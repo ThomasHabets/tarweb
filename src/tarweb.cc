@@ -15,7 +15,6 @@
 #include <deque>
 #include <iostream>
 #include <map>
-#include <map>
 #include <optional>
 #include <set>
 #include <span>
@@ -24,10 +23,18 @@
 
 constexpr int chunk_size = 4096;
 
-const std::string page404content = "File not found\n";
-const std::string page404 = "HTTP/1.1 404 Not Found\r\nContent-Length: " +
-                            std::to_string(page404content.size()) + "\r\n\r\n" +
-                            page404content;
+struct Error {
+    Error(const std::string& err)
+        : response("HTTP/1.1 " + err + "\r\nContent-Length: " +
+                   std::to_string(err.size() + 1) + "\r\n\r\n" + err + "\n")
+    {
+    }
+    const std::string response;
+};
+
+const Error page400("400 Bad Request");
+const Error page404("404 Not found");
+const Error page405("405 Method Not Allowed");
 
 struct File {
     File(std::span<const char> sp)
@@ -163,6 +170,10 @@ private:
     std::span<char> writable_ = std::span(buf_.begin(), buf_.end());
 
     // Parsed headers. TODO: also add the Method line.
+    std::span<const char> bad_request_;
+    std::string_view method_;
+    std::string_view url_;
+    std::string_view protocol_;
     std::pmr::vector<std::map<std::pmr::string, std::pmr::string>> headers_;
 
     obufs_t obuf_ = std::pmr::deque<OutBuf>(&pool_);
@@ -215,20 +226,57 @@ void Connection::incremental_parse(size_t bytes)
         // std::cout << ">> Line <" << std::string(line.begin(), line.end()) <<
         // ">\n";
         if (line.empty()) {
-            // const auto fn = "rand.bin";
-            const auto fn = "index.html";
+            if (bad_request_.size()) {
+                obuf_.emplace_back(bad_request_);
+                continue;
+            }
+
+            const auto fn = url_.substr(1);
             const auto file = site_.get_file(fn).value_or(nullptr);
             if (!file) {
-                obuf_.emplace_back(std::span(page404));
+                obuf_.emplace_back(std::span(page404.response));
                 continue;
             }
             obuf_.emplace_back(status200);
             obuf_.emplace_back(std::span(file->headers));
             obuf_.emplace_back(file->content);
-	    continue;
+            continue;
         }
 
-	// TODO: Parse method and header lines.
+        // If bad request already set then don't bother parsing more.
+        if (!bad_request_.empty()) {
+            continue;
+        }
+
+        // First line.
+        if (method_.empty()) {
+            auto itr1 = std::find(line.begin(), line.end(), ' ');
+            if (itr1 == line.end()) {
+                bad_request_ = std::span(page400.response);
+                continue;
+            }
+            method_ = std::string_view(line.begin(), itr1);
+            itr1++;
+
+            if (method_ != "GET" && method_ != "HEAD") {
+                bad_request_ = std::span(page405.response);
+                continue;
+            }
+
+            auto itr2 = std::find(itr1, line.end(), ' ');
+            if (itr2 == line.end()) {
+                bad_request_ = std::span(page400.response);
+                continue;
+            }
+
+
+            url_ = std::string_view(itr1, itr2);
+            if (url_.empty()) {
+                bad_request_ = std::span(page400.response);
+            }
+        }
+
+        // TODO: Parse header lines.
     }
 }
 
@@ -575,6 +623,12 @@ Site::Site()
         if (ofs & 0x1ff) {
             ofs = (ofs | 0x1ff) + 1;
         }
+    }
+
+    if (auto f = files_.find("index.html"); f != files_.end()) {
+        files_.emplace(std::piecewise_construct,
+                       std::forward_as_tuple(""),
+                       std::forward_as_tuple(f->second.content));
     }
 }
 
