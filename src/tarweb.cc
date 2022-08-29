@@ -10,6 +10,7 @@
 #include <sys/uio.h>
 #include <system_error>
 #include <unistd.h>
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <deque>
@@ -22,6 +23,30 @@
 #include <vector>
 
 constexpr int chunk_size = 4096;
+constexpr int max_connection_memory_use = chunk_size * 2;
+
+namespace encodings {
+constexpr int uncompressed = 0;
+constexpr int gzip = 1;
+constexpr int zstd = 2;
+constexpr int deflate = 3;
+constexpr int br = 4;
+
+constexpr int count = 5;
+
+const std::string_view name_gzip = "gzip";
+const std::string_view name_br = "br";
+const std::string_view name_deflate = "deflate";
+const std::string_view name_zstd = "zstd";
+
+const std::string header[] = {
+    "",
+    "Content-Encoding: gzip\r\n",
+    "Content-Encoding: zstd\r\n",
+    "Content-Encoding: deflate\r\n",
+    "Content-Encoding: br\r\n",
+};
+} // namespace encodings
 
 struct Error {
     Error(const std::string& err)
@@ -35,17 +60,21 @@ struct Error {
 const Error page400("400 Bad Request");
 const Error page404("404 Not found");
 const Error page405("405 Method Not Allowed");
+const std::string status200("HTTP/1.1 200 OK\r\n");
 
 struct File {
     File(std::span<const char> sp)
         : content(sp),
           headers("Content-Length: " + std::to_string(content.size()) +
-                  "\r\n\r\n")
+                  "\r\n\r\n"),
+          enc({ this })
     {
     }
 
     const std::span<const char> content;
     const std::string headers;
+
+    std::array<File*, encodings::count> enc{};
 
     // No copy or move. Implied by the const member variables though.
     File(const File&) = delete;
@@ -120,8 +149,9 @@ public:
     Connection(const Site& site, int fd)
         : site_(site),
           fd_(fd),
-          pool_buffer_(4096),
-          pool_(std::data(pool_buffer_), std::size(pool_buffer_)),
+          pool_(std::data(pool_buffer_),
+                std::size(pool_buffer_),
+                std::pmr::null_memory_resource()),
           buf_(&pool_)
     {
     }
@@ -161,7 +191,7 @@ private:
 
     const Site& site_;
     int fd_;
-    std::vector<char> pool_buffer_;
+    std::array<char, max_connection_memory_use> pool_buffer_;
     std::pmr::monotonic_buffer_resource pool_;
 
     // Buffer for reading from socket.
@@ -169,13 +199,17 @@ private:
     std::span<char> readable_ = std::span(buf_.begin(), buf_.begin());
     std::span<char> writable_ = std::span(buf_.begin(), buf_.end());
 
-    // Parsed headers. TODO: also add the Method line.
+    // Parsed request information.
     std::span<const char> bad_request_;
     std::string_view method_;
-    std::string_view url_;
+    const File* file_ = nullptr;
+    std::array<uint8_t, encodings::count> encoding_{};
     std::string_view protocol_;
-    std::pmr::vector<std::map<std::pmr::string, std::pmr::string>> headers_;
 
+    // When request is finished this is the output buffers.
+    //
+    // Note: since the deque nodes are from the memory pool they're not
+    // actually freed as they are completed. Maybe just use vector?
     obufs_t obuf_ = std::pmr::deque<OutBuf>(&pool_);
 };
 
@@ -200,6 +234,7 @@ void nonblock(int fd)
             errno, std::generic_category(), "fcntl(F_SETFL)");
     }
 }
+
 std::span<char> Connection::getbuf()
 {
     if (writable_.empty()) {
@@ -210,7 +245,6 @@ std::span<char> Connection::getbuf()
 
 void Connection::incremental_parse(size_t bytes)
 {
-    auto status200 = std::pmr::string("HTTP/1.1 200 OK\r\n", &pool_);
     readable_ = std::span(readable_.begin(), readable_.end() + bytes);
     writable_ = std::span(writable_.begin() + bytes, writable_.end());
     for (;;) {
@@ -231,15 +265,19 @@ void Connection::incremental_parse(size_t bytes)
                 continue;
             }
 
-            const auto fn = url_.substr(1);
-            const auto file = site_.get_file(fn).value_or(nullptr);
-            if (!file) {
-                obuf_.emplace_back(std::span(page404.response));
-                continue;
+            obuf_.emplace_back(std::span(status200));
+
+            for (const auto enc : encoding_) {
+                if (auto file2 = file_->enc[enc]; file2) {
+                    if (enc) {
+                        file_ = file2;
+                        obuf_.emplace_back(std::span(encodings::header[enc]));
+                    }
+                    break;
+                }
             }
-            obuf_.emplace_back(status200);
-            obuf_.emplace_back(std::span(file->headers));
-            obuf_.emplace_back(file->content);
+            obuf_.emplace_back(std::span(file_->headers));
+            obuf_.emplace_back(file_->content);
             continue;
         }
 
@@ -269,14 +307,47 @@ void Connection::incremental_parse(size_t bytes)
                 continue;
             }
 
-
-            url_ = std::string_view(itr1, itr2);
-            if (url_.empty()) {
+            const auto url = std::string_view(itr1, itr2);
+            if (url.empty()) {
                 bad_request_ = std::span(page400.response);
             }
+
+            // Get base file. May be replaced later due to compression.
+            file_ = site_.get_file(url.substr(1)).value_or(nullptr);
+            if (!file_) {
+                bad_request_ = std::span(page404.response);
+            }
+            continue;
         }
 
-        // TODO: Parse header lines.
+        // Parse headers.
+        {
+            auto itrc = std::find(line.begin(), line.end(), ':');
+            if (itrc == line.end()) {
+                bad_request_ = std::span(page400.response);
+                continue;
+            }
+            const auto name = std::string_view(line.begin(), itrc);
+            const auto value = std::string_view(itrc + 1, line.end());
+
+            std::cerr << "Header <" << name << "> = <" << value << ">\n";
+
+            if (name == "Accept-Encoding") {
+                // TODO: this is a bit unclean, with substring
+                // matching. Check around results that it's comma break.
+                int n = 0;
+                for (auto [name, val] :
+                     { std::make_pair(encodings::name_zstd, encodings::zstd),
+                       { encodings::name_gzip, encodings::gzip },
+                       { encodings::name_deflate, encodings::deflate },
+                       { encodings::name_br, encodings::br } }) {
+                    const auto m = std::ranges::search(value, name);
+                    if (m) {
+                        encoding_[n++] = val;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -298,7 +369,7 @@ public:
     void add_write(int fd) override { fdws_.insert(fd); }
     void remove_read(int fd) override;
     void remove_write(int fd) override;
-    void remove(int fd)
+    void remove(int fd) override
     {
         remove_read(fd);
         remove_write(fd);
@@ -322,7 +393,7 @@ public:
     void add_write(int fd) override;
     void remove_read(int fd) override;
     void remove_write(int fd) override;
-    void remove(int fd);
+    void remove(int fd) override;
     std::tuple<std::vector<int>, std::vector<int>> poll() override;
 
 private:
@@ -420,14 +491,14 @@ std::tuple<std::vector<int>, std::vector<int>> PollPoller::poll()
     std::vector<struct pollfd> pr;
     for (const auto fd : fdrs_) {
         pr.push_back(pollfd{
-            fd : fd,
-            events : POLLIN,
+            .fd = fd,
+            .events = POLLIN,
         });
     }
     for (const auto fd : fdws_) {
         pr.push_back(pollfd{
-            fd : fd,
-            events : POLLOUT,
+            .fd = fd,
+            .events = POLLOUT,
         });
     }
     const auto rc = ::poll(pr.data(), len, -1);
@@ -457,9 +528,10 @@ void main_loop(int fd, const Site& site)
     EPollPoller poller;
     poller.add_read(fd);
 
-    std::vector<char> buffer(102400);
-    std::pmr::monotonic_buffer_resource pool{ std::data(buffer),
-                                              std::size(buffer) };
+    std::vector<char> buffer(10240000);
+    std::pmr::monotonic_buffer_resource pool{
+        std::data(buffer), std::size(buffer), std::pmr::null_memory_resource()
+    };
 
     for (;;) {
         const auto [fdrs, fdws] = poller.poll();
@@ -477,10 +549,12 @@ void main_loop(int fd, const Site& site)
                             errno, std::generic_category(), "accept()");
                     }
                     nonblock(cli);
-
+#if 0
                     cons.emplace(std::piecewise_construct,
                                  std::forward_as_tuple(cli),
                                  std::forward_as_tuple(site, cli));
+#endif
+                    cons.try_emplace(cli, site, cli);
 
                     poller.add_read(cli);
                 }
@@ -629,6 +703,19 @@ Site::Site()
         files_.emplace(std::piecewise_construct,
                        std::forward_as_tuple(""),
                        std::forward_as_tuple(f->second.content));
+    }
+    for (auto& f : files_) {
+        auto comp = files_.find(f.first + ".gz");
+        if (comp == files_.end()) {
+            continue;
+        }
+        f.second.enc[encodings::gzip] = &comp->second;
+
+        comp = files_.find(f.first + ".zstd");
+        if (comp == files_.end()) {
+            continue;
+        }
+        f.second.enc[encodings::zstd] = &comp->second;
     }
 }
 
