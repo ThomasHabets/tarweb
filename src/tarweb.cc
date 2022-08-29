@@ -465,7 +465,7 @@ void EPollPoller::remove_write(int fd)
 
 std::tuple<std::vector<int>, std::vector<int>> EPollPoller::poll()
 {
-    std::array<struct epoll_event, 10> events;
+    std::array<struct epoll_event, 1000> events;
     const auto rc = epoll_wait(fd_, events.data(), events.size(), -1);
     if (-1 == rc) {
         throw std::system_error(errno, std::generic_category(), "epoll_wait()");
