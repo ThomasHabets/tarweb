@@ -19,6 +19,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <stack>
 #include <thread>
 #include <vector>
 
@@ -47,6 +48,8 @@ const std::string header[] = {
     "Content-Encoding: br\r\n",
 };
 } // namespace encodings
+
+const std::string_view connection_close = "Connection: close\r\n";
 
 struct Error {
     Error(const std::string& err)
@@ -200,11 +203,22 @@ private:
     std::span<char> writable_ = std::span(buf_.begin(), buf_.end());
 
     // Parsed request information.
+    void clear_request()
+    {
+        bad_request_ = std::span<char>();
+        method_ = "";
+        file_ = nullptr;
+        encoding_ = encoding_t{};
+        protocol_ = std::string_view();
+        keepalive_ = false;
+    }
     std::span<const char> bad_request_;
     std::string_view method_;
     const File* file_ = nullptr;
-    std::array<uint8_t, encodings::count> encoding_{};
+    using encoding_t = std::array<uint8_t, encodings::count>;
+    encoding_t encoding_{};
     std::string_view protocol_;
+    bool keepalive_ = false;
 
     // When request is finished this is the output buffers.
     //
@@ -266,7 +280,9 @@ void Connection::incremental_parse(size_t bytes)
             }
 
             obuf_.emplace_back(std::span(status200));
-
+            if (keepalive_) {
+                obuf_.emplace_back(std::span(connection_close));
+            }
             for (const auto enc : encoding_) {
                 if (auto file2 = file_->enc[enc]; file2) {
                     if (enc) {
@@ -278,6 +294,7 @@ void Connection::incremental_parse(size_t bytes)
             }
             obuf_.emplace_back(std::span(file_->headers));
             obuf_.emplace_back(file_->content);
+            clear_request();
             continue;
         }
 
@@ -290,6 +307,8 @@ void Connection::incremental_parse(size_t bytes)
         if (method_.empty()) {
             auto itr1 = std::find(line.begin(), line.end(), ' ');
             if (itr1 == line.end()) {
+                std::cerr << "Bad first line: "
+                          << std::string(line.begin(), line.end()) << "\n";
                 bad_request_ = std::span(page400.response);
                 continue;
             }
@@ -303,12 +322,16 @@ void Connection::incremental_parse(size_t bytes)
 
             auto itr2 = std::find(itr1, line.end(), ' ');
             if (itr2 == line.end()) {
+                std::cerr << "No space in line: "
+                          << std::string(line.begin(), line.end()) << "\n";
                 bad_request_ = std::span(page400.response);
                 continue;
             }
 
             const auto url = std::string_view(itr1, itr2);
             if (url.empty()) {
+                std::cerr << "Bad url in line: "
+                          << std::string(line.begin(), line.end()) << "\n";
                 bad_request_ = std::span(page400.response);
             }
 
@@ -324,13 +347,15 @@ void Connection::incremental_parse(size_t bytes)
         {
             auto itrc = std::find(line.begin(), line.end(), ':');
             if (itrc == line.end()) {
+                std::cerr << "Header has no colon: "
+                          << std::string(line.begin(), line.end()) << "\n";
                 bad_request_ = std::span(page400.response);
                 continue;
             }
             const auto name = std::string_view(line.begin(), itrc);
             const auto value = std::string_view(itrc + 1, line.end());
 
-            std::cerr << "Header <" << name << "> = <" << value << ">\n";
+            // std::cerr << "Header <" << name << "> = <" << value << ">\n";
 
             if (name == "Accept-Encoding") {
                 // TODO: this is a bit unclean, with substring
@@ -347,59 +372,32 @@ void Connection::incremental_parse(size_t bytes)
                     }
                 }
             }
+            if (name == "Connection") {
+                const auto m =
+                    std::ranges::search(value, std::string_view("keep-alive"));
+                if (m) {
+                    // TODO: spaces etc.
+                    keepalive_ = true;
+                }
+            }
         }
     }
 }
 
-class Poller
-{
-public:
-    virtual void add_read(int) = 0;
-    virtual void add_write(int) = 0;
-    virtual void remove_read(int) = 0;
-    virtual void remove_write(int) = 0;
-    virtual void remove(int) = 0;
-    virtual std::tuple<std::vector<int>, std::vector<int>> poll() = 0;
-};
-
-class PollPoller : public Poller
-{
-public:
-    void add_read(int fd) override { fdrs_.insert(fd); }
-    void add_write(int fd) override { fdws_.insert(fd); }
-    void remove_read(int fd) override;
-    void remove_write(int fd) override;
-    void remove(int fd) override
-    {
-        remove_read(fd);
-        remove_write(fd);
-    }
-    std::tuple<std::vector<int>, std::vector<int>> poll() override;
-
-private:
-    std::set<int> fdrs_;
-    std::set<int> fdws_;
-};
-
-void PollPoller::remove_read(int fd) { fdrs_.erase(fd); }
-void PollPoller::remove_write(int fd) { fdws_.erase(fd); }
-
-class EPollPoller : public Poller
+class EPollPoller
 {
 public:
     static constexpr int epoll_et_ = 0;
     EPollPoller();
-    void add_read(int fd) override;
-    void add_write(int fd) override;
-    void remove_read(int fd) override;
-    void remove_write(int fd) override;
-    void remove(int fd) override;
-    std::tuple<std::vector<int>, std::vector<int>> poll() override;
+    void add_read(Connection* fd);
+    void add_write(Connection* fd);
+    void remove_read(int fd);
+    void remove_write(Connection* ptr);
+    void remove(int fd);
+    void poll(std::vector<Connection*>&, std::vector<Connection*>&);
 
 private:
     int fd_;
-    std::set<int> fdrs_;
-    std::set<int> fdws_;
 };
 
 EPollPoller::EPollPoller() : fd_(epoll_create1(0))
@@ -410,23 +408,23 @@ EPollPoller::EPollPoller() : fd_(epoll_create1(0))
     }
 }
 
-void EPollPoller::add_read(int fd)
+void EPollPoller::add_read(Connection* ptr)
 {
     struct epoll_event ev;
     ev.events = EPOLLIN | epoll_et_;
-    ev.data.fd = fd;
-    if (epoll_ctl(fd_, EPOLL_CTL_ADD, fd, &ev)) {
+    ev.data.ptr = reinterpret_cast<void*>(ptr);
+    if (epoll_ctl(fd_, EPOLL_CTL_ADD, ptr->fd(), &ev)) {
         throw std::system_error(
             errno, std::generic_category(), "epoll_ctl(add read)");
     }
 }
 
-void EPollPoller::add_write(int fd)
+void EPollPoller::add_write(Connection* ptr)
 {
     struct epoll_event ev;
     ev.events = EPOLLIN | EPOLLOUT | epoll_et_;
-    ev.data.fd = fd;
-    if (epoll_ctl(fd_, EPOLL_CTL_MOD, fd, &ev)) {
+    ev.data.ptr = reinterpret_cast<void*>(ptr);
+    if (epoll_ctl(fd_, EPOLL_CTL_MOD, ptr->fd(), &ev)) {
         throw std::system_error(
             errno, std::generic_category(), "epoll_ctl(mod write)");
     }
@@ -436,7 +434,6 @@ void EPollPoller::remove_read(int fd)
 {
     struct epoll_event ev;
     ev.events = 0;
-    ev.data.fd = fd;
     if (epoll_ctl(fd_, EPOLL_CTL_MOD, fd, &ev)) {
         throw std::system_error(
             errno, std::generic_category(), "epoll_ctl(mod nothing)");
@@ -452,91 +449,103 @@ void EPollPoller::remove(int fd)
     }
 }
 
-void EPollPoller::remove_write(int fd)
+void EPollPoller::remove_write(Connection* ptr)
 {
     struct epoll_event ev;
     ev.events = EPOLLIN | epoll_et_;
-    ev.data.fd = fd;
-    if (epoll_ctl(fd_, EPOLL_CTL_MOD, fd, &ev)) {
+    ev.data.ptr = reinterpret_cast<void*>(ptr);
+    if (epoll_ctl(fd_, EPOLL_CTL_MOD, ptr->fd(), &ev)) {
         throw std::system_error(
             errno, std::generic_category(), "epoll_ctl(MOD read only)");
     }
 }
 
-std::tuple<std::vector<int>, std::vector<int>> EPollPoller::poll()
+void EPollPoller::poll(std::vector<Connection*>& retr,
+                       std::vector<Connection*>& retw)
 {
+    retr.clear();
+    retw.clear();
     std::array<struct epoll_event, 1000> events;
     const auto rc = epoll_wait(fd_, events.data(), events.size(), -1);
     if (-1 == rc) {
         throw std::system_error(errno, std::generic_category(), "epoll_wait()");
     }
-    std::vector<int> retr;
-    std::vector<int> retw;
     for (int c = 0; c < rc; c++) {
         if (events[c].events & EPOLLIN) {
-            retr.push_back(events[c].data.fd);
+            retr.push_back(reinterpret_cast<Connection*>(events[c].data.ptr));
         }
         if (events[c].events & EPOLLOUT) {
-            retw.push_back(events[c].data.fd);
+            retw.push_back(reinterpret_cast<Connection*>(events[c].data.ptr));
         }
     }
-    return { retr, retw };
 }
 
-std::tuple<std::vector<int>, std::vector<int>> PollPoller::poll()
+template <typename T>
+class UVector
 {
-    const auto rlen = fdrs_.size();
-    const auto wlen = fdws_.size();
-    const auto len = rlen + wlen;
-    std::vector<struct pollfd> pr;
-    for (const auto fd : fdrs_) {
-        pr.push_back(pollfd{
-            .fd = fd,
-            .events = POLLIN,
-        });
-    }
-    for (const auto fd : fdws_) {
-        pr.push_back(pollfd{
-            .fd = fd,
-            .events = POLLOUT,
-        });
-    }
-    const auto rc = ::poll(pr.data(), len, -1);
-    if (rc == -1) {
-        throw std::system_error(errno, std::generic_category(), "poll()");
-    }
-    std::vector<int> retr;
-    retr.reserve(rc);
-    std::vector<int> retw;
-    retw.reserve(rc);
-    for (const auto p : pr) {
-        if (p.revents & POLLIN) {
-            retr.push_back(p.fd);
-        }
-        if (p.revents & POLLOUT) {
-            retw.push_back(p.fd);
+public:
+    UVector(size_t n) : size_(n), buf_(sizeof(T) * n)
+    {
+        auto ptr = reinterpret_cast<T*>(buf_.data());
+        for (int c = n; c; c--) {
+            free_.push(ptr + (c - 1));
         }
     }
-    return { retr, retw };
-}
+    template <typename... Args>
+    T* alloc(Args&&... args)
+    {
+        if (free_.empty()) {
+            throw std::bad_alloc();
+        }
+        auto ptr = free_.top();
+        new (ptr) T(std::forward<Args>(args)...);
+        free_.pop();
+        // std::cerr << "Allocating " << (void*)ptr << "\n";
+        return ptr;
+    }
+    void free(T* ptr)
+    {
+        // std::cerr << "Destroying " << (void*)ptr << "\n";
+        ptr->~T();
+        free_.push(ptr);
+    }
+    ~UVector()
+    {
+        // TODO: just delete all the remaining ones, instead?
+        if (free_.size() != size_) {
+            std::cerr << "Memory leak: UVector is missing calls to free()\n";
+            std::terminate();
+        }
+    }
+
+private:
+    const size_t size_;
+    std::stack<T*> free_;
+    std::vector<char> buf_;
+};
 
 void main_loop(int fd, const Site& site)
 {
-    std::map<int, Connection> cons;
+    UVector<Connection> cons(1000);
 
+    Connection accept_connection(site, fd);
     // PollPoller poller;
     EPollPoller poller;
-    poller.add_read(fd);
+    poller.add_read(&accept_connection);
 
     std::vector<char> buffer(10240000);
     std::pmr::monotonic_buffer_resource pool{
         std::data(buffer), std::size(buffer), std::pmr::null_memory_resource()
     };
 
+    std::set<Connection*> cleared;
+    std::vector<Connection*> fdrs;
+    std::vector<Connection*> fdws;
     for (;;) {
-        const auto [fdrs, fdws] = poller.poll();
+        cleared.clear();
+        poller.poll(fdrs, fdws);
         for (const auto fdr : fdrs) {
-            if (fdr == fd) {
+            if (fdr == &accept_connection) {
                 for (;;) {
                     struct sockaddr_in6 sa;
                     socklen_t len = sizeof(sa);
@@ -549,36 +558,32 @@ void main_loop(int fd, const Site& site)
                             errno, std::generic_category(), "accept()");
                     }
                     nonblock(cli);
-#if 0
-                    cons.emplace(std::piecewise_construct,
-                                 std::forward_as_tuple(cli),
-                                 std::forward_as_tuple(site, cli));
-#endif
-                    cons.try_emplace(cli, site, cli);
-
-                    poller.add_read(cli);
+                    poller.add_read(cons.alloc(site, cli));
                 }
                 continue;
             }
 
-            auto& con = cons.at(fdr);
+            auto& con = *fdr;
             for (bool finished = false; !finished;) {
                 auto buf = con.getbuf();
-                const auto rc = read(fdr, buf.data(), buf.size());
+                const auto rc = read(con.fd(), buf.data(), buf.size());
                 if (rc == -1) {
                     if (errno == EAGAIN) {
+                        sleep(1);
                         break;
                     }
-                    poller.remove(fdr);
-                    cons.erase(fdr);
-                    close(fdr);
                     std::cerr << strerror(errno) << "\n";
+                    poller.remove(con.fd());
+                    close(con.fd());
+                    cleared.insert(&con);
+                    cons.free(&con);
                     break;
                 }
                 if (rc == 0) {
-                    poller.remove(fdr);
-                    cons.erase(fdr);
-                    close(fdr);
+                    poller.remove(con.fd());
+                    close(con.fd());
+                    cleared.insert(&con);
+                    cons.free(&con);
                     break;
                 }
                 if (rc != buf.size()) {
@@ -586,17 +591,16 @@ void main_loop(int fd, const Site& site)
                 }
                 con.incremental_parse(rc);
                 if (!con.get_obufs().empty()) {
-                    poller.add_write(con.fd());
+                    poller.add_write(&con);
                 }
             }
         }
         for (const auto fdw : fdws) {
-            auto conf = cons.find(fdw);
-            if (conf == cons.end()) {
+            if (cleared.count(fdw)) {
                 // Connection was destroyed while reading.
                 continue;
             }
-            auto& con = conf->second;
+            auto& con = *fdw;
             auto& bufs = con.get_obufs();
 
             std::pmr::vector<struct iovec> wv(bufs.size(), &pool);
@@ -606,14 +610,14 @@ void main_loop(int fd, const Site& site)
                 wv[i].iov_len = buf.size();
             }
             // TODO: because of the mmap, writes may actually block.
-            const auto rc = writev(fdw, &wv[0], wv.size());
+            const auto rc = writev(con.fd(), &wv[0], wv.size());
             if (rc == -1) {
                 throw std::system_error(
                     errno, std::generic_category(), "writev()");
             }
             con.write_advance(rc);
             if (con.get_obufs().empty()) {
-                poller.remove_write(con.fd());
+                poller.remove_write(&con);
             }
         }
     }
