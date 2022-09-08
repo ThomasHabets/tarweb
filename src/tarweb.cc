@@ -718,23 +718,23 @@ Site::Site()
         }
     }
 
-    if (auto f = files_.find("index.html"); f != files_.end()) {
-        files_.emplace(std::piecewise_construct,
-                       std::forward_as_tuple(""),
-                       std::forward_as_tuple(f->second.content));
-    }
     for (auto& f : files_) {
         auto comp = files_.find(f.first + ".gz");
-        if (comp == files_.end()) {
-            continue;
+        if (comp != files_.end()) {
+            f.second.enc[encodings::gzip] = &comp->second;
         }
-        f.second.enc[encodings::gzip] = &comp->second;
 
         comp = files_.find(f.first + ".zstd");
-        if (comp == files_.end()) {
-            continue;
+        if (comp != files_.end()) {
+            f.second.enc[encodings::zstd] = &comp->second;
         }
-        f.second.enc[encodings::zstd] = &comp->second;
+    }
+    if (auto f = files_.find("index.html"); f != files_.end()) {
+        auto [file, ok] =
+            files_.emplace(std::piecewise_construct,
+                           std::forward_as_tuple(""),
+                           std::forward_as_tuple(f->second.content));
+        file->second.enc = f->second.enc;
     }
 }
 
