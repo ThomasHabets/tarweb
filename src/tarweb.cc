@@ -579,7 +579,10 @@ void main_loop(int fd, const Site& site)
                             errno, std::generic_category(), "accept()");
                     }
                     nonblock(cli);
+                    // TODO: maybe data is usually available
+                    // immediately, so add it to the fdrs set too?
                     poller.add_read(cons.alloc(site, cli));
+                    break;
                 }
                 continue;
             }
