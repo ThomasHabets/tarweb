@@ -527,6 +527,24 @@ private:
     std::vector<char> buf_;
 };
 
+void do_write(std::pmr::monotonic_buffer_resource& pool, Connection& con)
+{
+    auto& bufs = con.get_obufs();
+
+    std::pmr::vector<struct iovec> wv(bufs.size(), &pool);
+    for (int i = 0; i < bufs.size(); i++) {
+        auto buf = bufs[i].getbuf();
+        wv[i].iov_base = const_cast<char*>(buf.data());
+        wv[i].iov_len = buf.size();
+    }
+    // TODO: because of the mmap, writes may actually block.
+    const auto rc = writev(con.fd(), &wv[0], wv.size());
+    if (rc == -1) {
+        throw std::system_error(errno, std::generic_category(), "writev()");
+    }
+    con.write_advance(rc);
+}
+
 void main_loop(int fd, const Site& site)
 {
     UVector<Connection> cons(1000);
@@ -594,7 +612,10 @@ void main_loop(int fd, const Site& site)
                 }
                 con.incremental_parse(rc);
                 if (!con.get_obufs().empty()) {
-                    poller.add_write(&con);
+                    do_write(pool, con);
+                    if (!con.get_obufs().empty()) {
+                        poller.add_write(&con);
+                    }
                 }
             }
         }
@@ -604,21 +625,9 @@ void main_loop(int fd, const Site& site)
                 continue;
             }
             auto& con = *fdw;
-            auto& bufs = con.get_obufs();
-
-            std::pmr::vector<struct iovec> wv(bufs.size(), &pool);
-            for (int i = 0; i < bufs.size(); i++) {
-                auto buf = bufs[i].getbuf();
-                wv[i].iov_base = const_cast<char*>(buf.data());
-                wv[i].iov_len = buf.size();
+            if (!con.get_obufs().empty()) {
+                do_write(pool, con);
             }
-            // TODO: because of the mmap, writes may actually block.
-            const auto rc = writev(con.fd(), &wv[0], wv.size());
-            if (rc == -1) {
-                throw std::system_error(
-                    errno, std::generic_category(), "writev()");
-            }
-            con.write_advance(rc);
             if (con.get_obufs().empty()) {
                 poller.remove_write(&con);
             }
