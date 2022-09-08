@@ -352,12 +352,15 @@ void Connection::incremental_parse(size_t bytes)
                 bad_request_ = std::span(page400.response);
                 continue;
             }
-            const auto name = std::string_view(line.begin(), itrc);
-            const auto value = std::string_view(itrc + 1, line.end());
+            std::span<char> name(line.begin(), itrc);
+            const std::string_view names(name.begin(), name.end());
+            const std::string_view value(itrc + 1, line.end());
 
             // std::cerr << "Header <" << name << "> = <" << value << ">\n";
-
-            if (name == "Accept-Encoding") {
+            std::ranges::transform(name, name.begin(), [](unsigned char c) {
+                return std::tolower(c);
+            });
+            if (names == "accept-encoding") {
                 // TODO: this is a bit unclean, with substring
                 // matching. Check around results that it's comma break.
                 int n = 0;
@@ -372,7 +375,7 @@ void Connection::incremental_parse(size_t bytes)
                     }
                 }
             }
-            if (name == "Connection") {
+            if (names == "connection") {
                 const auto m =
                     std::ranges::search(value, std::string_view("keep-alive"));
                 if (m) {
