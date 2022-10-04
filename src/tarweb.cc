@@ -545,6 +545,59 @@ void do_write(std::pmr::monotonic_buffer_resource& pool, Connection& con)
     con.write_advance(rc);
 }
 
+class Measure
+{
+public:
+    using clock_t = std::chrono::steady_clock;
+
+    Measure() : st_(clock_t::now()) {}
+    ~Measure()
+    {
+        std::cerr << "Measured: " << (clock_t::now() - st_).count() << "\n";
+    }
+
+private:
+    clock_t::time_point st_;
+};
+
+class LatencyTracker
+{
+public:
+    using buckets_t = std::array<uint64_t, 64>;
+
+    void add(const uint64_t ns)
+    {
+        count_++;
+        total_ += ns;
+        std::cerr << "Loop time in ns: " << ns << "\n";
+        buckets_[bucket(ns)]++;
+    }
+
+    const buckets_t& buckets() const { return buckets_; }
+    uint64_t avg() const { return total_ / count_; }
+    void print() const
+    {
+        std::cerr << "============= Stats ==============\n";
+        std::cerr << "Avg: " << (total_ / count_) << "\n";
+        const auto mx = *std::max_element(buckets_.begin(), buckets_.end());
+        for (const auto us : buckets_) {
+            std::cerr << std::string((us * 80) / mx, '#') << "\n";
+        }
+    }
+
+private:
+    int bucket(const uint64_t ns)
+    {
+        const auto us = ns / 1000;
+        return std::min(us, buckets_.size() - 1);
+    }
+
+    uint64_t count_ = 0;
+    uint64_t total_ = 0;
+
+    buckets_t buckets_{};
+};
+
 void main_loop(int fd, const Site& site)
 {
     UVector<Connection> cons(1000);
@@ -552,6 +605,7 @@ void main_loop(int fd, const Site& site)
     Connection accept_connection(site, fd);
     // PollPoller poller;
     EPollPoller poller;
+    LatencyTracker latency;
     poller.add_read(&accept_connection);
 
     std::vector<char> buffer(10240000);
@@ -562,17 +616,36 @@ void main_loop(int fd, const Site& site)
     std::set<Connection*> cleared;
     std::vector<Connection*> fdrs;
     std::vector<Connection*> fdws;
+    fdrs.reserve(1000);
+    fdws.reserve(1000);
+
+    using clock = std::chrono::steady_clock;
+    std::chrono::time_point<std::chrono::steady_clock> st;
+    bool first = true;
+    st = clock::now();
+
+    static_assert(std::chrono::steady_clock::period::num == 1);
+    static_assert(std::chrono::steady_clock::period::den == 1000000000);
     for (;;) {
         cleared.clear();
+        if (first) [[unlikely]] {
+            first = false;
+        } else {
+            const auto now = clock::now();
+            latency.add((now - st).count());
+            // latency.print();
+        }
         poller.poll(fdrs, fdws);
+        st = std::chrono::steady_clock::now();
         for (const auto fdr : fdrs) {
-            if (fdr == &accept_connection) {
+            if (fdr == &accept_connection) [[unlikely]] {
                 for (;;) {
                     struct sockaddr_in6 sa;
                     socklen_t len = sizeof(sa);
                     int cli = accept(fd, (sockaddr*)&sa, &len);
-                    if (-1 == cli) {
-                        if (errno == EAGAIN) {
+                    if (-1 == cli) [[unlikely]] {
+                        if (errno == EAGAIN) [[likely]] {
+                            // No more pending connections.
                             break;
                         }
                         throw std::system_error(
@@ -580,10 +653,15 @@ void main_loop(int fd, const Site& site)
                     }
                     nonblock(cli);
                     // TODO: maybe data is usually available
-                    // immediately, so add it to the fdrs set too?
+                    // immediately, so perform read here too?
+                    //
+                    // We can't add it to fdrs here, though, since
+                    // we're currently iterating over it.
                     poller.add_read(cons.alloc(site, cli));
                     break;
                 }
+
+                // Don't actually try to read from the listening socket.
                 continue;
             }
 
@@ -591,9 +669,8 @@ void main_loop(int fd, const Site& site)
             for (bool finished = false; !finished;) {
                 auto buf = con.getbuf();
                 const auto rc = read(con.fd(), buf.data(), buf.size());
-                if (rc == -1) {
+                if (rc == -1) [[unlikely]] {
                     if (errno == EAGAIN) {
-                        sleep(1);
                         break;
                     }
                     std::cerr << strerror(errno) << "\n";
@@ -613,9 +690,14 @@ void main_loop(int fd, const Site& site)
                 if (rc != buf.size()) {
                     finished = true;
                 }
-                con.incremental_parse(rc);
+                {
+                    con.incremental_parse(rc);
+                }
                 if (!con.get_obufs().empty()) {
-                    do_write(pool, con);
+                    {
+                        Measure m;
+                        do_write(pool, con); // this is ~20us.
+                    }
                     if (!con.get_obufs().empty()) {
                         poller.add_write(&con);
                     }
