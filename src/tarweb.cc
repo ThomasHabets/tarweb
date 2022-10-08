@@ -820,7 +820,7 @@ Site::Site()
     }
 }
 
-int main()
+int mainwrap(int argc, char** argv)
 {
     Site site;
 
@@ -868,4 +868,5 @@ int main()
         std::cerr << "Running single threaded\n";
         main_loop(sock, site);
     }
+    return 0;
 }
