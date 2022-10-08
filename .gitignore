@@ -18,3 +18,7 @@ config.h.in
 stamp-h1
 test-driver
 tarweb
+tarweb_test
+tarweb_test.log
+tarweb_test.trs
+test-suite.log
