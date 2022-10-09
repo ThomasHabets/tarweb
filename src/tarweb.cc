@@ -271,11 +271,15 @@ void Connection::incremental_parse(size_t bytes)
         if (!line.empty() && line.back() == '\r') {
             line = line.subspan(0, line.size() - 1);
         }
-        // std::cout << ">> Line <" << std::string(line.begin(), line.end()) <<
-        // ">\n";
+        if (false) {
+            std::cout << ">> Line <" << std::string(line.begin(), line.end())
+                      << ">\n";
+        }
         if (line.empty()) {
             if (bad_request_.size()) {
+                std::cout << "Bad request\n";
                 obuf_.emplace_back(bad_request_);
+                clear_request();
                 continue;
             }
 
@@ -316,6 +320,7 @@ void Connection::incremental_parse(size_t bytes)
             itr1++;
 
             if (method_ != "GET" && method_ != "HEAD") {
+                std::cout << "Setting Bad request 405\n";
                 bad_request_ = std::span(page405.response);
                 continue;
             }
@@ -338,6 +343,7 @@ void Connection::incremental_parse(size_t bytes)
             // Get base file. May be replaced later due to compression.
             file_ = site_.get_file(url.substr(1)).value_or(nullptr);
             if (!file_) {
+                std::cout << "Setting Bad request 404\n";
                 bad_request_ = std::span(page404.response);
             }
             continue;
