@@ -146,6 +146,28 @@ private:
     std::span<const char> sp_;
 };
 
+class Request
+{
+public:
+    bool bad() const { return !bad_request_.empty(); }
+    void clear()
+    {
+        bad_request_ = std::span<char>();
+        method_ = "";
+        file_ = nullptr;
+        encoding_ = encoding_t{};
+        keepalive_ = false;
+    }
+
+    using encoding_t = std::array<uint8_t, encodings::count>;
+
+    std::span<const char> bad_request_;
+    std::string_view method_;
+    const File* file_ = nullptr;
+    encoding_t encoding_{};
+    bool keepalive_ = false;
+};
+
 class Connection
 {
 public:
@@ -202,23 +224,8 @@ private:
     std::span<char> readable_ = std::span(buf_.begin(), buf_.begin());
     std::span<char> writable_ = std::span(buf_.begin(), buf_.end());
 
-    // Parsed request information.
-    void clear_request()
-    {
-        bad_request_ = std::span<char>();
-        method_ = "";
-        file_ = nullptr;
-        encoding_ = encoding_t{};
-        protocol_ = std::string_view();
-        keepalive_ = false;
-    }
-    std::span<const char> bad_request_;
-    std::string_view method_;
-    const File* file_ = nullptr;
-    using encoding_t = std::array<uint8_t, encodings::count>;
-    encoding_t encoding_{};
-    std::string_view protocol_;
-    bool keepalive_ = false;
+    // Request under construction.
+    Request request_;
 
     // When request is finished this is the output buffers.
     //
@@ -276,52 +283,52 @@ void Connection::incremental_parse(size_t bytes)
                       << ">\n";
         }
         if (line.empty()) {
-            if (bad_request_.size()) {
+            if (request_.bad()) {
                 std::cout << "Bad request\n";
-                obuf_.emplace_back(bad_request_);
-                clear_request();
+                obuf_.emplace_back(request_.bad_request_);
+                request_.clear();
                 continue;
             }
 
             obuf_.emplace_back(std::span(status200));
-            if (keepalive_) {
+            if (request_.keepalive_) {
                 obuf_.emplace_back(std::span(connection_close));
             }
-            for (const auto enc : encoding_) {
-                if (auto file2 = file_->enc[enc]; file2) {
+            for (const auto enc : request_.encoding_) {
+                if (auto file2 = request_.file_->enc[enc]; file2) {
                     if (enc) {
-                        file_ = file2;
+                        request_.file_ = file2;
                         obuf_.emplace_back(std::span(encodings::header[enc]));
                     }
                     break;
                 }
             }
-            obuf_.emplace_back(std::span(file_->headers));
-            obuf_.emplace_back(file_->content);
-            clear_request();
+            obuf_.emplace_back(std::span(request_.file_->headers));
+            obuf_.emplace_back(request_.file_->content);
+            request_.clear();
             continue;
         }
 
         // If bad request already set then don't bother parsing more.
-        if (!bad_request_.empty()) {
+        if (request_.bad()) {
             continue;
         }
 
         // First line.
-        if (method_.empty()) {
+        if (request_.method_.empty()) {
             auto itr1 = std::find(line.begin(), line.end(), ' ');
             if (itr1 == line.end()) {
                 std::cerr << "Bad first line: "
                           << std::string(line.begin(), line.end()) << "\n";
-                bad_request_ = std::span(page400.response);
+                request_.bad_request_ = std::span(page400.response);
                 continue;
             }
-            method_ = std::string_view(line.begin(), itr1);
+            request_.method_ = std::string_view(line.begin(), itr1);
             itr1++;
 
-            if (method_ != "GET" && method_ != "HEAD") {
+            if (request_.method_ != "GET" && request_.method_ != "HEAD") {
                 std::cout << "Setting Bad request 405\n";
-                bad_request_ = std::span(page405.response);
+                request_.bad_request_ = std::span(page405.response);
                 continue;
             }
 
@@ -329,7 +336,7 @@ void Connection::incremental_parse(size_t bytes)
             if (itr2 == line.end()) {
                 std::cerr << "No space in line: "
                           << std::string(line.begin(), line.end()) << "\n";
-                bad_request_ = std::span(page400.response);
+                request_.bad_request_ = std::span(page400.response);
                 continue;
             }
 
@@ -337,14 +344,14 @@ void Connection::incremental_parse(size_t bytes)
             if (url.empty()) {
                 std::cerr << "Bad url in line: "
                           << std::string(line.begin(), line.end()) << "\n";
-                bad_request_ = std::span(page400.response);
+                request_.bad_request_ = std::span(page400.response);
             }
 
             // Get base file. May be replaced later due to compression.
-            file_ = site_.get_file(url.substr(1)).value_or(nullptr);
-            if (!file_) {
+            request_.file_ = site_.get_file(url.substr(1)).value_or(nullptr);
+            if (!request_.file_) {
                 std::cout << "Setting Bad request 404\n";
-                bad_request_ = std::span(page404.response);
+                request_.bad_request_ = std::span(page404.response);
             }
             continue;
         }
@@ -355,7 +362,7 @@ void Connection::incremental_parse(size_t bytes)
             if (itrc == line.end()) {
                 std::cerr << "Header has no colon: "
                           << std::string(line.begin(), line.end()) << "\n";
-                bad_request_ = std::span(page400.response);
+                request_.bad_request_ = std::span(page400.response);
                 continue;
             }
             std::span<char> name(line.begin(), itrc);
@@ -377,7 +384,7 @@ void Connection::incremental_parse(size_t bytes)
                        { encodings::name_br, encodings::br } }) {
                     const auto m = std::ranges::search(value, name);
                     if (m) {
-                        encoding_[n++] = val;
+                        request_.encoding_[n++] = val;
                     }
                 }
             }
@@ -386,7 +393,7 @@ void Connection::incremental_parse(size_t bytes)
                     std::ranges::search(value, std::string_view("keep-alive"));
                 if (m) {
                     // TODO: spaces etc.
-                    keepalive_ = true;
+                    request_.keepalive_ = true;
                 }
             }
         }
