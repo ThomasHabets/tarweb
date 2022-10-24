@@ -23,15 +23,34 @@
 #include <thread>
 #include <vector>
 
+namespace {
+template <typename To, typename From>
+To safe_int_cast(const From from)
+{
+    if (std::is_signed_v<From> && std::is_unsigned_v<To> && from < 0) {
+        throw std::runtime_error("bad value, casting negative to unsigned");
+    }
+    const To to = static_cast<To>(from);
+    if (std::is_unsigned_v<From> && std::is_signed_v<To> && to < 0) {
+        throw std::runtime_error("bad value, unsigned value turned negative");
+    }
+    if (from != static_cast<From>(to)) {
+        throw std::runtime_error(
+            "bad value, different value when converted back");
+    }
+    return to;
+}
+} // namespace
+
 constexpr int chunk_size = 4096;
 constexpr int max_connection_memory_use = chunk_size * 2;
 
 namespace encodings {
-constexpr int uncompressed = 0;
-constexpr int gzip = 1;
-constexpr int zstd = 2;
-constexpr int deflate = 3;
-constexpr int br = 4;
+constexpr uint8_t uncompressed = 0;
+constexpr uint8_t gzip = 1;
+constexpr uint8_t zstd = 2;
+constexpr uint8_t deflate = 3;
+constexpr uint8_t br = 4;
 
 constexpr int count = 5;
 
@@ -212,7 +231,7 @@ public:
     int fd() const { return fd_; }
 
 private:
-    void reset_buffer(int size);
+    void reset_buffer(size_t size);
 
     const Site& site_;
     int fd_;
@@ -234,7 +253,7 @@ private:
     obufs_t obuf_ = std::pmr::deque<OutBuf>(&pool_);
 };
 
-void Connection::reset_buffer(int size)
+void Connection::reset_buffer(size_t size)
 {
     auto r = &readable_[0] - &buf_[0];
     auto w = &writable_[0] - &buf_[0];
@@ -503,7 +522,7 @@ public:
     UVector(size_t n) : size_(n), buf_(sizeof(T) * n)
     {
         auto ptr = reinterpret_cast<T*>(buf_.data());
-        for (int c = n; c; c--) {
+        for (size_t c = n; c; c--) {
             free_.push(ptr + (c - 1));
         }
     }
@@ -545,13 +564,13 @@ void do_write(std::pmr::monotonic_buffer_resource& pool, Connection& con)
     auto& bufs = con.get_obufs();
 
     std::pmr::vector<struct iovec> wv(bufs.size(), &pool);
-    for (int i = 0; i < bufs.size(); i++) {
+    for (size_t i = 0; i < bufs.size(); i++) {
         auto buf = bufs[i].getbuf();
         wv[i].iov_base = const_cast<char*>(buf.data());
         wv[i].iov_len = buf.size();
     }
     // TODO: because of the mmap, writes may actually block.
-    const auto rc = writev(con.fd(), &wv[0], wv.size());
+    const auto rc = writev(con.fd(), &wv[0], safe_int_cast<int>(wv.size()));
     if (rc == -1) {
         throw std::system_error(errno, std::generic_category(), "writev()");
     }
@@ -602,7 +621,7 @@ private:
     int bucket(const uint64_t ns)
     {
         const auto us = ns / 1000;
-        return std::min(us, buckets_.size() - 1);
+        return safe_int_cast<int>(std::min(us, buckets_.size() - 1));
     }
 
     uint64_t count_ = 0;
@@ -700,7 +719,7 @@ void main_loop(int fd, const Site& site)
                     cons.free(&con);
                     break;
                 }
-                if (rc != buf.size()) {
+                if (rc != safe_int_cast<ssize_t>(buf.size())) {
                     finished = true;
                 }
                 {
@@ -783,7 +802,8 @@ Site::Site()
     site_ = std::span(ptr, ptr + st.st_size);
 
     std::cout << sizeof(posix_header) << "\n";
-    for (auto ofs = 0; ofs + sizeof(posix_header) < st.st_size;) {
+    for (size_t ofs = 0;
+         ofs + sizeof(posix_header) < safe_int_cast<size_t>(st.st_size);) {
         posix_header* head = (posix_header*)(site_.data() + ofs);
         if (!memcmp(head->magic, "\x00\x00\x00\x00\x00\x00", 6)) {
             break;
@@ -833,7 +853,7 @@ Site::Site()
     }
 }
 
-int mainwrap(int argc, char** argv)
+int mainwrap([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 {
     Site site;
 
@@ -862,7 +882,7 @@ int mainwrap(int argc, char** argv)
     std::vector<std::jthread> threads;
     if (false) {
         const auto cpus = std::thread::hardware_concurrency();
-        for (int i = 0; i < cpus; i++) {
+        for (unsigned int i = 0; i < cpus; i++) {
             std::jthread th([sock, &site, i] {
                 cpu_set_t cpuset;
                 CPU_ZERO(&cpuset);

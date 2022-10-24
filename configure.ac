@@ -25,7 +25,7 @@ MYSTD="c++20"
 if test ! "x$STD" = "x"; then
    MYSTD="$STD"
 fi
-CXXFLAGS="$CXXFLAGS -std=$MYSTD -g -Wall -pedantic"
+CXXFLAGS="$CXXFLAGS -std=$MYSTD -g -Wall -Wextra -Wconversion -pedantic"
 
 # Output
 AC_CONFIG_FILES([Makefile])
