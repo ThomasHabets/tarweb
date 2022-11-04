@@ -15,4 +15,4 @@ TODO:
 * For short files, do writev() from mmap(), for large files, do sendfile()
 * ktls
 * request timeout
-
+* support headerless, where all headers are already pre-inserted into the tarfile

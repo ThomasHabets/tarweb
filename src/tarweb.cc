@@ -1,3 +1,5 @@
+#include "writer.h"
+
 #include <fcntl.h>
 #include <memory_resource>
 #include <netinet/in.h>
@@ -44,6 +46,7 @@ To safe_int_cast(const From from)
 
 constexpr int chunk_size = 4096;
 constexpr int max_connection_memory_use = chunk_size * 2;
+constexpr size_t sendfile_min_size = 4096; // TODO: tune this.
 
 namespace encodings {
 constexpr uint8_t uncompressed = 0;
@@ -152,6 +155,8 @@ public:
         return &itr->second;
     }
 
+    int fd() const { return fd_; }
+
 private:
     FD fd_;
 
@@ -160,38 +165,6 @@ private:
     std::span<char> site_;
 };
 
-class OutBuf
-{
-public:
-    // no regular strings.
-    OutBuf(const std::string&) = delete;
-
-    // No copy.
-    OutBuf(const OutBuf&) = delete;
-    OutBuf& operator=(const OutBuf&) = delete;
-
-    // Construct from PMR string or span.
-    explicit OutBuf(std::pmr::string&& str)
-        : str_(std::move(str)), sp_(str_.begin(), str_.end())
-    {
-    }
-    explicit OutBuf(std::span<const char> sp) : sp_(sp) {}
-
-    std::span<const char> getbuf() const { return sp_; }
-
-    size_t advance(size_t size)
-    {
-        const auto n = std::min(size, sp_.size());
-        sp_ = sp_.subspan(n);
-        return n;
-    }
-
-    bool empty() const { return sp_.empty(); }
-
-private:
-    const std::pmr::string str_;
-    std::span<const char> sp_;
-};
 
 class Request
 {
@@ -242,20 +215,8 @@ public:
     // There is `size` more data in the buffer. Parse and handle.
     void incremental_parse(size_t size);
 
-    // `size` bytes from obuf have been written to the socket.
-    void write_advance(size_t size)
-    {
-        while (size > 0) {
-            auto& obuf = obuf_.front();
-            size -= obuf.advance(size);
-            if (obuf.empty()) {
-                obuf_.pop_front();
-            }
-        }
-    }
+    OQueue oqueue_;
 
-    using obufs_t = std::pmr::deque<OutBuf>;
-    const obufs_t& get_obufs() const { return obuf_; }
     int fd() const { return fd_; }
 
 private:
@@ -273,12 +234,6 @@ private:
 
     // Request under construction.
     Request request_;
-
-    // When request is finished this is the output buffers.
-    //
-    // Note: since the deque nodes are from the memory pool they're not
-    // actually freed as they are completed. Maybe just use vector?
-    obufs_t obuf_ = std::pmr::deque<OutBuf>(&pool_);
 };
 
 void Connection::reset_buffer(size_t size)
@@ -332,26 +287,33 @@ void Connection::incremental_parse(size_t bytes)
         if (line.empty()) {
             if (request_.bad()) {
                 std::cout << "Bad request\n";
-                obuf_.emplace_back(request_.bad_request_);
+                oqueue_.add(ViewBuf(request_.bad_request_));
                 request_.clear();
                 continue;
             }
 
-            obuf_.emplace_back(std::span(status200));
+            oqueue_.add(ViewBuf(std::span(status200)));
             if (request_.keepalive_) {
-                obuf_.emplace_back(std::span(connection_close));
+                oqueue_.add(ViewBuf{ connection_close });
             }
             for (const auto enc : request_.encoding_) {
                 if (auto file2 = request_.file_->enc[enc]; file2) {
                     if (enc) {
                         request_.file_ = file2;
-                        obuf_.emplace_back(std::span(encodings::header[enc]));
+                        oqueue_.add(ViewBuf(std::span(encodings::header[enc])));
                     }
                     break;
                 }
             }
-            obuf_.emplace_back(std::span(request_.file_->headers));
-            obuf_.emplace_back(request_.file_->content);
+            oqueue_.add(ViewBuf(std::span(request_.file_->headers)));
+
+            const auto content_size = request_.file_->content.size();
+            if (content_size > sendfile_min_size) {
+                oqueue_.add(
+                    FileBuf(site_.fd(), request_.file_->offset, content_size));
+            } else {
+                oqueue_.add(ViewBuf(request_.file_->content));
+            }
             request_.clear();
             continue;
         }
@@ -577,7 +539,7 @@ public:
         // TODO: just delete all the remaining ones, instead?
         if (free_.size() != size_) {
             std::cerr << "Memory leak: UVector is missing calls to free()\n";
-            std::terminate();
+            // std::terminate();
         }
     }
 
@@ -586,24 +548,6 @@ private:
     std::stack<T*> free_;
     std::vector<char> buf_;
 };
-
-void do_write(std::pmr::monotonic_buffer_resource& pool, Connection& con)
-{
-    auto& bufs = con.get_obufs();
-
-    std::pmr::vector<struct iovec> wv(bufs.size(), &pool);
-    for (size_t i = 0; i < bufs.size(); i++) {
-        auto buf = bufs[i].getbuf();
-        wv[i].iov_base = const_cast<char*>(buf.data());
-        wv[i].iov_len = buf.size();
-    }
-    // TODO: because of the mmap, writes may actually block.
-    const auto rc = writev(con.fd(), &wv[0], safe_int_cast<int>(wv.size()));
-    if (rc == -1) {
-        throw std::system_error(errno, std::generic_category(), "writev()");
-    }
-    con.write_advance(rc);
-}
 
 class Measure
 {
@@ -753,12 +697,12 @@ void main_loop(int fd, const Site& site)
                 {
                     con.incremental_parse(rc);
                 }
-                if (!con.get_obufs().empty()) {
+                if (!con.oqueue_.empty()) {
                     {
                         Measure m;
-                        do_write(pool, con); // this is ~20us.
+                        con.oqueue_.write(con.fd());
                     }
-                    if (!con.get_obufs().empty()) {
+                    if (!con.oqueue_.empty()) {
                         poller.add_write(&con);
                     }
                 }
@@ -770,10 +714,10 @@ void main_loop(int fd, const Site& site)
                 continue;
             }
             auto& con = *fdw;
-            if (!con.get_obufs().empty()) {
-                do_write(pool, con);
+            if (!con.oqueue_.empty()) {
+                con.oqueue_.write(con.fd());
             }
-            if (con.get_obufs().empty()) {
+            if (con.oqueue_.empty()) {
                 poller.remove_write(&con);
             }
         }
