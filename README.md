@@ -12,3 +12,7 @@ TODO:
 * EPOLLRDHUP?
 * EPOLLHUP? (don't bother reading from closed connection)
 * Keepalive connection
+* For short files, do writev() from mmap(), for large files, do sendfile()
+* ktls
+* request timeout
+

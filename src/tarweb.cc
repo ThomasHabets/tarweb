@@ -85,14 +85,16 @@ const Error page405("405 Method Not Allowed");
 const std::string status200("HTTP/1.1 200 OK\r\n");
 
 struct File {
-    File(std::span<const char> sp)
-        : content(sp),
+    File(std::span<const char> sp, size_t offset)
+        : offset(offset),
+          content(sp),
           headers("Content-Length: " + std::to_string(content.size()) +
                   "\r\n\r\n"),
           enc({ this })
     {
     }
 
+    const size_t offset;
     const std::span<const char> content;
     const std::string headers;
 
@@ -103,6 +105,30 @@ struct File {
     File(File&&) = delete;
     File& operator=(const File&) = delete;
     File& operator=(File&&) = delete;
+};
+
+class FD
+{
+public:
+    FD(int fd) : fd_(fd) {}
+    ~FD() { close(); }
+    void close()
+    {
+        if (fd_ < 0) {
+            return;
+        }
+        ::close(fd_);
+        fd_ = -1;
+    }
+    operator int() const { return fd_; }
+    // No copy or move.
+    FD(const FD&) = delete;
+    FD(FD&&) = delete;
+    FD& operator=(const FD&) = delete;
+    FD& operator=(FD&) = delete;
+
+private:
+    int fd_;
 };
 
 class Site
@@ -127,6 +153,8 @@ public:
     }
 
 private:
+    FD fd_;
+
     // TODO: create perfect hashing.
     std::map<std::string, File> files_;
     std::span<char> site_;
@@ -781,21 +809,18 @@ Site::~Site()
     }
 }
 
-Site::Site()
+Site::Site() : fd_(open("site.tar", O_RDONLY))
 {
-    const int fd = open("site.tar", O_RDONLY);
-    if (fd == -1) {
+    if (fd_ == -1) {
         throw std::system_error(errno, std::generic_category(), "open()");
     }
     struct stat st;
-    if (-1 == fstat(fd, &st)) {
-        close(fd);
+    if (-1 == fstat(fd_, &st)) {
         throw std::system_error(errno, std::generic_category(), "fstat()");
     }
 
     auto ptr = (char*)mmap(
-        nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0); // MAP_HUGE*?
-    close(fd);
+        nullptr, st.st_size, PROT_READ, MAP_PRIVATE, fd_, 0); // MAP_HUGE*?
     if (ptr == nullptr) {
         throw std::system_error(errno, std::generic_category(), "mmap()");
     }
@@ -824,7 +849,7 @@ Site::Site()
                   << "\n";
         files_.emplace(std::piecewise_construct,
                        std::forward_as_tuple(head->name),
-                       std::forward_as_tuple(sp));
+                       std::forward_as_tuple(sp, ofs));
 
         ofs += size;
         // Round up.
@@ -845,10 +870,10 @@ Site::Site()
         }
     }
     if (auto f = files_.find("index.html"); f != files_.end()) {
-        auto [file, ok] =
-            files_.emplace(std::piecewise_construct,
-                           std::forward_as_tuple(""),
-                           std::forward_as_tuple(f->second.content));
+        auto [file, ok] = files_.emplace(
+            std::piecewise_construct,
+            std::forward_as_tuple(""),
+            std::forward_as_tuple(f->second.content, f->second.offset));
         file->second.enc = f->second.enc;
     }
 }
