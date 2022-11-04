@@ -46,7 +46,8 @@ To safe_int_cast(const From from)
 
 constexpr int chunk_size = 4096;
 constexpr int max_connection_memory_use = chunk_size * 2;
-constexpr size_t sendfile_min_size = 4096; // TODO: tune this.
+
+size_t sendfile_min_size = 4096; // TODO: tune this.
 
 namespace encodings {
 constexpr uint8_t uncompressed = 0;
@@ -137,7 +138,7 @@ private:
 class Site
 {
 public:
-    Site();
+    Site(const char*);
     ~Site();
 
     // No copy or move.
@@ -573,7 +574,7 @@ public:
     {
         count_++;
         total_ += ns;
-        std::cerr << "Loop time in ns: " << ns << "\n";
+        // std::cerr << "Loop time in ns: " << ns << "\n";
         buckets_[bucket(ns)]++;
     }
 
@@ -753,7 +754,7 @@ Site::~Site()
     }
 }
 
-Site::Site() : fd_(open("site.tar", O_RDONLY))
+Site::Site(const char* sitefn) : fd_(open(sitefn, O_RDONLY))
 {
     if (fd_ == -1) {
         throw std::system_error(errno, std::generic_category(), "open()");
@@ -822,9 +823,47 @@ Site::Site() : fd_(open("site.tar", O_RDONLY))
     }
 }
 
-int mainwrap([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
+[[noreturn]] void usage(const char* av0, int err)
 {
-    Site site;
+    std::ostream* o = &std::cout;
+    if (err) {
+        o = &std::cerr;
+    }
+    *o << "Usage: " << av0 << " [ -S <sendfile threshold> ]\n";
+    exit(err);
+}
+
+int mainwrap(int argc, char** argv)
+{
+    uint16_t port = 8787;
+    const char* sitefn = "site.tar";
+    {
+        int opt;
+        while ((opt = getopt(argc, argv, "f:hp:S:")) != -1) {
+            switch (opt) {
+            case 'f':
+                sitefn = optarg;
+                break;
+            case 'h':
+                usage(argv[0], EXIT_SUCCESS);
+            case 'p':
+                // TODO: must_parse()
+                port = safe_int_cast<uint16_t>(strtoul(optarg, nullptr, 0));
+                break;
+            case 'S':
+                // TODO: must_parse()
+                sendfile_min_size = strtoul(optarg, nullptr, 0);
+                break;
+            default:
+                usage(argv[0], EXIT_FAILURE);
+            }
+        }
+    }
+    if (optind != argc) {
+        std::cerr << "Extra args on command line\n";
+        exit(1);
+    }
+    Site site(sitefn);
 
     int sock = socket(AF_INET6, SOCK_STREAM, 0);
     if (-1 == sock) {
@@ -840,7 +879,7 @@ int mainwrap([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     struct sockaddr_in6 sa {
     };
     sa.sin6_family = AF_INET6;
-    sa.sin6_port = htons(8787);
+    sa.sin6_port = htons(port);
     if (-1 == bind(sock, (struct sockaddr*)&sa, sizeof(sa))) {
         throw std::system_error(errno, std::generic_category(), "bind()");
     }

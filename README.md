@@ -16,3 +16,4 @@ TODO:
 * ktls
 * request timeout
 * support headerless, where all headers are already pre-inserted into the tarfile
+* verify that archive doesn't have sparse files
