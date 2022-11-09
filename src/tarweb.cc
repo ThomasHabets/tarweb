@@ -1,3 +1,4 @@
+#include "tls.h"
 #include "writer.h"
 
 #include <fcntl.h>
@@ -46,6 +47,8 @@ To safe_int_cast(const From from)
 
 constexpr int chunk_size = 4096;
 constexpr int max_connection_memory_use = chunk_size * 2;
+std::string tls_cert = "";
+std::string tls_priv = "";
 
 size_t sendfile_min_size = 4096; // TODO: tune this.
 
@@ -605,6 +608,12 @@ private:
 
 void main_loop(int fd, const Site& site)
 {
+    auto tls = [] {
+        if (tls_cert.empty()) {
+            return std::unique_ptr<TLS>();
+        }
+        return std::make_unique<TLS>(tls_cert, tls_priv);
+    }();
     UVector<Connection> cons(1000);
 
     Connection accept_connection(site, fd);
@@ -655,6 +664,9 @@ void main_loop(int fd, const Site& site)
                         }
                         throw std::system_error(
                             errno, std::generic_category(), "accept()");
+                    }
+                    if (tls && !tls->enable_ktls(cli, true)) {
+                        throw std::runtime_error("enabling KTLS");
                     }
                     nonblock(cli);
                     // TODO: maybe data is usually available
@@ -839,7 +851,7 @@ int mainwrap(int argc, char** argv)
     const char* sitefn = "site.tar";
     {
         int opt;
-        while ((opt = getopt(argc, argv, "f:hp:S:")) != -1) {
+        while ((opt = getopt(argc, argv, "f:hp:S:C:")) != -1) {
             switch (opt) {
             case 'f':
                 sitefn = optarg;
@@ -853,6 +865,9 @@ int mainwrap(int argc, char** argv)
             case 'S':
                 // TODO: must_parse()
                 sendfile_min_size = strtoul(optarg, nullptr, 0);
+                break;
+            case 'C':
+                tls_priv = tls_cert = optarg;
                 break;
             default:
                 usage(argv[0], EXIT_FAILURE);
