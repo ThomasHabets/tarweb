@@ -686,18 +686,26 @@ void main_loop(int fd, const Site& site)
             for (bool finished = false; !finished;) {
                 auto buf = con.getbuf();
                 const auto rc = read(con.fd(), buf.data(), buf.size());
+                bool should_close = false;
                 if (rc == -1) [[unlikely]] {
                     if (errno == EAGAIN) {
                         break;
                     }
-                    std::cerr << strerror(errno) << "\n";
-                    poller.remove(con.fd());
-                    close(con.fd());
-                    cleared.insert(&con);
-                    cons.free(&con);
-                    break;
+                    if (tls) {
+                        const int err = tls->get_error(con.fd());
+                        if (err != ENOTCONN) {
+                            std::cerr << "TLS error: " << strerror(err) << "\n";
+                        }
+                    } else {
+                        std::cerr << "Reading from socket: " << strerror(errno)
+                                  << "\n";
+                    }
+                    should_close = true;
                 }
                 if (rc == 0) {
+                    should_close = true;
+                }
+                if (should_close) {
                     poller.remove(con.fd());
                     close(con.fd());
                     cleared.insert(&con);

@@ -20,6 +20,7 @@ public:
     ~TLS();
 
     std::unique_ptr<TLSConnection> enable_ktls(int fd, bool server);
+    static int get_error(int fd);
 
 private:
     SSL_CTX* ctx_;

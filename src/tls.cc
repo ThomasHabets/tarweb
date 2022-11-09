@@ -1,6 +1,10 @@
 #include "tls.h"
 
+#include <linux/tls.h>
 #include <openssl/ssl.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <iostream>
 #include <memory>
 
 TLSConnection::TLSConnection(SSL_CTX* ctx)
@@ -51,6 +55,51 @@ TLS::~TLS()
     if (ctx_) {
         SSL_CTX_free(ctx_);
     }
+}
+
+/*
+ https://patchwork.kernel.org/project/linux-crypto/patch/20180320175434.GA23938@davejwatson-mba.local/
+*/
+int TLS::get_error(int fd)
+{
+    char buffer[128];
+    char cmsgspace[CMSG_SPACE(sizeof(unsigned char))];
+    struct msghdr msg {
+    };
+    msg.msg_control = cmsgspace;
+    msg.msg_controllen = sizeof(cmsgspace);
+
+    struct iovec msg_iov;
+    msg_iov.iov_base = buffer;
+    msg_iov.iov_len = sizeof(buffer);
+
+    msg.msg_iov = &msg_iov;
+    msg.msg_iovlen = 1;
+
+    const auto ret = recvmsg(fd, &msg, 0);
+    if (-1 == ret) {
+        std::cerr << "recvmsg(): " << strerror(errno) << "\n";
+        return errno;
+    }
+    for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr;
+         cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_TLS &&
+            cmsg->cmsg_type == TLS_GET_RECORD_TYPE) {
+            int record_type = *((unsigned char*)CMSG_DATA(cmsg));
+            switch (record_type) {
+            case 21: // TLS_RECORD_TYPE_ALERT
+                return ENOTCONN;
+            case 22: // Handshake.
+            case 23: // Application data.
+            default:
+                std::cerr << "Unknown KTLS record type " << record_type << "\n";
+            }
+        } else {
+            std::cerr << "TLS application data??? Should not be\n";
+            // Buffer contains application data.
+        }
+    }
+    return 0;
 }
 
 std::unique_ptr<TLSConnection> TLS::enable_ktls(int fd, bool server)
