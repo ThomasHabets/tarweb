@@ -51,7 +51,8 @@ public:
         off_t ofs = ofs_;
         const auto rc = sendfile(fd, fd_, &ofs, size_);
         if (rc < 0) {
-            throw std::runtime_error("sendfile()");
+            throw std::system_error(
+                errno, std::generic_category(), "sendfile()");
         }
         return rc;
     }
