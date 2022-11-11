@@ -6,10 +6,15 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/times.h>
 #include <sys/uio.h>
 #include <system_error>
 #include <unistd.h>
@@ -622,6 +627,14 @@ void main_loop(int fd, const Site& site)
     LatencyTracker latency;
     poller.add_read(&accept_connection);
 
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);
+    int sigfd = signalfd(-1, &mask, SFD_NONBLOCK);
+    Connection sigcon(site, sigfd);
+    poller.add_read(&sigcon);
+    sigprocmask(SIG_BLOCK, &mask, nullptr);
+
     std::vector<char> buffer(10240000);
     std::pmr::monotonic_buffer_resource pool{
         std::data(buffer), std::size(buffer), std::pmr::null_memory_resource()
@@ -652,6 +665,12 @@ void main_loop(int fd, const Site& site)
         poller.poll(fdrs, fdws);
         st = std::chrono::steady_clock::now();
         for (const auto fdr : fdrs) {
+            if (fdr == &sigcon) [[unlikely]] {
+                struct signalfd_siginfo info;
+                read(sigfd, &info, sizeof(info));
+                std::cerr << "Exiting because SIGINT\n";
+                return;
+            }
             if (fdr == &accept_connection) [[unlikely]] {
                 for (;;) {
                     struct sockaddr_in6 sa;
