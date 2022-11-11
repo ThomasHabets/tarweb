@@ -806,7 +806,7 @@ void main_loop(int fd, const Site& site)
                 }
                 if (!con.oqueue_.empty()) {
                     {
-                        Measure m;
+                        // Measure m;
                         con.oqueue_.write(con.fd());
                     }
                     if (!con.oqueue_.empty()) {
@@ -939,6 +939,17 @@ Site::Site(const char* sitefn) : fd_(open(sitefn, O_RDONLY))
     exit(err);
 }
 
+double tvsub(const struct timeval& a, const struct timeval& b)
+{
+    double ret = a.tv_sec - b.tv_sec;
+    double d = a.tv_usec - b.tv_usec;
+    if (a.tv_usec > b.tv_usec) {
+        ret -= 1;
+        d += 1000000.0;
+    }
+    return ret + d / 1000000.0;
+}
+
 int mainwrap(int argc, char** argv)
 {
     uint16_t port = 8787;
@@ -1004,8 +1015,8 @@ int mainwrap(int argc, char** argv)
                 cpu_set_t cpuset;
                 CPU_ZERO(&cpuset);
                 CPU_SET(i, &cpuset);
-                if (-1 ==
-                    sched_setaffinity(gettid(), sizeof(cpuset), &cpuset)) {
+                if (-1 == sched_setaffinity(
+                              pthread_self(), sizeof(cpuset), &cpuset)) {
                     throw std::system_error(
                         errno, std::generic_category(), "sched_cpuset()");
                 }
@@ -1016,7 +1027,19 @@ int mainwrap(int argc, char** argv)
         std::cerr << "All threads running\n";
     } else {
         std::cerr << "Running single threaded\n";
+        struct rusage stu;
+        if (getrusage(RUSAGE_SELF, &stu)) {
+            throw std::system_error(errno, std::generic_category(), "rusage()");
+        }
         main_loop(sock, site);
+        struct rusage nowu;
+        if (getrusage(RUSAGE_SELF, &nowu)) {
+            throw std::system_error(errno, std::generic_category(), "rusage()");
+        }
+        std::cerr << "User time:    " << tvsub(nowu.ru_utime, stu.ru_utime)
+                  << "\n";
+        std::cerr << "System time:  " << tvsub(nowu.ru_stime, stu.ru_stime)
+                  << "\n";
     }
     return 0;
 }
