@@ -25,6 +25,7 @@
 #include <iostream>
 #include <map>
 #include <optional>
+#include <regex>
 #include <set>
 #include <span>
 #include <stack>
@@ -48,12 +49,38 @@ To safe_int_cast(const From from)
     }
     return to;
 }
+
+std::optional<size_t> parse_size(const std::string& in)
+{
+    if (in.empty()) {
+        return {};
+    }
+
+    // Parse number.
+    char* endp = NULL; // This will point to end of string.
+    errno = 0;         // Pre-set errno to 0.
+    auto ret = strtoll(in.c_str(), &endp, 0);
+
+    // Range errors are delivered as errno.
+    // I.e. on amd64 Linux it needs to be between -2^63 and 2^63-1.
+    if (errno) {
+        return {};
+    }
+
+    // Check for garbage at the end of the string.
+    if (*endp) {
+        return {};
+    }
+    return safe_int_cast<size_t>(ret);
+}
+
 } // namespace
 
 constexpr int chunk_size = 4096;
 constexpr int max_connection_memory_use = chunk_size * 2;
 std::string tls_cert = "";
 std::string tls_priv = "";
+const std::regex rangeRE(" bytes=(\\d+)-(\\d+)");
 
 size_t sendfile_min_size = 4096; // TODO: tune this.
 
@@ -195,6 +222,7 @@ public:
     const File* file_ = nullptr;
     encoding_t encoding_{};
     bool keepalive_ = false;
+    std::pair<int, int> range_{ 1, 0 }; // Default to invalid range.
 };
 
 class Connection
@@ -314,14 +342,41 @@ void Connection::incremental_parse(size_t bytes)
                     break;
                 }
             }
-            oqueue_.add(ViewBuf(std::span(request_.file_->headers)));
 
-            const auto content_size = request_.file_->content.size();
-            if (content_size > sendfile_min_size) {
-                oqueue_.add(
-                    FileBuf(site_.fd(), request_.file_->offset, content_size));
+            const auto full_content_size = request_.file_->content.size();
+            auto& range = request_.range_;
+
+            // Set range if not already set.
+            if (range.first > range.second) {
+                range = { 0, full_content_size - 1 };
+
+            } else if (range.second >= full_content_size) {
+                // Cap range.
+                // TODO: is this correct, or should it be a 4xx?
+                range = { 0, full_content_size - 1 };
+            }
+
+            // Set actual content size.
+            const auto content_size = range.second - range.first + 1;
+
+            if (full_content_size == content_size) {
+                std::cerr << "Full request\n";
+                oqueue_.add(ViewBuf(std::span(request_.file_->headers)));
             } else {
-                oqueue_.add(ViewBuf(request_.file_->content));
+                oqueue_.add(Buf(
+                    "Content-Length: " + std::to_string(content_size) +
+                    "\r\nContent-Range: bytes " + std::to_string(range.first) +
+                    "-" + std::to_string(range.second) + "/" +
+                    std::to_string(full_content_size) + "\r\n\r\n"));
+            }
+
+            if (content_size > sendfile_min_size) {
+                oqueue_.add(FileBuf(site_.fd(),
+                                    request_.file_->offset + range.first,
+                                    content_size));
+            } else {
+                oqueue_.add(ViewBuf(request_.file_->content.subspan(
+                    range.first, content_size)));
             }
             request_.clear();
             continue;
@@ -403,6 +458,18 @@ void Connection::incremental_parse(size_t bytes)
                     const auto m = std::ranges::search(value, name);
                     if (m) {
                         request_.encoding_[n++] = val;
+                    }
+                }
+            }
+            if (names == "range") {
+                std::match_results<std::string_view::const_iterator> m;
+                const bool ok =
+                    std::regex_match(value.begin(), value.end(), m, rangeRE);
+                if (ok) {
+                    auto a = parse_size(m[1].str());
+                    auto b = parse_size(m[2].str());
+                    if (a && b) {
+                        request_.range_ = { a.value(), b.value() };
                     }
                 }
             }
