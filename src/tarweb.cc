@@ -228,13 +228,17 @@ public:
 class Connection
 {
 public:
-    Connection(const Site& site, int fd)
+    Connection(const Site& site,
+               int fd,
+               std::unique_ptr<TLSConnection>&& tls = {})
         : site_(site),
           fd_(fd),
           pool_(std::data(pool_buffer_),
                 std::size(pool_buffer_),
                 std::pmr::null_memory_resource()),
-          buf_(&pool_)
+          buf_(&pool_),
+          tls_(std::move(tls)),
+          handshaking_(tls_)
     {
     }
 
@@ -256,6 +260,9 @@ public:
 
     int fd() const { return fd_; }
 
+    bool handshaking() const { return handshaking_; }
+    std::pair<bool, bool> handshake();
+
 private:
     void reset_buffer(size_t size);
 
@@ -271,7 +278,36 @@ private:
 
     // Request under construction.
     Request request_;
+
+    std::unique_ptr<TLSConnection> tls_;
+    bool handshaking_;
 };
+
+std::pair<bool, bool> Connection::handshake()
+{
+    if (!handshaking_) {
+        return { true, false };
+    }
+    const int rc = SSL_accept(tls_->ssl());
+    if (rc == 1) {
+        if (!BIO_get_ktls_send(SSL_get_wbio(tls_->ssl()))) {
+            throw std::runtime_error("KTLS not enabled for send");
+        }
+        if (!BIO_get_ktls_recv(SSL_get_rbio(tls_->ssl()))) {
+            throw std::runtime_error("KTLS not enabled for receive");
+        }
+        handshaking_ = false;
+        return { true, false };
+    }
+    const auto rc_err = SSL_get_error(tls_->ssl(), rc);
+    if (rc_err == SSL_ERROR_WANT_READ) {
+        return { true, false };
+    }
+    if (rc_err == SSL_ERROR_WANT_WRITE) {
+        return { false, true };
+    }
+    throw std::runtime_error("SSL_accept() unknown error");
+}
 
 void Connection::reset_buffer(size_t size)
 {
@@ -485,6 +521,9 @@ void Connection::incremental_parse(size_t bytes)
     }
 }
 
+/*
+ * TODO: This class isn't great. It confuses MOD and ADD.
+ */
 class EPollPoller
 {
 public:
@@ -514,10 +553,15 @@ void EPollPoller::add_read(Connection* ptr)
     struct epoll_event ev;
     ev.events = EPOLLIN | epoll_et_;
     ev.data.ptr = reinterpret_cast<void*>(ptr);
-    if (epoll_ctl(fd_, EPOLL_CTL_ADD, ptr->fd(), &ev)) {
-        throw std::system_error(
-            errno, std::generic_category(), "epoll_ctl(add read)");
+    const auto rc = epoll_ctl(fd_, EPOLL_CTL_ADD, ptr->fd(), &ev);
+    if (rc == 0) {
+        return;
     }
+    if (errno == EEXIST) {
+        return;
+    }
+    throw std::system_error(
+        errno, std::generic_category(), "epoll_ctl(add read)");
 }
 
 void EPollPoller::add_write(Connection* ptr)
@@ -742,7 +786,8 @@ void main_loop(int fd, const Site& site)
                 for (;;) {
                     struct sockaddr_in6 sa;
                     socklen_t len = sizeof(sa);
-                    int cli = accept(fd, (sockaddr*)&sa, &len);
+
+                    int cli = accept4(fd, (sockaddr*)&sa, &len, SOCK_NONBLOCK);
                     if (-1 == cli) [[unlikely]] {
                         if (errno == EAGAIN) [[likely]] {
                             // No more pending connections.
@@ -751,16 +796,23 @@ void main_loop(int fd, const Site& site)
                         throw std::system_error(
                             errno, std::generic_category(), "accept()");
                     }
-                    if (tls && !tls->enable_ktls(cli, true)) {
-                        throw std::runtime_error("enabling KTLS");
-                    }
-                    nonblock(cli);
                     // TODO: maybe data is usually available
                     // immediately, so perform read here too?
                     //
                     // We can't add it to fdrs here, though, since
                     // we're currently iterating over it.
-                    poller.add_read(cons.alloc(site, cli));
+                    std::unique_ptr<TLSConnection> tlscon;
+                    if (tls) {
+                        tlscon = tls->enable_ktls(cli);
+                    }
+                    auto newcon = cons.alloc(site, cli, std::move(tlscon));
+                    const auto [r, w] = newcon->handshake();
+                    if (r) {
+                        poller.add_read(newcon);
+                    }
+                    if (w) {
+                        poller.add_write(newcon);
+                    }
                     break;
                 }
 
@@ -768,13 +820,36 @@ void main_loop(int fd, const Site& site)
                 continue;
             }
 
+            /*
+             * Handshaker waiting to read.
+             */
             auto& con = *fdr;
+            if (con.handshaking()) {
+                const auto [r, w] = con.handshake();
+                if (con.handshaking()) {
+                    poller.add_read(&con);
+                    poller.remove_write(&con);
+                } else {
+                    if (r) {
+                        poller.add_read(&con);
+                    }
+                    if (w) {
+                        poller.add_write(&con);
+                    }
+                }
+                continue;
+            }
+
+            /*
+             * Connection waiting to read normal data.
+             */
             for (bool finished = false; !finished;) {
                 auto buf = con.getbuf();
                 const auto rc = read(con.fd(), buf.data(), buf.size());
                 bool should_close = false;
                 if (rc == -1) [[unlikely]] {
                     if (errno == EAGAIN) {
+                        // No more to read for now.
                         break;
                     }
                     if (tls) {
@@ -815,12 +890,26 @@ void main_loop(int fd, const Site& site)
                 }
             }
         }
+
         for (const auto fdw : fdws) {
             if (cleared.count(fdw)) {
                 // Connection was destroyed while reading.
                 continue;
             }
             auto& con = *fdw;
+
+            if (con.handshaking()) {
+                const auto [r, w] = con.handshake();
+                // TODO: remove read bit if no more to read()
+                if (r) {
+                    poller.add_read(&con);
+                }
+                if (!w) {
+                    poller.remove_write(&con);
+                }
+                continue;
+            }
+
             if (!con.oqueue_.empty()) {
                 con.oqueue_.write(con.fd());
             }

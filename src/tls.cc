@@ -7,10 +7,14 @@
 #include <iostream>
 #include <memory>
 
-TLSConnection::TLSConnection(SSL_CTX* ctx)
+TLSConnection::TLSConnection(SSL_CTX* ctx, int fd)
 {
     if (ssl_ = SSL_new(ctx); !ssl_) {
         throw std::runtime_error("KTLS: failed to create SSL object");
+    }
+    if (int err = SSL_set_fd(ssl_, fd); err != 1) {
+        SSL_free(ssl_);
+        throw std::runtime_error("KTLS: failed to set fd for SSL object");
     }
 }
 
@@ -102,30 +106,7 @@ int TLS::get_error(int fd)
     return 0;
 }
 
-std::unique_ptr<TLSConnection> TLS::enable_ktls(int fd, bool server)
+std::unique_ptr<TLSConnection> TLS::enable_ktls(int fd)
 {
-    auto tls = std::make_unique<TLSConnection>(ctx_);
-
-    if (int err = SSL_set_fd(tls->ssl(), fd); err != 1) {
-        throw std::runtime_error("KTLS: failed to set fd for SSL object");
-    }
-
-    if (const int handshake =
-            [&tls, server] {
-                if (server) {
-                    return SSL_accept(tls->ssl());
-                }
-                return SSL_connect(tls->ssl());
-            }();
-        handshake != 1) {
-        throw std::runtime_error("KTLS: failed to handshake");
-    }
-
-    if (!BIO_get_ktls_send(SSL_get_wbio(tls->ssl()))) {
-        throw std::runtime_error("KTLS not enabled for send");
-    }
-    if (!BIO_get_ktls_recv(SSL_get_rbio(tls->ssl()))) {
-        throw std::runtime_error("KTLS not enabled for receive");
-    }
-    return tls;
+    return std::make_unique<TLSConnection>(ctx_, fd);
 }
