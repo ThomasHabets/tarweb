@@ -222,7 +222,7 @@ public:
     const File* file_ = nullptr;
     encoding_t encoding_{};
     bool keepalive_ = false;
-    std::pair<int, int> range_{ 1, 0 }; // Default to invalid range.
+    std::pair<size_t, size_t> range_{ 1, 0 }; // Default to invalid range.
 };
 
 class Connection
@@ -777,9 +777,15 @@ void main_loop(int fd, const Site& site)
         st = std::chrono::steady_clock::now();
         for (const auto fdr : fdrs) {
             if (fdr == &sigcon) [[unlikely]] {
-                struct signalfd_siginfo info;
-                read(sigfd, &info, sizeof(info));
-                std::cerr << "Exiting because SIGINT\n";
+                struct signalfd_siginfo info {
+                };
+                const auto rc = read(sigfd, &info, sizeof(info));
+                if (rc <= 0) {
+                    throw std::system_error(
+                        errno, std::generic_category(), "read(sigfd)");
+                }
+                std::cerr << "Exiting because SIG"
+                          << sigabbrev_np(info.ssi_signo) << " \n";
                 return;
             }
             if (fdr == &accept_connection) [[unlikely]] {
@@ -1030,8 +1036,8 @@ Site::Site(const char* sitefn) : fd_(open(sitefn, O_RDONLY))
 
 double tvsub(const struct timeval& a, const struct timeval& b)
 {
-    double ret = a.tv_sec - b.tv_sec;
-    double d = a.tv_usec - b.tv_usec;
+    double ret = static_cast<double>(a.tv_sec) - static_cast<double>(b.tv_sec);
+    double d = static_cast<double>(a.tv_usec) - static_cast<double>(b.tv_usec);
     if (a.tv_usec > b.tv_usec) {
         ret -= 1;
         d += 1000000.0;
@@ -1104,8 +1110,10 @@ int mainwrap(int argc, char** argv)
                 cpu_set_t cpuset;
                 CPU_ZERO(&cpuset);
                 CPU_SET(i, &cpuset);
-                if (-1 == sched_setaffinity(
-                              pthread_self(), sizeof(cpuset), &cpuset)) {
+                if (-1 ==
+                    sched_setaffinity(safe_int_cast<pid_t>(pthread_self()),
+                                      sizeof(cpuset),
+                                      &cpuset)) {
                     throw std::system_error(
                         errno, std::generic_category(), "sched_cpuset()");
                 }
