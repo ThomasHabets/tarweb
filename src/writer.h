@@ -17,7 +17,7 @@ class BufBase
 {
 public:
     BufBase() {}
-    ~BufBase() {}
+    virtual ~BufBase() {}
 
     // No copy, only move.
     BufBase(const BufBase&) = delete;
