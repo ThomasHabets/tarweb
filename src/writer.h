@@ -1,5 +1,7 @@
+#include <memory_resource>
 #include <string_view>
 #include <sys/uio.h>
+#include <cassert>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -36,7 +38,14 @@ public:
 class FileBuf : public BufBase
 {
 public:
+    // Construct.
+    FileBuf() = delete;
     FileBuf(int fd, size_t ofs, size_t size) : fd_(fd), ofs_(ofs), size_(size)
+    {
+    }
+
+    // Copy.
+    FileBuf(const FileBuf& rhs) : fd_(rhs.fd_), ofs_(rhs.ofs_), size_(rhs.size_)
     {
     }
 
@@ -46,6 +55,7 @@ public:
         size_ -= bytes;
         return size_;
     }
+
     size_t write(int fd) override
     {
         off_t ofs = ofs_;
@@ -56,6 +66,7 @@ public:
         }
         return rc;
     }
+
     bool empty() const override { return size_ == 0; }
 
 private:
@@ -67,14 +78,18 @@ private:
 class ViewBuf : public BufBase
 {
 public:
+    // Construct.
+    ViewBuf(const ViewBuf& rhs) : sv_(rhs.sv_) {}
     ViewBuf(std::span<const char> sv) : sv_(sv) {}
     ViewBuf(std::string_view sv) : sv_(sv) {}
+
     size_t advance(size_t bytes) override
     {
         const auto take = std::min(sv_.size(), bytes);
         sv_ = sv_.subspan(take);
         return bytes - take;
     }
+
     size_t write(int fd) override
     {
         const auto rc = ::write(fd, sv_.data(), sv_.size());
@@ -83,23 +98,32 @@ public:
         }
         return rc;
     }
+
     std::optional<std::span<const char>> buf() override { return sv_; }
 
     bool empty() const override { return sv_.empty(); }
 
 protected:
+    // Called by class Buf.
     ViewBuf() {}
+
     std::span<const char> sv_;
 };
 
 class Buf : public ViewBuf
 {
 public:
-    Buf(std::string buf) : buf_(std::move(buf)) { sv_ = buf_; }
+    Buf() = delete;
+    Buf(std::pmr::string&& buf) : buf_(std::move(buf)) { sv_ = buf_; }
+
+    // No copy.
     Buf(const Buf&) = delete;
     Buf& operator=(const Buf&) = delete;
 
+    // Move.
     Buf(Buf&& rhs) : buf_(std::move(rhs.buf_)) { sv_ = buf_; }
+
+    // Move.
     Buf& operator=(Buf&& rhs)
     {
         buf_ = std::move(rhs.buf_);
@@ -108,13 +132,18 @@ public:
     }
 
 private:
-    std::string buf_;
+    std::pmr::string buf_;
 };
 
 
 class OQueue
 {
 public:
+    OQueue(std::pmr::memory_resource* pool) : pool_(pool), bufs_(pool)
+    {
+        bufs_.reserve(3);
+    }
+
     template <typename T>
     void add(T&& buf)
     {
@@ -125,7 +154,8 @@ public:
 
     void write(int fd)
     {
-        std::vector<struct iovec> iov;
+        std::pmr::vector<struct iovec> iov(pool_);
+        iov.reserve(bufs_.size());
         for (auto& buf : bufs_) {
             const auto maybe = buf->buf();
             if (!maybe) {
@@ -168,8 +198,8 @@ public:
     }
 
 private:
-    // TODO: turn into a circular buffer.
-    std::vector<std::unique_ptr<BufBase>> bufs_;
+    std::pmr::memory_resource* pool_;
+    std::pmr::vector<std::unique_ptr<BufBase>> bufs_;
 };
 #if 0
 int main()

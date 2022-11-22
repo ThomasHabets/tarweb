@@ -34,6 +34,9 @@
 #include <vector>
 
 namespace {
+
+constexpr bool debug_alloc = false;
+
 template <typename To, typename From>
 To safe_int_cast(const From from)
 {
@@ -51,7 +54,9 @@ To safe_int_cast(const From from)
     return to;
 }
 
-std::optional<size_t> parse_size(const std::string& in)
+// TODO: parse_size() could avoid an alloc and a copy if we rewrite
+// strtoll() to take a span instead of null terminated string.
+std::optional<size_t> parse_size(const std::pmr::string& in)
 {
     if (in.empty()) {
         return {};
@@ -60,7 +65,7 @@ std::optional<size_t> parse_size(const std::string& in)
     // Parse number.
     char* endp = NULL; // This will point to end of string.
     errno = 0;         // Pre-set errno to 0.
-    auto ret = strtoll(in.c_str(), &endp, 0);
+    auto ret = strtoll(in.c_str(), &endp, 0); // TODO: can be non-decimal?
 
     // Range errors are delivered as errno.
     // I.e. on amd64 Linux it needs to be between -2^63 and 2^63-1.
@@ -202,6 +207,62 @@ private:
     std::span<char> site_;
 };
 
+class PoolAllocator : public std::pmr::memory_resource
+{
+public:
+    PoolAllocator(size_t max) : max_(max) {}
+    ~PoolAllocator();
+
+private:
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override;
+    void
+    do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override;
+    bool do_is_equal(const memory_resource& other) const noexcept override
+    {
+        return &other == this;
+    }
+    size_t current_ = 0;
+    size_t total_ = 0;
+    size_t count_ = 0;
+    const size_t max_;
+};
+
+PoolAllocator::~PoolAllocator()
+{
+    if constexpr (debug_alloc) {
+        std::cerr << "Allocated total of " << total_ << " bytes in " << count_
+                  << " allocations\n";
+    }
+    if (current_) {
+        std::cerr << "ERROR: Allocator destroyed with non-zero balance of "
+                  << current_ << " bytes\n";
+    }
+}
+
+void* PoolAllocator::do_allocate(std::size_t bytes, std::size_t alignment)
+{
+    if constexpr (debug_alloc) {
+        std::cerr << "Allocating " << bytes << "\n";
+    }
+    current_ += bytes;
+    total_ += bytes;
+    count_++;
+    if (current_ > max_) {
+        throw std::bad_alloc();
+    }
+    return std::pmr::get_default_resource()->allocate(bytes, alignment);
+}
+
+void PoolAllocator::do_deallocate(void* p,
+                                  std::size_t bytes,
+                                  std::size_t alignment)
+{
+    if constexpr (debug_alloc) {
+        std::cerr << "Deallocating " << bytes << "\n";
+    }
+    std::pmr::get_default_resource()->deallocate(p, bytes, alignment);
+    current_ -= bytes;
+}
 
 class Request
 {
@@ -236,6 +297,7 @@ public:
           fd_(fd),
           pool_(max_connection_memory_use),
           buf_(&pool_),
+          oqueue_(&pool_),
           handshaker_(Handshaker::Base::make(std::move(tls)))
     {
     }
@@ -254,8 +316,6 @@ public:
     // There is `size` more data in the buffer. Parse and handle.
     void incremental_parse(size_t size);
 
-    OQueue oqueue_;
-
     int fd() const { return fd_; }
 
     bool handshaking() const { return !handshaker_->done(); }
@@ -267,11 +327,14 @@ private:
 
     const Site& site_;
     int fd_;
-    std::array<char, max_connection_memory_use> pool_buffer_;
-    std::pmr::monotonic_buffer_resource pool_;
+    PoolAllocator pool_;
 
     // Buffer for reading from socket.
     std::pmr::vector<char> buf_;
+
+    // Output queue.
+    OQueue oqueue_;
+
     std::span<char> readable_ = std::span(buf_.begin(), buf_.begin());
     std::span<char> writable_ = std::span(buf_.begin(), buf_.end());
 
@@ -371,11 +434,15 @@ void Connection::incremental_parse(size_t bytes)
                 std::cerr << "Full request\n";
                 oqueue_.add(ViewBuf(std::span(request_.file_->headers)));
             } else {
-                oqueue_.add(Buf(
+                // TODO: While constructing this string there's a bunch
+                // of allocations that are not counted.
+                oqueue_.add(Buf(std::pmr::string(
                     "Content-Length: " + std::to_string(content_size) +
-                    "\r\nContent-Range: bytes " + std::to_string(range.first) +
-                    "-" + std::to_string(range.second) + "/" +
-                    std::to_string(full_content_size) + "\r\n\r\n"));
+                        "\r\nContent-Range: bytes " +
+                        std::to_string(range.first) + "-" +
+                        std::to_string(range.second) + "/" +
+                        std::to_string(full_content_size) + "\r\n\r\n",
+                    &pool_)));
             }
 
             if (content_size > sendfile_min_size) {
@@ -470,12 +537,15 @@ void Connection::incremental_parse(size_t bytes)
                 }
             }
             if (names == "range") {
-                std::match_results<std::string_view::const_iterator> m;
+                std::pmr::match_results<std::string_view::const_iterator> m(
+                    &pool_);
                 const bool ok =
                     std::regex_match(value.begin(), value.end(), m, rangeRE);
                 if (ok) {
-                    auto a = parse_size(m[1].str());
-                    auto b = parse_size(m[2].str());
+                    const auto a =
+                        parse_size({ m[1].first, m[1].second, &pool_ });
+                    const auto b =
+                        parse_size({ m[2].first, m[2].second, &pool_ });
                     if (a && b) {
                         request_.range_ = { a.value(), b.value() };
                     }
@@ -861,12 +931,12 @@ void main_loop(int fd, const Site& site)
                 {
                     con.incremental_parse(rc);
                 }
-                if (!con.oqueue_.empty()) {
+                if (!con.oqueue().empty()) {
                     {
                         // Measure m;
-                        con.oqueue_.write(con.fd());
+                        con.oqueue().write(con.fd());
                     }
-                    if (!con.oqueue_.empty()) {
+                    if (!con.oqueue().empty()) {
                         poller.add_write(&con);
                     }
                 }

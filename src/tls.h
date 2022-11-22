@@ -3,6 +3,8 @@
  */
 #include <openssl/ssl.h>
 #include <memory>
+// class SSL;
+// class SSL_CTX;
 
 class TLSConnection
 {
@@ -14,7 +16,6 @@ public:
 private:
     SSL* ssl_;
 };
-
 
 class TLS
 {
