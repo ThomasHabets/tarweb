@@ -12,6 +12,7 @@ check_PROGRAMS=$(TESTS)
 tarweb_SOURCES=\
 src/main.cc \
 src/tls.cc \
+src/handshaker.cc \
 src/tarweb.cc
 
 tarweb_test_SOURCES=\

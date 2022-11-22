@@ -1,3 +1,4 @@
+#include "handshaker.h"
 #include "tls.h"
 #include "writer.h"
 
@@ -233,12 +234,9 @@ public:
                std::unique_ptr<TLSConnection>&& tls = {})
         : site_(site),
           fd_(fd),
-          pool_(std::data(pool_buffer_),
-                std::size(pool_buffer_),
-                std::pmr::null_memory_resource()),
+          pool_(max_connection_memory_use),
           buf_(&pool_),
-          tls_(std::move(tls)),
-          handshaking_(tls_)
+          handshaker_(Handshaker::Base::make(std::move(tls)))
     {
     }
 
@@ -260,8 +258,9 @@ public:
 
     int fd() const { return fd_; }
 
-    bool handshaking() const { return handshaking_; }
-    std::pair<bool, bool> handshake();
+    bool handshaking() const { return !handshaker_->done(); }
+    Handshaker::Status handshake() { return handshaker_->handshake(); }
+    OQueue& oqueue() noexcept { return oqueue_; }
 
 private:
     void reset_buffer(size_t size);
@@ -279,35 +278,8 @@ private:
     // Request under construction.
     Request request_;
 
-    std::unique_ptr<TLSConnection> tls_;
-    bool handshaking_;
+    std::unique_ptr<Handshaker::Base> handshaker_;
 };
-
-std::pair<bool, bool> Connection::handshake()
-{
-    if (!handshaking_) {
-        return { true, false };
-    }
-    const int rc = SSL_accept(tls_->ssl());
-    if (rc == 1) {
-        if (!BIO_get_ktls_send(SSL_get_wbio(tls_->ssl()))) {
-            throw std::runtime_error("KTLS not enabled for send");
-        }
-        if (!BIO_get_ktls_recv(SSL_get_rbio(tls_->ssl()))) {
-            throw std::runtime_error("KTLS not enabled for receive");
-        }
-        handshaking_ = false;
-        return { true, false };
-    }
-    const auto rc_err = SSL_get_error(tls_->ssl(), rc);
-    if (rc_err == SSL_ERROR_WANT_READ) {
-        return { true, false };
-    }
-    if (rc_err == SSL_ERROR_WANT_WRITE) {
-        return { false, true };
-    }
-    throw std::runtime_error("SSL_accept() unknown error");
-}
 
 void Connection::reset_buffer(size_t size)
 {
@@ -625,6 +597,8 @@ void EPollPoller::poll(std::vector<Connection*>& retr,
     }
 }
 
+// UVector is a pool of preallocated object spaces used to efficiently
+// construct objects.
 template <typename T>
 class UVector
 {
@@ -812,11 +786,11 @@ void main_loop(int fd, const Site& site)
                         tlscon = tls->enable_ktls(cli);
                     }
                     auto newcon = cons.alloc(site, cli, std::move(tlscon));
-                    const auto [r, w] = newcon->handshake();
-                    if (r) {
+                    const auto st = newcon->handshake();
+                    if (st.want_read || st.done) {
                         poller.add_read(newcon);
                     }
-                    if (w) {
+                    if (st.want_write) {
                         poller.add_write(newcon);
                     }
                     break;
@@ -831,15 +805,17 @@ void main_loop(int fd, const Site& site)
              */
             auto& con = *fdr;
             if (con.handshaking()) {
-                const auto [r, w] = con.handshake();
-                if (con.handshaking()) {
+                const auto hs = con.handshake();
+                if (hs.done) {
                     poller.add_read(&con);
                     poller.remove_write(&con);
                 } else {
-                    if (r) {
+                    if (hs.want_read) {
                         poller.add_read(&con);
                     }
-                    if (w) {
+                    if (hs.want_write) {
+                        // TODO: remove read.
+                        // First need to clean up the EPoller
                         poller.add_write(&con);
                     }
                 }
@@ -904,23 +880,21 @@ void main_loop(int fd, const Site& site)
             }
             auto& con = *fdw;
 
-            if (con.handshaking()) {
-                const auto [r, w] = con.handshake();
-                // TODO: remove read bit if no more to read()
-                if (r) {
-                    poller.add_read(&con);
-                }
-                if (!w) {
-                    poller.remove_write(&con);
-                }
-                continue;
+            const auto hs = con.handshake();
+            if (hs.done || hs.want_read) {
+                poller.add_read(&con);
+            }
+            if (!hs.want_write) {
+                poller.remove_write(&con);
             }
 
-            if (!con.oqueue_.empty()) {
-                con.oqueue_.write(con.fd());
-            }
-            if (con.oqueue_.empty()) {
-                poller.remove_write(&con);
+            if (hs.done) {
+                if (!con.oqueue().empty()) {
+                    con.oqueue().write(con.fd());
+                }
+                if (con.oqueue().empty()) {
+                    poller.remove_write(&con);
+                }
             }
         }
     }
