@@ -54,30 +54,24 @@ To safe_int_cast(const From from)
     return to;
 }
 
-// TODO: parse_size() could avoid an alloc and a copy if we rewrite
-// strtoll() to take a span instead of null terminated string.
-std::optional<size_t> parse_size(const std::pmr::string& in)
+std::optional<size_t> parse_size(std::string_view in)
 {
     if (in.empty()) {
         return {};
     }
 
-    // Parse number.
-    char* endp = NULL; // This will point to end of string.
-    errno = 0;         // Pre-set errno to 0.
-    auto ret = strtoll(in.c_str(), &endp, 0); // TODO: can be non-decimal?
-
-    // Range errors are delivered as errno.
-    // I.e. on amd64 Linux it needs to be between -2^63 and 2^63-1.
-    if (errno) {
-        return {};
+    size_t ret = 0;
+    for (const auto ch : in) {
+        if (!isdigit(ch)) {
+            return {};
+        }
+        const auto newret = ret * 10 + (ch - '0');
+        if (newret < ret) {
+            return {};
+        }
+        ret = newret;
     }
-
-    // Check for garbage at the end of the string.
-    if (*endp) {
-        return {};
-    }
-    return safe_int_cast<size_t>(ret);
+    return ret;
 }
 
 } // namespace
@@ -542,10 +536,8 @@ void Connection::incremental_parse(size_t bytes)
                 const bool ok =
                     std::regex_match(value.begin(), value.end(), m, rangeRE);
                 if (ok) {
-                    const auto a =
-                        parse_size({ m[1].first, m[1].second, &pool_ });
-                    const auto b =
-                        parse_size({ m[2].first, m[2].second, &pool_ });
+                    const auto a = parse_size({ m[1].first, m[1].second });
+                    const auto b = parse_size({ m[2].first, m[2].second });
                     if (a && b) {
                         request_.range_ = { a.value(), b.value() };
                     }
