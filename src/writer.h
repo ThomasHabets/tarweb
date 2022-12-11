@@ -1,3 +1,5 @@
+#include "cast.h"
+
 #include <memory_resource>
 #include <string_view>
 #include <sys/uio.h>
@@ -141,7 +143,7 @@ class OQueue
 public:
     OQueue(std::pmr::memory_resource* pool) : pool_(pool), bufs_(pool)
     {
-        bufs_.reserve(3);
+        bufs_.reserve(5); // See README. Should not see more than 5.
     }
 
     template <typename T>
@@ -154,23 +156,27 @@ public:
 
     void write(int fd)
     {
-        // TODO: this vector could probably just be on the stack.
-        std::pmr::vector<struct iovec> iov(pool_);
-        iov.reserve(bufs_.size());
-        for (auto& buf : bufs_) {
-            const auto maybe = buf->buf();
+        size_t size = bufs_.size();
+
+        // Wat, why are variable length arrays not part of C++20?
+        // TODO: assert that size is indeed small?
+        auto iov =
+            static_cast<struct iovec*>(alloca(size * sizeof(struct iovec)));
+
+        for (size_t c = 0; c < bufs_.size(); c++) {
+            const auto maybe = bufs_[c]->buf();
             if (!maybe) {
+                // Next buffer may be a sendfile().
+                size = c;
                 break;
             }
             const auto b = maybe.value();
-            iov.push_back(iovec{
-                .iov_base = (void*)b.data(),
-                .iov_len = b.size(),
-            });
+            iov[c].iov_base = (void*)b.data();
+            iov[c].iov_len = b.size();
         }
-        if (!iov.empty()) {
+        if (size) {
             // TODO: set TCP_CORK if iov.size() < bufs_.size() ?
-            auto rc = ::writev(fd, iov.data(), (int)iov.size());
+            auto rc = ::writev(fd, iov, safe_int_cast<int>(size));
             if (rc < 0) {
                 throw std::runtime_error("writev()");
             }
@@ -195,7 +201,6 @@ public:
                 bufs_.erase(bufs_.begin(), bufs_.begin() + 1);
             }
         }
-        return;
     }
 
 private:

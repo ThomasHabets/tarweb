@@ -15,7 +15,27 @@ TODO:
 * request timeout
 * support headerless, where all headers are already pre-inserted into the tarfile
 * verify that archive doesn't have sparse files
+* content-type
 
 ## Useful references
 * https://youtu.be/8NSzkYSX5nY
 * https://youtu.be/36qZYL5RlgY
+
+## Memory allocations per request
+
+### Full file request
+
+* 4096 bytes request read buffer.
+* 40 bytes for 5 output queue entries
+  * status200
+  * if applicable: keepalive header
+  * if applicable: transfer encoding header
+  * file-specific headers (namely content-length)
+  * contents
+
+### Range read
+
+* 4096 bytes request read buffer.
+* regex match_results parsing range header
+* 48 bytes (should be enough) for range header
+* output queue entries (see full request)

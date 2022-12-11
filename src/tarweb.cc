@@ -1,3 +1,4 @@
+#include "cast.h"
 #include "handshaker.h"
 #include "tls.h"
 #include "writer.h"
@@ -35,24 +36,7 @@
 
 namespace {
 
-constexpr bool debug_alloc = true;
-
-template <typename To, typename From>
-To safe_int_cast(const From from)
-{
-    if (std::is_signed_v<From> && std::is_unsigned_v<To> && from < 0) {
-        throw std::runtime_error("bad value, casting negative to unsigned");
-    }
-    const To to = static_cast<To>(from);
-    if (std::is_unsigned_v<From> && std::is_signed_v<To> && to < 0) {
-        throw std::runtime_error("bad value, unsigned value turned negative");
-    }
-    if (from != static_cast<From>(to)) {
-        throw std::runtime_error(
-            "bad value, different value when converted back");
-    }
-    return to;
-}
+constexpr bool debug_alloc = false;
 
 std::optional<size_t> parse_size(std::string_view in)
 {
@@ -438,7 +422,6 @@ void Connection::incremental_parse(size_t bytes)
             const auto content_size = range.second - range.first + 1;
 
             if (full_content_size == content_size) {
-                std::cerr << "Full request\n";
                 oqueue_.add(ViewBuf(std::span(request_.file_->headers)));
             } else {
                 // Maybe there's a cleaner way to avoid non-pool allocs.
