@@ -35,7 +35,7 @@
 
 namespace {
 
-constexpr bool debug_alloc = false;
+constexpr bool debug_alloc = true;
 
 template <typename To, typename From>
 To safe_int_cast(const From from)
@@ -74,6 +74,16 @@ std::optional<size_t> parse_size(std::string_view in)
     return ret;
 }
 
+
+void append(std::pmr::string& buf, std::string_view sv) { buf.append(sv); }
+
+void append(std::pmr::string& buf, size_t i)
+{
+    // TODO: This may or may not allocate, due to small string
+    // optimization. But it's a very brief allocation, so it's fine?
+    buf.append(std::to_string(i));
+}
+
 } // namespace
 
 constexpr int chunk_size = 4096;
@@ -108,6 +118,9 @@ const std::string header[] = {
 } // namespace encodings
 
 const std::string_view connection_close = "Connection: close\r\n";
+constexpr std::string_view content_length = "Content-Length: ";
+constexpr std::string_view crnl_content_range_bytes =
+    "\r\nContent-Range: bytes ";
 
 struct Error {
     Error(const std::string& err)
@@ -428,15 +441,20 @@ void Connection::incremental_parse(size_t bytes)
                 std::cerr << "Full request\n";
                 oqueue_.add(ViewBuf(std::span(request_.file_->headers)));
             } else {
-                // TODO: While constructing this string there's a bunch
-                // of allocations that are not counted.
-                oqueue_.add(Buf(std::pmr::string(
-                    "Content-Length: " + std::to_string(content_size) +
-                        "\r\nContent-Range: bytes " +
-                        std::to_string(range.first) + "-" +
-                        std::to_string(range.second) + "/" +
-                        std::to_string(full_content_size) + "\r\n\r\n",
-                    &pool_)));
+                // Maybe there's a cleaner way to avoid non-pool allocs.
+                std::pmr::string buf(&pool_);
+                buf.reserve(content_length.size() + 10 +
+                            crnl_content_range_bytes.size() + 10 + 10 + 10 + 4);
+                append(buf, content_length);
+                append(buf, content_size);
+                append(buf, crnl_content_range_bytes);
+                append(buf, range.first);
+                buf.append("-");
+                append(buf, range.second);
+                buf.append("/");
+                append(buf, full_content_size);
+                append(buf, "\r\n\r\n");
+                oqueue_.add(Buf(std::move(buf)));
             }
 
             if (content_size > sendfile_min_size) {

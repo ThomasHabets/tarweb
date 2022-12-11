@@ -154,6 +154,7 @@ public:
 
     void write(int fd)
     {
+        // TODO: this vector could probably just be on the stack.
         std::pmr::vector<struct iovec> iov(pool_);
         iov.reserve(bufs_.size());
         for (auto& buf : bufs_) {
