@@ -156,14 +156,18 @@ public:
 
     void write(int fd)
     {
-        size_t size = bufs_.size();
+        // The real number should be max 5, per README. But that may
+        // change as we add features.
+        //
+        // The important part is not alloca()ing so much that we skip
+        // any stack guard pages.
+        size_t size = std::min<size_t>(bufs_.size(), 10);
 
-        // Wat, why are variable length arrays not part of C++20?
-        // TODO: assert that size is indeed small?
+        // VLAs are not part of C++, and won't be.
         auto iov =
             static_cast<struct iovec*>(alloca(size * sizeof(struct iovec)));
 
-        for (size_t c = 0; c < bufs_.size(); c++) {
+        for (size_t c = 0; c < size; c++) {
             const auto maybe = bufs_[c]->buf();
             if (!maybe) {
                 // Next buffer may be a sendfile().
