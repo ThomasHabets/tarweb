@@ -58,14 +58,16 @@ std::optional<size_t> parse_size(std::string_view in)
     return ret;
 }
 
-
-void append(std::pmr::string& buf, std::string_view sv) { buf.append(sv); }
-
-void append(std::pmr::string& buf, size_t i)
+template <typename T>
+void append(std::pmr::string& buf, const T& i)
 {
-    // TODO: This may or may not allocate, due to small string
-    // optimization. But it's a very brief allocation, so it's fine?
-    buf.append(std::to_string(i));
+    if constexpr (std::is_arithmetic_v<T>) {
+        // TODO: This may or may not allocate, due to small string
+        // optimization. But it's a very brief allocation, so it's fine?
+        buf.append(std::to_string(i));
+    } else {
+        buf.append(i);
+    }
 }
 
 } // namespace
