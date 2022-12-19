@@ -14,6 +14,8 @@ struct Status {
 class Base
 {
 public:
+    virtual ~Base(){};
+
     bool done() const { return done_; }
 
     static std::unique_ptr<Base> make(std::unique_ptr<TLSConnection>&&);
