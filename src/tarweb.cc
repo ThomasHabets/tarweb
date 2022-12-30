@@ -4,33 +4,38 @@
 #include "writer.h"
 
 #include <fcntl.h>
-#include <memory_resource>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <unistd.h>
+
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/times.h>
+#include <sys/types.h>
 #include <sys/uio.h>
-#include <system_error>
-#include <unistd.h>
+
 #include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <deque>
 #include <iostream>
 #include <map>
+#include <memory_resource>
 #include <optional>
 #include <regex>
 #include <set>
 #include <span>
 #include <stack>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -840,6 +845,15 @@ void main_loop(int fd, const Site& site)
                         }
                         throw std::system_error(
                             errno, std::generic_category(), "accept()");
+                    }
+                    {
+                        int on = 1;
+                        if (setsockopt(
+                                cli, SOL_TCP, TCP_NODELAY, &on, sizeof(on))) {
+                            throw std::system_error(errno,
+                                                    std::generic_category(),
+                                                    "setsockopt(TCP_NODELAY)");
+                        }
                     }
                     // TODO: maybe data is usually available
                     // immediately, so perform read here too?
