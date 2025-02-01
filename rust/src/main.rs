@@ -414,21 +414,35 @@ fn maybe_answer_req(
     trace!("Let's see if there's a request in {:?}", s);
     let req = parse_request(data)?;
     let Some(req) = req else {
+        // No full request yet.
         hook.con.read(ops);
         return Ok((0, 0));
     };
-    debug!("Got request for {}", req.path);
+    debug!("Got request for path {}", req.path);
     // TODO: replace with writev?
     let len = req.len + 4;
-    // TODO: remove duplicate lookup.
-    let (pos, resp_len) = archive.get_ofs("blog.habets.se/index.html").unwrap();
-    hook.con.write_header_bytes(
-        ops,
-        format!("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: {resp_len}\r\n\r\n")
+    let (pos, resp_len) = if let Some((pos, resp_len)) = archive.get_ofs(req.path) {
+        hook.con.write_header_bytes(
+            ops,
+            format!(
+                "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: {resp_len}\r\n\r\n"
+            )
             .as_bytes(),
-        pos,
-        resp_len,
-    );
+            pos,
+            resp_len,
+        );
+        (pos, resp_len)
+    } else {
+        let msg404 = "Not found\n";
+        let len404 = msg404.len();
+        hook.con.write_header_bytes(
+            ops,
+            format!("HTTP/1.1 404 Not Found\r\nConnection: keep-alive\r\nContent-Length: {len404}\r\n\r\n{msg404}").as_bytes(),
+            0,
+            0,
+        );
+        (0, 0)
+    };
     hook.con.read_buf.copy_within(len.., 0);
     hook.con.read_buf_pos -= len;
     Ok((pos, resp_len))
@@ -682,6 +696,9 @@ struct Opt {
     #[arg(long, short, default_value = "[::]:8080", help = "Listen address.")]
     listen: String,
 
+    #[arg(long, default_value = "", help = "Strip prefix before looking in tar")]
+    prefix: String,
+
     tarfile: String,
 }
 
@@ -718,24 +735,43 @@ struct Archive {
 }
 
 impl Archive {
-    fn new(filename: &str) -> Result<Self> {
+    fn new(filename: &str, prefix: &str) -> Result<Self> {
         let file = std::fs::File::open(filename)?;
         let mut archive = tar::Archive::new(&file);
         let mut content = HashMap::new();
         for e in archive.entries()? {
             let e = e?;
-            content.insert(
-                e.path()?.to_string_lossy().to_string(),
-                (e.raw_file_position(), e.size()),
-            );
+            if let tar::EntryType::Regular = e.header().entry_type() {
+            } else {
+                continue;
+            }
+            let name = e.path()?;
+            let name = name.to_string_lossy();
+            let name = name.strip_prefix(prefix).unwrap_or(name.as_ref());
+            content.insert(name.to_string(), (e.raw_file_position(), e.size()));
         }
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         Ok(Self { content, mmap })
     }
     #[must_use]
     fn get_ofs(&self, filename: &str) -> Option<(usize, usize)> {
+        use std::borrow::Cow;
+        if filename.is_empty() {
+            return None;
+        }
+        // Strip initial slash.
+        let filename = filename.strip_prefix("/").unwrap_or(filename);
+
+        // Add index.html to directory paths.
+        let filename = if filename.is_empty() || filename.ends_with('/') {
+            Cow::Owned(filename.to_owned() + "index.html")
+        } else {
+            Cow::Borrowed(filename)
+        };
+
+        trace!("Looking up {filename}");
         self.content
-            .get(filename)
+            .get(filename.as_ref())
             .copied()
             .map(|(a, b)| (a as usize, b as usize))
     }
@@ -765,7 +801,7 @@ fn main() -> Result<()> {
     trace!("Ring size: {}", opt.ring_size);
     trace!("Single issuer: {}", opt.single_issuer);
 
-    let archive = Archive::new(&opt.tarfile)?;
+    let archive = Archive::new(&opt.tarfile, &opt.prefix)?;
 
     let listener = std::net::TcpListener::bind(&opt.listen)?;
     // The Rust API doesn't allow it, but setting TCP_NODELAY on a listening socket seems to set
