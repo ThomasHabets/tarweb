@@ -403,11 +403,7 @@ fn decode_user_data(user_data: u64, result: i32, cons: &mut Connections) -> Hook
 }
 
 // This function ends with an error, or a submitted read() or write().
-fn maybe_answer_req(
-    hook: &mut Hook,
-    ops: &mut SQueue,
-    archive: &Archive,
-) -> Result<(usize, usize)> {
+fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Result<()> {
     let data = &hook.con.read_buf[..hook.con.read_buf_pos];
     let s =
         unsafe { std::ffi::CStr::from_ptr(data.as_ptr() as *const std::os::raw::c_char).to_str()? };
@@ -416,12 +412,12 @@ fn maybe_answer_req(
     let Some(req) = req else {
         // No full request yet.
         hook.con.read(ops);
-        return Ok((0, 0));
+        return Ok(());
     };
     debug!("Got request for path {}", req.path);
     // TODO: replace with writev?
     let len = req.len + 4;
-    let (pos, resp_len) = if let Some((pos, resp_len)) = archive.get_ofs(req.path) {
+    if let Some((pos, resp_len)) = archive.get_ofs(req.path) {
         hook.con.write_header_bytes(
             ops,
             format!(
@@ -431,7 +427,6 @@ fn maybe_answer_req(
             pos,
             resp_len,
         );
-        (pos, resp_len)
     } else {
         let msg404 = "Not found\n";
         let len404 = msg404.len();
@@ -441,11 +436,10 @@ fn maybe_answer_req(
             0,
             0,
         );
-        (0, 0)
     };
     hook.con.read_buf.copy_within(len.., 0);
     hook.con.read_buf_pos -= len;
-    Ok((pos, resp_len))
+    Ok(())
 }
 
 fn handle_connection(
