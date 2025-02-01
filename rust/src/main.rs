@@ -19,22 +19,36 @@ use log::{debug, error, info, trace, warn};
 use rtsan_standalone::nonblocking;
 
 const MAX_CONNECTIONS: usize = 100_000;
-const USER_DATA_CON_MASK: u64 = 0xffff;
 
+// Every io_uring op has a "handle" of sorts. We use it to stuff the connection
+// ID, and the operation.
+// This mask allows for 2^32 concurrent connections.
+const USER_DATA_CON_MASK: u64 = 0xffffffff;
+
+// Special user data "handle" to indicate a new connection coming in.
+const USER_DATA_LISTENER: u64 = u64::MAX;
+
+// Special user data "handle" to indicate timeout. At timeout, we do some
+// housekeeping.
+const USER_DATA_TIMEOUT: u64 = USER_DATA_LISTENER - 1;
+
+// This is the op type part of the user data "handle".
 // If more ops are added, add them to make_ops_cancel for !modern path.
-const USER_DATA_OP_MASK: u64 = 0xf0000;
-const USER_DATA_OP_WRITE: u64 = 0x10000;
-const USER_DATA_OP_CLOSE: u64 = 0x20000;
-const USER_DATA_OP_READ: u64 = 0x30000;
-const USER_DATA_OP_CANCEL: u64 = 0x40000;
+const USER_DATA_OP_MASK: u64 = 0xf00000000;
+const USER_DATA_OP_WRITE: u64 = 0x100000000;
+const USER_DATA_OP_CLOSE: u64 = 0x200000000;
+const USER_DATA_OP_READ: u64 = 0x300000000;
+const USER_DATA_OP_CANCEL: u64 = 0x400000000;
 
+// Max milliseconds that a connection is allowed to be idle, before we close it.
 const MAX_IDLE: u128 = 5000;
 
+// Every connection has a fixed read buffer (for the request). This is the
+// size.
 const MAX_READ_BUF: usize = 1024;
-const MAX_HEADER_BUF: usize = 1024;
 
-const USER_DATA_LISTENER: u64 = u64::MAX;
-const USER_DATA_TIMEOUT: u64 = USER_DATA_LISTENER - 1;
+// Outgoing headers max size.
+const MAX_HEADER_BUF: usize = 1024;
 
 // TODO: panics if squeue is full. There's a better way, surely.
 type SQueue = ArrayVec<io_uring::squeue::Entry, 10_000>;
