@@ -334,23 +334,12 @@ fn disable_nodelay(fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum UserDataOp {
     Write,
     Read,
     Close,
     Cancel,
-}
-
-impl std::fmt::Display for UserDataOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            UserDataOp::Write => write!(f, "Write"),
-            UserDataOp::Read => write!(f, "Read"),
-            UserDataOp::Close => write!(f, "Close"),
-            UserDataOp::Cancel => write!(f, "Cancel"),
-        }
-    }
 }
 
 struct Hook<'a> {
@@ -466,7 +455,7 @@ fn handle_connection(
     {
         let fd = hook.con.fd().unwrap_or(-1);
         debug!(
-            "Op {op} completed on con {con} fd {fd}, res={res} raw={raw:x}",
+            "Op {op:?} completed on con {con} fd {fd}, res={res} raw={raw:x}",
             op = hook.op,
             con = hook.con.id,
             raw = hook.raw,
