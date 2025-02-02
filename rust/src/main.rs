@@ -644,6 +644,9 @@ fn mainloop(
             drop(sq);
             // This will only trigger a syscall if the kernel thread went to
             // sleep.
+            //
+            // There doesn't seem to be a way to know if it in fact did trigger
+            // a syscall.
             ring.submit()?;
         }
     }
@@ -853,3 +856,5 @@ fn main() -> Result<()> {
         Ok(())
     })
 }
+/* vim: textwidth=80
+ */
