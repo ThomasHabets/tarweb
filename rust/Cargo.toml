@@ -5,7 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.95"
-arrayvec = "0.7.6"
+# Not sure why I need to have the zeroize feature *and* dependency.
+# The feature doesn't seem to add anything.
+arrayvec = { version = "0.7.6", features = ["zeroize"]}
 clap = { version = "4.5.27", features = ["derive"] }
 core_affinity = "0.8.1"
 
@@ -18,7 +20,7 @@ nix = { version = "0.29.0", features = ["feature"]}
 rtsan-standalone = "0.1.0"
 stderrlog = "0.6.0"
 tar = "0.4.43"
-zeroize = "1.8.1"
+zeroize = { version = "1.8.1", features = ["simd"] }
 
 [features]
 rtsan = ["rtsan-standalone/enable"]
