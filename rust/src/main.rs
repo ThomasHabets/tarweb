@@ -349,13 +349,6 @@ struct Hook<'a> {
     result: i32,
 }
 
-#[must_use]
-fn strerror(errno: i32) -> String {
-    let estr = unsafe { libc::strerror(errno.abs()) };
-    // May allocate memory. But it's in the error path, so it's OK?
-    unsafe { std::ffi::CStr::from_ptr(estr).to_string_lossy().to_string() }
-}
-
 struct Request<'a> {
     path: &'a str,
     len: usize,
@@ -462,7 +455,10 @@ fn handle_connection(
             res = hook.result,
         );
         if hook.result < 0 {
-            debug!("… errno {}", strerror(hook.result));
+            debug!(
+                "… errno {}",
+                std::io::Error::from_raw_os_error(hook.result.abs())
+            );
         }
     }
     match hook.op {
@@ -470,7 +466,7 @@ fn handle_connection(
             if hook.result < 0 {
                 return Err(Error::msg(format!(
                     "read() failed: {}",
-                    strerror(hook.result)
+                    std::io::Error::from_raw_os_error(hook.result.abs())
                 )));
             }
             if hook.result == 0 {
@@ -492,7 +488,7 @@ fn handle_connection(
             if hook.result < 0 {
                 return Err(Error::msg(format!(
                     "write() failed: {}",
-                    strerror(hook.result)
+                    std::io::Error::from_raw_os_error(hook.result.abs())
                 )));
             }
             // TODO: ensure write is complete. Else re-issue the write.
@@ -510,7 +506,7 @@ fn handle_connection(
                 error!(
                     "Cancel return nonzero: {} {}",
                     hook.result,
-                    strerror(hook.result)
+                    std::io::Error::from_raw_os_error(hook.result.abs())
                 );
             }
         }
@@ -596,7 +592,7 @@ fn mainloop(
                     if result < 0 {
                         warn!(
                             "Accept failed! {}",
-                            std::io::Error::from_raw_os_error(-result)
+                            std::io::Error::from_raw_os_error(result.abs())
                         );
                         continue;
                     }
