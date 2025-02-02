@@ -59,14 +59,15 @@ type HeaderBuf = ArrayVec<u8, MAX_HEADER_BUF>;
 enum State {
     Idle,
 
-    // Reading new request. Note that because of pipelining, we may enter this state with a nonzero
-    // read_buf, and may exit it with more full requests ready to go.
+    // Reading new request. Note that because of pipelining, we may enter this
+    // state with a nonzero read_buf, and may exit it with more full requests
+    // ready to go.
     //
     // This state means no pending Write or Close, at least.
     Reading(i32),
 
-    // header_buf could be inside this enum, but I'm not sure I can create it on state change
-    // without copying it. No placement new.
+    // header_buf could be inside this enum, but I'm not sure I can create it on
+    // state change without copying it. No placement new.
     //
     // This state has a pending Write.
     WritingHeaders(i32, usize, usize),
@@ -76,8 +77,8 @@ enum State {
     // TODO: add data file.
     WritingData(i32, usize, usize),
 
-    // Close and possibly Cancel has been sent, but we don't reuse the connection object until all
-    // ops have completed.
+    // Close and possibly Cancel has been sent, but we don't reuse the
+    // connection object until all ops have completed.
     Closing,
 }
 struct Connection {
@@ -238,8 +239,8 @@ impl Connection {
 struct Connections {
     // Always size MAX_CONNECTIONS.
     //
-    // I'd like for this to be an array, but it can't be constructed directly on the heap.
-    // https://github.com/rust-lang/rust/issues/53827
+    // I'd like for this to be an array, but it can't be constructed directly on
+    // the heap. https://github.com/rust-lang/rust/issues/53827
     //
     // No box syntax?
     // So… how am I supposed to do this?
@@ -250,7 +251,6 @@ impl Connections {
     #[must_use]
     fn new() -> Self {
         Self {
-            //cons: std::array::from_fn(Connection::new),
             cons: (0..MAX_CONNECTIONS).map(Connection::new).collect(),
         }
     }
