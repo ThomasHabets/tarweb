@@ -20,6 +20,8 @@ use rtsan_standalone::nonblocking;
 
 const MAX_CONNECTIONS: usize = 100_000;
 
+const THREAD_STACK_SIZE: usize = 10 * 1048576;
+
 // Every io_uring op has a "handle" of sorts. We use it to stuff the connection
 // ID, and the operation.
 // This mask allows for 2^32 concurrent connections.
@@ -812,46 +814,49 @@ fn main() -> Result<()> {
             let listener = listener.try_clone()?;
             let opt = &opt;
             let archive = &archive;
-            s.spawn(move || -> Result<()> {
-                if opt.cpu_affinity {
-                    // Set affinity mapping 1:1.
-                    if !core_affinity::set_for_current(core_affinity::CoreId { id: 2 * n }) {
-                        error!("Failed to bind to core {n}");
+            std::thread::Builder::new()
+                .name(format!("handler/{n}").to_string())
+                .stack_size(THREAD_STACK_SIZE)
+                .spawn_scoped(s, move || -> Result<()> {
+                    if opt.cpu_affinity {
+                        // Set affinity mapping 1:1.
+                        if !core_affinity::set_for_current(core_affinity::CoreId { id: 2 * n }) {
+                            error!("Failed to bind to core {n}");
+                        }
                     }
-                }
-                let mut ring = io_uring::IoUring::builder();
-                let mut ring = ring
-                    .dontfork()
-                    // .setup_sqpoll_cpu()
-                    // .setup_cqsize()
-                    .setup_sqpoll(opt.sqpoll_ms);
-                if opt.single_issuer {
-                    ring = ring.setup_single_issuer();
-                }
-                let mut ring = ring.build(opt.ring_size)?;
+                    let mut ring = io_uring::IoUring::builder();
+                    let mut ring = ring
+                        .dontfork()
+                        // .setup_sqpoll_cpu()
+                        // .setup_cqsize()
+                        .setup_sqpoll(opt.sqpoll_ms);
+                    if opt.single_issuer {
+                        ring = ring.setup_single_issuer();
+                    }
+                    let mut ring = ring.build(opt.ring_size)?;
 
-                // TODO: Apparently, this pin is ineffective because timespec is Unpin.
-                // Needs a wrapping struct that is not Unpin, apparently.
-                let timeout = opt.periodic_wakeup.into();
-                let timeout = Pin::new(&timeout);
-                let init_ops = [
-                    make_op_accept(&listener, opt.accept_multi),
-                    make_op_timeout(timeout),
-                ];
-                unsafe {
-                    for op in init_ops {
-                        ring.submission()
-                            .push(&op)
-                            .expect("submission queue is full");
+                    // TODO: Apparently, this pin is ineffective because timespec is Unpin.
+                    // Needs a wrapping struct that is not Unpin, apparently.
+                    let timeout = opt.periodic_wakeup.into();
+                    let timeout = Pin::new(&timeout);
+                    let init_ops = [
+                        make_op_accept(&listener, opt.accept_multi),
+                        make_op_timeout(timeout),
+                    ];
+                    unsafe {
+                        for op in init_ops {
+                            ring.submission()
+                                .push(&op)
+                                .expect("submission queue is full");
+                        }
                     }
-                }
-                ring.submit()?; // Or sq.sync?
-                eprintln!("Running thread {n}");
-                let mut connections = Connections::new();
-                mainloop(ring, listener, timeout, &mut connections, opt, archive)?;
-                eprintln!("Exiting thread {n}");
-                Ok(())
-            });
+                    ring.submit()?; // Or sq.sync?
+                    eprintln!("Running thread {n}");
+                    let mut connections = Connections::new();
+                    mainloop(ring, listener, timeout, &mut connections, opt, archive)?;
+                    eprintln!("Exiting thread {n}");
+                    Ok(())
+                })?;
         }
         Ok(())
     })
