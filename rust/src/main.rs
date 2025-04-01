@@ -614,9 +614,11 @@ fn mainloop(
     debug!("Loading key");
     let key = load_private_key("privkey.pem")?;
     debug!("Creating TLS config");
-    let config = Arc::new(rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(certs, key)?);
+        .with_single_cert(certs, key)?;
+    config.enable_secret_extraction = true;
+    let config = Arc::new(config);
     eprintln!("Starting main thread loop");
     loop {
         let mut cq = ring.completion();
@@ -709,6 +711,9 @@ fn mainloop(
             if !d.tls.is_handshaking() {
                 debug!("Handshaking is done");
                 let fd = d.fd;
+                let t = std::mem::replace(&mut d.tls, rustls::ServerConnection::new(config.clone())?);
+                let keys = t.dangerous_extract_secrets()?;
+                //debug!("Extracted secrets: {keys:?}");
                 drop(d);
                 data.con.state = State::Reading(fd);
             }
@@ -904,12 +909,13 @@ fn main() -> Result<()> {
         disable_nodelay(listener.as_raw_fd())?;
     }
 
-    std::thread::scope(|s| {
+    let ret = std::thread::scope(|s| -> Result<()> {
+        let mut handles = Vec::new();
         for n in 0..opt.threads {
             let listener = listener.try_clone()?;
             let opt = &opt;
             let archive = &archive;
-            std::thread::Builder::new()
+            handles.push(std::thread::Builder::new()
                 .name(format!("handler/{n}").to_string())
                 .stack_size(THREAD_STACK_SIZE)
                 .spawn_scoped(s, move || -> Result<()> {
@@ -951,10 +957,16 @@ fn main() -> Result<()> {
                     mainloop(ring, listener, timeout, &mut connections, opt, archive)?;
                     eprintln!("Exiting thread {n}");
                     Ok(())
-                })?;
+                })?);
         }
+        for handle in handles {
+            handle.join().expect("foo")?;
+        }
+        debug!("All threads joined!");
         Ok(())
-    })
+    })?;
+    debug!("All threads done: {ret:?}");
+    Ok(())
 }
 /* vim: textwidth=80
  */
