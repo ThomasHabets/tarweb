@@ -11,12 +11,15 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::{Error, Result};
 use arrayvec::ArrayVec;
 use clap::Parser;
 use log::{debug, error, info, trace, warn};
 use rtsan_standalone::nonblocking;
+
+use rustls::pki_types::{PrivateKeyDer, CertificateDer};
 
 const MAX_CONNECTIONS: usize = 100_000;
 
@@ -58,8 +61,33 @@ type ReadBuf = [u8; MAX_READ_BUF];
 type HeaderBuf = ArrayVec<u8, MAX_HEADER_BUF>;
 
 #[derive(Debug)]
+struct HandshakeData {
+    fd: i32,
+    tls: rustls::ServerConnection,
+}
+
+
+
+impl HandshakeData {
+    fn new(fd: i32, tls: rustls::ServerConnection) -> Self {
+        Self {
+            fd,
+            tls,
+        }
+    }
+    fn received(&mut self, data: &[u8]) -> Result<rustls::IoState, rustls::Error> {
+        debug!("Got some handshaky data: {data:?}");
+        let mut reader = std::io::Cursor::new(data);
+        self.tls.read_tls(&mut reader).unwrap();
+        self.tls.process_new_packets()
+    }
+}
+
+#[derive(Debug)]
 enum State {
     Idle,
+
+    Handshaking(HandshakeData),
 
     // Reading new request. Note that because of pipelining, we may enter this
     // state with a nonzero read_buf, and may exit it with more full requests
@@ -86,6 +114,8 @@ enum State {
 struct Connection {
     id: usize,
     state: State,
+
+    // Outstanding number of io_uring ops.
     outstanding: usize,
     last_action: std::time::Instant,
     read_buf_pos: usize,
@@ -108,8 +138,8 @@ impl Connection {
             _pin: std::marker::PhantomPinned,
         }
     }
-    fn init(&mut self, fd: i32) {
-        self.state = State::Reading(fd);
+    fn init(&mut self, fd: i32, tls: rustls::ServerConnection) {
+        self.state = State::Handshaking(HandshakeData::new(fd, tls));
         self.last_action = std::time::Instant::now();
     }
     fn deinit(&mut self) {
@@ -142,6 +172,7 @@ impl Connection {
             State::Reading(fd) => Some(fd),
             State::WritingHeaders(fd, _, _) => Some(fd),
             State::WritingData(fd, _, _) => Some(fd),
+            State::Handshaking(ref data) => Some(data.fd),
             State::Closing => None,
         }
     }
@@ -219,11 +250,15 @@ impl Connection {
             }
         }
     }
+
+    // Queue up a read.
     fn read(&mut self, ops: &mut SQueue) {
-        let State::Reading(fd) = self.state else {
-            panic!("read in wrong state");
-        };
         let read_buf = &mut self.read_buf[self.read_buf_pos..];
+        let fd = match &self.state {
+            State::Reading(fd) => *fd,
+            State::Handshaking(data) => data.fd,
+            _ => panic!("read in wrong state"),
+        };
         // Try RecvMulti/RecvMsgMulti/RecvMultiBundle?
         self.outstanding += 1;
         ops.push(
@@ -235,6 +270,11 @@ impl Connection {
             .build()
             .user_data((self.id as u64) | USER_DATA_OP_READ),
         );
+    }
+
+    // Get the read buffer.
+    fn get_read_buf(&self) -> &[u8] {
+        &self.read_buf[self.read_buf_pos..]
     }
 }
 
@@ -541,6 +581,18 @@ fn make_op_timeout(ts: Pin<&io_uring::types::Timespec>) -> io_uring::squeue::Ent
         .build()
         .user_data(USER_DATA_TIMEOUT)
 }
+fn load_certs(filename: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
+    // Open certificate file.
+    let certfile = std::fs::File::open(filename)?;
+    let mut reader = std::io::BufReader::new(certfile);
+    rustls_pemfile::certs(&mut reader).collect()
+}
+
+fn load_private_key(filename: &str) -> std::io::Result<PrivateKeyDer<'static>> {
+    let keyfile = std::fs::File::open(filename)?;
+    let mut reader = std::io::BufReader::new(keyfile);
+    rustls_pemfile::private_key(&mut reader).map(|key| key.unwrap())
+}
 
 #[nonblocking]
 fn mainloop(
@@ -551,10 +603,21 @@ fn mainloop(
     opt: &Opt,
     archive: &Archive,
 ) -> Result<()> {
+    eprintln!("Thread main");
     let mut pooltracker = PoolTracker::new();
     let mut ops: SQueue = ArrayVec::new();
     let mut last_submit = std::time::Instant::now();
     let mut syscalls = 0;
+    debug!("Loading certs");
+    let certs = load_certs("fullchain.pem")?;
+    // Load private key.
+    debug!("Loading key");
+    let key = load_private_key("privkey.pem")?;
+    debug!("Creating TLS config");
+    let config = Arc::new(rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?);
+    eprintln!("Starting main thread loop");
     loop {
         let mut cq = ring.completion();
         assert_eq!(cq.overflow(), 0);
@@ -602,7 +665,8 @@ fn mainloop(
                     let id = pooltracker.alloc().unwrap();
                     debug!("Allocated {id}");
                     let new_conn = connections.get(id);
-                    new_conn.init(result);
+                    let tls = rustls::ServerConnection::new(config.clone())?;
+                    new_conn.init(result, tls);
                     new_conn.read(&mut ops);
                 }
                 USER_DATA_TIMEOUT => {
@@ -618,9 +682,40 @@ fn mainloop(
                     syscalls = 0;
                 }
                 _ => {
-                    //println!("Completed: User data: {user_data:x}");
+                    println!("Completed: User data: {user_data:x}");
+
+
                     let mut data = decode_user_data(user_data, result, connections);
                     data.con.io_completed();
+
+            debug!("{} {}", data.con.read_buf_pos, data.result);
+        if let State::Handshaking(d) = &mut data.con.state {
+            let io = d.received(&data.con.read_buf[..data.result as usize]).unwrap();
+            debug!("rustls op: {io:?}");
+            let nw = io.tls_bytes_to_write();
+            if nw > 0 {
+                let v = vec![];
+                let mut c = std::io::Cursor::new(v);
+                let n = d.tls.write_tls(&mut c)?;
+                let v = c.into_inner();
+                // TODO: make this write io_uring.
+                let rc = unsafe {
+                    libc::write(d.fd, v.as_ptr() as *const libc::c_void, v.len())
+                };
+                debug!("Is handshaking: {}", d.tls.is_handshaking());
+            } else {
+                todo!("queue another read");
+            }
+            if !d.tls.is_handshaking() {
+                debug!("Handshaking is done");
+                let fd = d.fd;
+                drop(d);
+                data.con.state = State::Reading(fd);
+            }
+            data.con.read(&mut ops);
+            continue;
+        }
+
                     if let Err(e) =
                         handle_connection(&mut data, archive, opt.async_cancel2, &mut ops)
                     {
