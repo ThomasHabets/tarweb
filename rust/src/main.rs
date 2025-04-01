@@ -713,6 +713,15 @@ fn mainloop(
                 let fd = d.fd;
                 let t = std::mem::replace(&mut d.tls, rustls::ServerConnection::new(config.clone())?);
                 let keys = t.dangerous_extract_secrets()?;
+                match keys.rx {
+                    (_seq, rustls::ConnectionTrafficSecrets::Aes128Gcm{key: _key, iv: _iv}) => {
+                        debug!("Secret here!");
+                    },
+                    (_seq, rustls::ConnectionTrafficSecrets::Aes256Gcm{key: _key, iv: _iv}) => {
+                        debug!("Secret here, AES256!");
+                    },
+                    _ => todo!(),
+                };
                 //debug!("Extracted secrets: {keys:?}");
                 drop(d);
                 data.con.state = State::Reading(fd);
