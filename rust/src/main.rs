@@ -19,7 +19,7 @@ use clap::Parser;
 use log::{debug, error, info, trace, warn};
 use rtsan_standalone::nonblocking;
 
-use rustls::pki_types::{PrivateKeyDer, CertificateDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 const MAX_CONNECTIONS: usize = 100_000;
 
@@ -66,14 +66,9 @@ struct HandshakeData {
     tls: rustls::ServerConnection,
 }
 
-
-
 impl HandshakeData {
     fn new(fd: i32, tls: rustls::ServerConnection) -> Self {
-        Self {
-            fd,
-            tls,
-        }
+        Self { fd, tls }
     }
     fn received(&mut self, data: &[u8]) -> Result<rustls::IoState, rustls::Error> {
         debug!("Got some handshaky data: {data:?}");
@@ -400,9 +395,8 @@ struct Request<'a> {
 // Some(req) if it's a good request.
 // None if more data is needed.
 fn parse_request(heads: &[u8]) -> Result<Option<Request>> {
-    let s = unsafe {
-        std::ffi::CStr::from_ptr(heads.as_ptr() as *const std::os::raw::c_char).to_str()?
-    };
+    let s = std::str::from_utf8(heads)?;
+
     let Some(end) = s.find("\r\n\r\n") else {
         return Ok(None);
     };
@@ -443,8 +437,7 @@ fn decode_user_data(user_data: u64, result: i32, cons: &mut Connections) -> Hook
 // This function ends with an error, or a submitted read() or write().
 fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Result<()> {
     let data = &hook.con.read_buf[..hook.con.read_buf_pos];
-    let s =
-        unsafe { std::ffi::CStr::from_ptr(data.as_ptr() as *const std::os::raw::c_char).to_str()? };
+    let s = std::str::from_utf8(data)?;
     trace!("Let's see if there's a request in {:?}", s);
     let req = parse_request(data)?;
     let Some(req) = req else {
@@ -545,7 +538,7 @@ fn handle_connection(
         }
         UserDataOp::Cancel => {
             if hook.result != 0 {
-                error!(
+                debug!(
                     "Cancel return nonzero: {} {}",
                     hook.result,
                     std::io::Error::from_raw_os_error(hook.result.abs())
@@ -614,9 +607,10 @@ fn mainloop(
     debug!("Loading key");
     let key = load_private_key("privkey.pem")?;
     debug!("Creating TLS config");
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
+    let mut config =
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?;
     config.enable_secret_extraction = true;
     let config = Arc::new(config);
     eprintln!("Starting main thread loop");
@@ -684,51 +678,53 @@ fn mainloop(
                     syscalls = 0;
                 }
                 _ => {
-                    println!("Completed: User data: {user_data:x}");
-
+                    debug!("Completed: User data: {user_data:x}");
 
                     let mut data = decode_user_data(user_data, result, connections);
                     data.con.io_completed();
 
-            debug!("{} {}", data.con.read_buf_pos, data.result);
-        if let State::Handshaking(d) = &mut data.con.state {
-            let io = d.received(&data.con.read_buf[..data.result as usize]).unwrap();
-            debug!("rustls op: {io:?}");
-            let nw = io.tls_bytes_to_write();
-            if nw > 0 {
-                let v = vec![];
-                let mut c = std::io::Cursor::new(v);
-                let n = d.tls.write_tls(&mut c)?;
-                let v = c.into_inner();
-                // TODO: make this write io_uring.
-                let rc = unsafe {
-                    libc::write(d.fd, v.as_ptr() as *const libc::c_void, v.len())
-                };
-                debug!("Is handshaking: {}", d.tls.is_handshaking());
-            } else {
-                todo!("queue another read");
-            }
-            if !d.tls.is_handshaking() {
-                debug!("Handshaking is done");
-                let fd = d.fd;
-                let t = std::mem::replace(&mut d.tls, rustls::ServerConnection::new(config.clone())?);
-                let keys = t.dangerous_extract_secrets()?;
-                match keys.rx {
-                    (_seq, rustls::ConnectionTrafficSecrets::Aes128Gcm{key: _key, iv: _iv}) => {
-                        debug!("Secret here!");
-                    },
-                    (_seq, rustls::ConnectionTrafficSecrets::Aes256Gcm{key: _key, iv: _iv}) => {
-                        debug!("Secret here, AES256!");
-                    },
-                    _ => todo!(),
-                };
-                //debug!("Extracted secrets: {keys:?}");
-                drop(d);
-                data.con.state = State::Reading(fd);
-            }
-            data.con.read(&mut ops);
-            continue;
-        }
+                    debug!("{} {}", data.con.read_buf_pos, data.result);
+                    if let State::Handshaking(d) = &mut data.con.state {
+                        let io = d
+                            .received(&data.con.read_buf[..data.result as usize])
+                            .unwrap();
+                        debug!("rustls op: {io:?}");
+                        let nw = io.tls_bytes_to_write();
+                        if nw > 0 {
+                            let v = vec![];
+                            let mut c = std::io::Cursor::new(v);
+                            let n = d.tls.write_tls(&mut c)?;
+                            let v = c.into_inner();
+                            // TODO: make this write io_uring.
+                            let rc = unsafe {
+                                libc::write(d.fd, v.as_ptr() as *const libc::c_void, v.len())
+                            };
+                            debug!("Is handshaking: {}", d.tls.is_handshaking());
+                        } else {
+                            todo!("queue another read");
+                        }
+                        if !d.tls.is_handshaking() {
+                            debug!("Handshaking is done");
+                            let fd = d.fd;
+                            ktls::ffi::setup_ulp(fd)?;
+                            let t = std::mem::replace(
+                                &mut d.tls,
+                                rustls::ServerConnection::new(config.clone())?,
+                            );
+                            let suite = t.negotiated_cipher_suite().unwrap();
+                            debug!("Suite: {suite:?}");
+                            let keys = t.dangerous_extract_secrets()?;
+                            let mut ci = ktls::CryptoInfo::from_rustls(suite, keys.rx)?;
+                            ktls::ffi::setup_tls_info(fd, ktls::ffi::Direction::Rx, ci)?;
+                            let ci = ktls::CryptoInfo::from_rustls(suite, keys.tx)?;
+                            ktls::ffi::setup_tls_info(fd, ktls::ffi::Direction::Tx, ci)?;
+                            drop(d);
+                            data.con.state = State::Reading(fd);
+                            data.con.read_buf_pos = 0;
+                        }
+                        data.con.read(&mut ops);
+                        continue;
+                    }
 
                     if let Err(e) =
                         handle_connection(&mut data, archive, opt.async_cancel2, &mut ops)
@@ -924,49 +920,52 @@ fn main() -> Result<()> {
             let listener = listener.try_clone()?;
             let opt = &opt;
             let archive = &archive;
-            handles.push(std::thread::Builder::new()
-                .name(format!("handler/{n}").to_string())
-                .stack_size(THREAD_STACK_SIZE)
-                .spawn_scoped(s, move || -> Result<()> {
-                    if opt.cpu_affinity {
-                        // Set affinity mapping 1:1.
-                        if !core_affinity::set_for_current(core_affinity::CoreId { id: 2 * n }) {
-                            error!("Failed to bind to core {n}");
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("handler/{n}").to_string())
+                    .stack_size(THREAD_STACK_SIZE)
+                    .spawn_scoped(s, move || -> Result<()> {
+                        if opt.cpu_affinity {
+                            // Set affinity mapping 1:1.
+                            if !core_affinity::set_for_current(core_affinity::CoreId { id: 2 * n })
+                            {
+                                error!("Failed to bind to core {n}");
+                            }
                         }
-                    }
-                    let mut ring = io_uring::IoUring::builder();
-                    let mut ring = ring
-                        .dontfork()
-                        // .setup_sqpoll_cpu()
-                        // .setup_cqsize()
-                        .setup_sqpoll(opt.sqpoll_ms);
-                    if opt.single_issuer {
-                        ring = ring.setup_single_issuer();
-                    }
-                    let mut ring = ring.build(opt.ring_size)?;
+                        let mut ring = io_uring::IoUring::builder();
+                        let mut ring = ring
+                            .dontfork()
+                            // .setup_sqpoll_cpu()
+                            // .setup_cqsize()
+                            .setup_sqpoll(opt.sqpoll_ms);
+                        if opt.single_issuer {
+                            ring = ring.setup_single_issuer();
+                        }
+                        let mut ring = ring.build(opt.ring_size)?;
 
-                    // TODO: Apparently, this pin is ineffective because timespec is Unpin.
-                    // Needs a wrapping struct that is not Unpin, apparently.
-                    let timeout = opt.periodic_wakeup.into();
-                    let timeout = Pin::new(&timeout);
-                    let init_ops = [
-                        make_op_accept(&listener, opt.accept_multi),
-                        make_op_timeout(timeout),
-                    ];
-                    unsafe {
-                        for op in init_ops {
-                            ring.submission()
-                                .push(&op)
-                                .expect("submission queue is full");
+                        // TODO: Apparently, this pin is ineffective because timespec is Unpin.
+                        // Needs a wrapping struct that is not Unpin, apparently.
+                        let timeout = opt.periodic_wakeup.into();
+                        let timeout = Pin::new(&timeout);
+                        let init_ops = [
+                            make_op_accept(&listener, opt.accept_multi),
+                            make_op_timeout(timeout),
+                        ];
+                        unsafe {
+                            for op in init_ops {
+                                ring.submission()
+                                    .push(&op)
+                                    .expect("submission queue is full");
+                            }
                         }
-                    }
-                    ring.submit()?; // Or sq.sync?
-                    eprintln!("Running thread {n}");
-                    let mut connections = Connections::new();
-                    mainloop(ring, listener, timeout, &mut connections, opt, archive)?;
-                    eprintln!("Exiting thread {n}");
-                    Ok(())
-                })?);
+                        ring.submit()?; // Or sq.sync?
+                        eprintln!("Running thread {n}");
+                        let mut connections = Connections::new();
+                        mainloop(ring, listener, timeout, &mut connections, opt, archive)?;
+                        eprintln!("Exiting thread {n}");
+                        Ok(())
+                    })?,
+            );
         }
         for handle in handles {
             handle.join().expect("foo")?;
