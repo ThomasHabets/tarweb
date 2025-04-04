@@ -176,6 +176,7 @@ impl Connection {
     }
     fn io_completed(&mut self) {
         self.last_action = std::time::Instant::now();
+        self.outstanding -= 1;
     }
     fn fd(&self) -> Option<i32> {
         match self.state {
@@ -500,7 +501,6 @@ fn handle_connection(
     modern: bool,
     ops: &mut SQueue,
 ) -> Result<()> {
-    hook.con.outstanding -= 1;
     {
         let fd = hook.con.fd().unwrap_or(-1);
         debug!(
@@ -628,9 +628,13 @@ fn op_completion(
     );
     match data.con.state {
         State::EnablingKtls(fd) => {
-            data.con.read(ops);
-            data.con.state = State::Reading(fd);
-            data.con.read_buf_pos = 0;
+            if data.con.outstanding == 0 {
+                data.con.read(ops);
+                data.con.state = State::Reading(fd);
+                data.con.read_buf_pos = 0;
+            } else {
+                debug!("EnablingKtls: still waiting for {}", data.con.outstanding);
+            }
             return Ok(());
         }
         _ => {}
@@ -662,6 +666,7 @@ fn op_completion(
 
             // TODO: use IO_LINK for the three setsockopts.
             setup_ulp(fd, data.con.id, &mut ops)?;
+            data.con.outstanding += 1;
 
             let t = std::mem::replace(&mut data.con.state, State::Reading(fd));
             let State::Handshaking(d) = t else { panic!() };
@@ -670,8 +675,10 @@ fn op_completion(
             let keys = d.tls.dangerous_extract_secrets()?;
             let mut ci = ktls::CryptoInfo::from_rustls(suite, keys.rx)?;
             setup_tls_info(fd, data.con.id, libc::TLS_RX as u32, ci, &mut ops)?;
+            data.con.outstanding += 1;
             let ci = ktls::CryptoInfo::from_rustls(suite, keys.tx)?;
             setup_tls_info(fd, data.con.id, libc::TLS_TX as u32, ci, &mut ops)?;
+            data.con.outstanding += 1;
 
             data.con.state = State::EnablingKtls(fd);
         }
