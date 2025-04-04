@@ -90,7 +90,7 @@ enum State {
     //
     // The associated buffers are not part of the state, in order to ensure
     // nothing outstanding points to it, even if we go to Closing state.
-    //EnablingKtls,
+    EnablingKtls(i32),
 
     // Reading new request. Note that because of pipelining, we may enter this
     // state with a nonzero read_buf, and may exit it with more full requests
@@ -180,10 +180,11 @@ impl Connection {
     fn fd(&self) -> Option<i32> {
         match self.state {
             State::Idle => None,
+            State::Handshaking(ref data) => Some(data.fd),
+            State::EnablingKtls(fd) => Some(fd),
             State::Reading(fd) => Some(fd),
             State::WritingHeaders(fd, _, _) => Some(fd),
             State::WritingData(fd, _, _) => Some(fd),
-            State::Handshaking(ref data) => Some(data.fd),
             State::Closing => None,
         }
     }
@@ -268,6 +269,7 @@ impl Connection {
         let fd = match &self.state {
             State::Reading(fd) => *fd,
             State::Handshaking(data) => data.fd,
+            State::EnablingKtls(fd) => *fd,
             _ => panic!("read in wrong state"),
         };
         // Try RecvMulti/RecvMsgMulti/RecvMultiBundle?
@@ -624,6 +626,16 @@ fn op_completion(
         "Read buf pos: {} result: {}",
         data.con.read_buf_pos, data.result
     );
+    match data.con.state {
+        State::EnablingKtls(fd) => {
+            data.con.read(ops);
+            data.con.state = State::Reading(fd);
+            data.con.read_buf_pos = 0;
+            return Ok(());
+        }
+        _ => {}
+    }
+
     if let State::Handshaking(d) = &mut data.con.state {
         let io = d
             .received(&data.con.read_buf[..data.result as usize])
@@ -641,29 +653,28 @@ fn op_completion(
         } else {
             todo!("queue another read");
         }
-        if !d.tls.is_handshaking() {
+        if d.tls.is_handshaking() {
+            // Not done. Read more.
+            data.con.read(&mut ops);
+        } else {
             debug!("Handshaking is done");
             let fd = d.fd;
-            if true {
-                // TODO: use IO_LINK for the three setsockopts.
-                setup_ulp(fd, data.con.id, &mut ops)?;
-                return Ok(());
-            } else {
-                ktls::ffi::setup_ulp(fd)?;
-            }
+
+            // TODO: use IO_LINK for the three setsockopts.
+            setup_ulp(fd, data.con.id, &mut ops)?;
+
             let t = std::mem::replace(&mut data.con.state, State::Reading(fd));
             let State::Handshaking(d) = t else { panic!() };
             let suite = d.tls.negotiated_cipher_suite().unwrap();
             debug!("Suite: {suite:?}");
             let keys = d.tls.dangerous_extract_secrets()?;
             let mut ci = ktls::CryptoInfo::from_rustls(suite, keys.rx)?;
-            ktls::ffi::setup_tls_info(fd, ktls::ffi::Direction::Rx, ci)?;
+            setup_tls_info(fd, data.con.id, libc::TLS_RX as u32, ci, &mut ops)?;
             let ci = ktls::CryptoInfo::from_rustls(suite, keys.tx)?;
-            ktls::ffi::setup_tls_info(fd, ktls::ffi::Direction::Tx, ci)?;
-            data.con.state = State::Reading(fd);
-            data.con.read_buf_pos = 0;
+            setup_tls_info(fd, data.con.id, libc::TLS_TX as u32, ci, &mut ops)?;
+
+            data.con.state = State::EnablingKtls(fd);
         }
-        data.con.read(ops);
         return Ok(());
     }
 
@@ -864,21 +875,8 @@ lazy_static! {
 }
 
 const TLS_STR: &str = "tls";
-// TODO: change to use io_uring
+
 fn setup_ulp(fd: std::os::fd::RawFd, con_id: usize, ops: &mut SQueue) -> Result<()> {
-    /*
-        use io_uring::sys::SOCKET_URING_OP_SETSOCKOPT;
-        let size = std::mem::size_of::<SetSockOptTls>();
-        let ptr = &SETSOCKOPT_TLS as *const SetSockOptTls as *const u8;
-        let mut bytes = [0u8; 80];
-        unsafe {
-            std::ptr::copy_nonoverlapping(ptr, bytes.as_mut_ptr(), size);
-        }
-        let sqe = io_uring::opcode::UringCmd80::new(io_uring::types::Fd(fd), SOCKET_URING_OP_SETSOCKOPT)
-           .cmd(bytes)
-           .build()
-            .user_data(con_id as u64 | USER_DATA_OP_SETSOCKOPT);
-    */
     let mut sqe: io_uring::sys::io_uring_sqe = unsafe { std::mem::zeroed() };
 
     // Common.
@@ -888,46 +886,41 @@ fn setup_ulp(fd: std::os::fd::RawFd, con_id: usize, ops: &mut SQueue) -> Result<
     sqe.user_data = con_id as u64 | USER_DATA_OP_SETSOCKOPT;
     //sqe.__bindgen_anon_3.uring_cmd_flags = io_uring::sys::IORING_URING_CMD_FIXED;
 
-    // Point to setsockopt.
-    if false {
-        sqe.__bindgen_anon_2.addr = (&*SETSOCKOPT_TLS as *const SetSockOptTls) as u64;
-        sqe.len = std::mem::size_of::<SetSockOptTls>() as u32;
-    }
-
-    if true {
-        // Set sockopt values directly.
-        let mut v = TLS_STR.as_ptr() as u64;
-        debug!("tls addr: {v:x}");
-        let mut v2 = io_uring::sys::__BindgenUnionField::new();
-        unsafe {
-            *v2.as_mut() = v;
-        };
-        sqe.__bindgen_anon_2.__bindgen_anon_1.level = libc::SOL_TCP as u32;
-        sqe.__bindgen_anon_2.__bindgen_anon_1.optname = libc::TCP_ULP as u32;
-        sqe.__bindgen_anon_5.optlen = 3;
-        sqe.__bindgen_anon_6.optval = v2;
-        sqe.__bindgen_anon_6.bindgen_union_field[0] = v;
-        sqe.len = 0;
-    }
-
-    /*
-    let mut sqe: io_uring::sys::io_uring_sqe = unsafe { std::mem::zeroed()};
-    sqe.opcode = io_uring::sys::IORING_OP_URING_CMD as u8;
-    sqe.fd = fd;
-    sqe.__bindgen_anon_1.__bindgen_anon_1.cmd_op = io_uring::sys::SOCKET_URING_OP_SETSOCKOPT;
+    // Set sockopt values directly.
+    let mut v = TLS_STR.as_ptr() as u64;
     sqe.__bindgen_anon_2.__bindgen_anon_1.level = libc::SOL_TCP as u32;
     sqe.__bindgen_anon_2.__bindgen_anon_1.optname = libc::TCP_ULP as u32;
-    let mut v = "tls".as_ptr() as u64;
-    let mut v2 = io_uring::sys::__BindgenUnionField::new();
-    unsafe { *v2.as_mut() = v; };
-    sqe.__bindgen_anon_6.optval = v2;
     sqe.__bindgen_anon_5.optlen = 3;
+    sqe.__bindgen_anon_6.bindgen_union_field[0] = v;
+    sqe.len = 0;
+
+    ops.push(io_uring::squeue::Entry(sqe));
+    Ok(())
+}
+
+fn setup_tls_info(
+    fd: std::os::fd::RawFd,
+    con_id: usize,
+    dir: u32,
+    ci: ktls::CryptoInfo,
+    ops: &mut SQueue,
+) -> Result<()> {
+    let mut sqe: io_uring::sys::io_uring_sqe = unsafe { std::mem::zeroed() };
+    sqe.opcode = io_uring::sys::IORING_OP_URING_CMD as u8;
+    sqe.fd = fd;
+
+    sqe.__bindgen_anon_1.__bindgen_anon_1.cmd_op = io_uring::sys::SOCKET_URING_OP_SETSOCKOPT;
     sqe.user_data = con_id as u64 | USER_DATA_OP_SETSOCKOPT;
-    unsafe {
-        sqe.__bindgen_anon_3.uring_cmd_flags |= io_uring::sys::IORING_URING_CMD_FIXED;
-    }
-    */
-    //debug!("ULP SQE: {sqe:?}");
+    //sqe.__bindgen_anon_3.uring_cmd_flags = io_uring::sys::IORING_URING_CMD_FIXED;
+
+    // Set sockopt values directly.
+    let mut v = ci.as_ptr() as u64;
+    sqe.__bindgen_anon_2.__bindgen_anon_1.level = libc::SOL_TLS as u32;
+    sqe.__bindgen_anon_2.__bindgen_anon_1.optname = dir;
+    sqe.__bindgen_anon_5.optlen = ci.size() as u32;
+    sqe.__bindgen_anon_6.bindgen_union_field[0] = v;
+    sqe.len = 0;
+
     ops.push(io_uring::squeue::Entry(sqe));
     Ok(())
     //ktls::ffi::setup_ulp(fd)
