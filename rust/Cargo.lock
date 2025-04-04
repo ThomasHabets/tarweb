@@ -581,11 +581,8 @@ dependencies = [
 
 [[package]]
 name = "io-uring"
-version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5d5b4a5e02a58296749114728ea3644f9a4cd5669c243896e445b90bd299ad6"
+version = "0.7.4"
 dependencies = [
- "bindgen 0.69.5",
  "bitflags",
  "cfg-if",
  "libc",
@@ -1144,6 +1141,7 @@ dependencies = [
  "core_affinity",
  "io-uring",
  "ktls",
+ "lazy_static",
  "libc",
  "log",
  "memmap2",

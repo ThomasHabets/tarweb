@@ -44,6 +44,7 @@ const USER_DATA_OP_WRITE: u64 = 0x100000000;
 const USER_DATA_OP_CLOSE: u64 = 0x200000000;
 const USER_DATA_OP_READ: u64 = 0x300000000;
 const USER_DATA_OP_CANCEL: u64 = 0x400000000;
+const USER_DATA_OP_SETSOCKOPT: u64 = 0x800000000;
 
 // Max milliseconds that a connection is allowed to be idle, before we close it.
 const MAX_IDLE: u128 = 5000;
@@ -82,7 +83,14 @@ impl HandshakeData {
 enum State {
     Idle,
 
+    // rustls handshaking happening.
     Handshaking(HandshakeData),
+
+    // KTLS setsockopt()s in flight. Awaiting their completion.
+    //
+    // The associated buffers are not part of the state, in order to ensure
+    // nothing outstanding points to it, even if we go to Closing state.
+    //EnablingKtls,
 
     // Reading new request. Note that because of pipelining, we may enter this
     // state with a nonzero read_buf, and may exit it with more full requests
@@ -103,16 +111,24 @@ enum State {
     WritingData(i32, usize, usize),
 
     // Close and possibly Cancel has been sent, but we don't reuse the
-    // connection object until all ops have completed.
+    // connection object until all ops have completed. (`outstdanding == 0`)
     Closing,
 }
+
+#[derive(Debug)]
 struct Connection {
     id: usize,
     state: State,
 
-    // Outstanding number of io_uring ops.
+    // Outstanding number of io_uring ops. Don't GC the connection until it's
+    // zero.
     outstanding: usize,
+
+    // Last time anything happened. Used to time out the connection.
     last_action: std::time::Instant,
+
+    // Next position incoming data should be appended at. Once a full request is
+    // processed, any tail is copied to the beginning.
     read_buf_pos: usize,
     read_buf: ReadBuf,
     header_buf: HeaderBuf,
@@ -377,8 +393,10 @@ enum UserDataOp {
     Read,
     Close,
     Cancel,
+    SetSockOpt,
 }
 
+#[derive(Debug)]
 struct Hook<'a> {
     raw: u64,
     con: &'a mut Connection,
@@ -423,7 +441,8 @@ fn decode_user_data(user_data: u64, result: i32, cons: &mut Connections) -> Hook
         USER_DATA_OP_READ => UserDataOp::Read,
         USER_DATA_OP_CLOSE => UserDataOp::Close,
         USER_DATA_OP_CANCEL => UserDataOp::Cancel,
-        _ => panic!("Invalid op {user_data:x}"),
+        USER_DATA_OP_SETSOCKOPT => UserDataOp::SetSockOpt,
+        _ => panic!("Invalid op {user_data:x} result {result}"),
     };
     assert_eq!(user_data & !(USER_DATA_CON_MASK | USER_DATA_OP_MASK), 0);
     Hook {
@@ -497,6 +516,10 @@ fn handle_connection(
         }
     }
     match hook.op {
+        UserDataOp::SetSockOpt => {
+            debug!("Setsockopt returned {}", hook.result);
+            assert_eq!(hook.result, 0);
+        }
         UserDataOp::Read => {
             if hook.result < 0 {
                 return Err(Error::msg(format!(
@@ -587,6 +610,75 @@ fn load_private_key(filename: &str) -> std::io::Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut reader).map(|key| key.unwrap())
 }
 
+fn op_completion(
+    mut data: Hook,
+    mut ops: &mut SQueue,
+    opt: &Opt,
+    pooltracker: &mut PoolTracker,
+    archive: &Archive,
+) -> Result<()> {
+    debug!("Decoded op={:?} result={}", data.op, data.result);
+    data.con.io_completed();
+
+    debug!(
+        "Read buf pos: {} result: {}",
+        data.con.read_buf_pos, data.result
+    );
+    if let State::Handshaking(d) = &mut data.con.state {
+        let io = d
+            .received(&data.con.read_buf[..data.result as usize])
+            .unwrap();
+        debug!("rustls op: {io:?}");
+        let nw = io.tls_bytes_to_write();
+        if nw > 0 {
+            let v = vec![];
+            let mut c = std::io::Cursor::new(v);
+            let n = d.tls.write_tls(&mut c)?;
+            let v = c.into_inner();
+            // TODO: make this write io_uring.
+            let rc = unsafe { libc::write(d.fd, v.as_ptr() as *const libc::c_void, v.len()) };
+            debug!("Is handshaking: {}", d.tls.is_handshaking());
+        } else {
+            todo!("queue another read");
+        }
+        if !d.tls.is_handshaking() {
+            debug!("Handshaking is done");
+            let fd = d.fd;
+            if true {
+                // TODO: use IO_LINK for the three setsockopts.
+                setup_ulp(fd, data.con.id, &mut ops)?;
+                return Ok(());
+            } else {
+                ktls::ffi::setup_ulp(fd)?;
+            }
+            let t = std::mem::replace(&mut data.con.state, State::Reading(fd));
+            let State::Handshaking(d) = t else { panic!() };
+            let suite = d.tls.negotiated_cipher_suite().unwrap();
+            debug!("Suite: {suite:?}");
+            let keys = d.tls.dangerous_extract_secrets()?;
+            let mut ci = ktls::CryptoInfo::from_rustls(suite, keys.rx)?;
+            ktls::ffi::setup_tls_info(fd, ktls::ffi::Direction::Rx, ci)?;
+            let ci = ktls::CryptoInfo::from_rustls(suite, keys.tx)?;
+            ktls::ffi::setup_tls_info(fd, ktls::ffi::Direction::Tx, ci)?;
+            data.con.state = State::Reading(fd);
+            data.con.read_buf_pos = 0;
+        }
+        data.con.read(ops);
+        return Ok(());
+    }
+
+    if let Err(e) = handle_connection(&mut data, archive, opt.async_cancel2, ops) {
+        info!("Error handling connection: {e:?}");
+        data.con.close(opt.async_cancel2, ops);
+    }
+    if data.con.closing() && data.con.outstanding == 0 {
+        data.con.deinit();
+        pooltracker.dealloc(data.con.id);
+        debug!("Deallocated {}", data.con.id);
+    }
+    Ok(())
+}
+
 #[nonblocking]
 fn mainloop(
     mut ring: io_uring::IoUring,
@@ -608,7 +700,7 @@ fn mainloop(
     let key = load_private_key("privkey.pem")?;
     debug!("Creating TLS config");
     let mut config =
-        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_no_client_auth()
             .with_single_cert(certs, key)?;
     config.enable_secret_extraction = true;
@@ -681,62 +773,7 @@ fn mainloop(
                     debug!("Completed: User data: {user_data:x}");
 
                     let mut data = decode_user_data(user_data, result, connections);
-                    data.con.io_completed();
-
-                    debug!("{} {}", data.con.read_buf_pos, data.result);
-                    if let State::Handshaking(d) = &mut data.con.state {
-                        let io = d
-                            .received(&data.con.read_buf[..data.result as usize])
-                            .unwrap();
-                        debug!("rustls op: {io:?}");
-                        let nw = io.tls_bytes_to_write();
-                        if nw > 0 {
-                            let v = vec![];
-                            let mut c = std::io::Cursor::new(v);
-                            let n = d.tls.write_tls(&mut c)?;
-                            let v = c.into_inner();
-                            // TODO: make this write io_uring.
-                            let rc = unsafe {
-                                libc::write(d.fd, v.as_ptr() as *const libc::c_void, v.len())
-                            };
-                            debug!("Is handshaking: {}", d.tls.is_handshaking());
-                        } else {
-                            todo!("queue another read");
-                        }
-                        if !d.tls.is_handshaking() {
-                            debug!("Handshaking is done");
-                            let fd = d.fd;
-                            ktls::ffi::setup_ulp(fd)?;
-                            let t = std::mem::replace(
-                                &mut d.tls,
-                                rustls::ServerConnection::new(config.clone())?,
-                            );
-                            let suite = t.negotiated_cipher_suite().unwrap();
-                            debug!("Suite: {suite:?}");
-                            let keys = t.dangerous_extract_secrets()?;
-                            let mut ci = ktls::CryptoInfo::from_rustls(suite, keys.rx)?;
-                            ktls::ffi::setup_tls_info(fd, ktls::ffi::Direction::Rx, ci)?;
-                            let ci = ktls::CryptoInfo::from_rustls(suite, keys.tx)?;
-                            ktls::ffi::setup_tls_info(fd, ktls::ffi::Direction::Tx, ci)?;
-                            drop(d);
-                            data.con.state = State::Reading(fd);
-                            data.con.read_buf_pos = 0;
-                        }
-                        data.con.read(&mut ops);
-                        continue;
-                    }
-
-                    if let Err(e) =
-                        handle_connection(&mut data, archive, opt.async_cancel2, &mut ops)
-                    {
-                        info!("Error handling connection: {e:?}");
-                        data.con.close(opt.async_cancel2, &mut ops);
-                    }
-                    if data.con.closing() && data.con.outstanding == 0 {
-                        data.con.deinit();
-                        pooltracker.dealloc(data.con.id);
-                        debug!("Deallocated {}", data.con.id);
-                    }
+                    op_completion(data, &mut ops, opt, &mut pooltracker, archive)?;
                 }
             }
         }
@@ -803,6 +840,97 @@ struct Opt {
     prefix: String,
 
     tarfile: String,
+}
+
+#[derive(Default)]
+#[repr(C)]
+struct SetSockOptTls {
+    level: u32,
+    optname: u32,
+    optval: u64,
+    optlen: u32,
+    _pad: u32,
+}
+
+use lazy_static::lazy_static;
+lazy_static! {
+    static ref SETSOCKOPT_TLS: SetSockOptTls = SetSockOptTls {
+        level: libc::SOL_TCP as u32,
+        optname: libc::TCP_ULP as u32,
+        optval: "tls".as_ptr() as u64,
+        optlen: 3,
+        _pad: 0,
+    };
+}
+
+const TLS_STR: &str = "tls";
+// TODO: change to use io_uring
+fn setup_ulp(fd: std::os::fd::RawFd, con_id: usize, ops: &mut SQueue) -> Result<()> {
+    /*
+        use io_uring::sys::SOCKET_URING_OP_SETSOCKOPT;
+        let size = std::mem::size_of::<SetSockOptTls>();
+        let ptr = &SETSOCKOPT_TLS as *const SetSockOptTls as *const u8;
+        let mut bytes = [0u8; 80];
+        unsafe {
+            std::ptr::copy_nonoverlapping(ptr, bytes.as_mut_ptr(), size);
+        }
+        let sqe = io_uring::opcode::UringCmd80::new(io_uring::types::Fd(fd), SOCKET_URING_OP_SETSOCKOPT)
+           .cmd(bytes)
+           .build()
+            .user_data(con_id as u64 | USER_DATA_OP_SETSOCKOPT);
+    */
+    let mut sqe: io_uring::sys::io_uring_sqe = unsafe { std::mem::zeroed() };
+
+    // Common.
+    sqe.opcode = io_uring::sys::IORING_OP_URING_CMD as u8;
+    sqe.fd = fd;
+    sqe.__bindgen_anon_1.__bindgen_anon_1.cmd_op = io_uring::sys::SOCKET_URING_OP_SETSOCKOPT;
+    sqe.user_data = con_id as u64 | USER_DATA_OP_SETSOCKOPT;
+    //sqe.__bindgen_anon_3.uring_cmd_flags = io_uring::sys::IORING_URING_CMD_FIXED;
+
+    // Point to setsockopt.
+    if false {
+        sqe.__bindgen_anon_2.addr = (&*SETSOCKOPT_TLS as *const SetSockOptTls) as u64;
+        sqe.len = std::mem::size_of::<SetSockOptTls>() as u32;
+    }
+
+    if true {
+        // Set sockopt values directly.
+        let mut v = TLS_STR.as_ptr() as u64;
+        debug!("tls addr: {v:x}");
+        let mut v2 = io_uring::sys::__BindgenUnionField::new();
+        unsafe {
+            *v2.as_mut() = v;
+        };
+        sqe.__bindgen_anon_2.__bindgen_anon_1.level = libc::SOL_TCP as u32;
+        sqe.__bindgen_anon_2.__bindgen_anon_1.optname = libc::TCP_ULP as u32;
+        sqe.__bindgen_anon_5.optlen = 3;
+        sqe.__bindgen_anon_6.optval = v2;
+        sqe.__bindgen_anon_6.bindgen_union_field[0] = v;
+        sqe.len = 0;
+    }
+
+    /*
+    let mut sqe: io_uring::sys::io_uring_sqe = unsafe { std::mem::zeroed()};
+    sqe.opcode = io_uring::sys::IORING_OP_URING_CMD as u8;
+    sqe.fd = fd;
+    sqe.__bindgen_anon_1.__bindgen_anon_1.cmd_op = io_uring::sys::SOCKET_URING_OP_SETSOCKOPT;
+    sqe.__bindgen_anon_2.__bindgen_anon_1.level = libc::SOL_TCP as u32;
+    sqe.__bindgen_anon_2.__bindgen_anon_1.optname = libc::TCP_ULP as u32;
+    let mut v = "tls".as_ptr() as u64;
+    let mut v2 = io_uring::sys::__BindgenUnionField::new();
+    unsafe { *v2.as_mut() = v; };
+    sqe.__bindgen_anon_6.optval = v2;
+    sqe.__bindgen_anon_5.optlen = 3;
+    sqe.user_data = con_id as u64 | USER_DATA_OP_SETSOCKOPT;
+    unsafe {
+        sqe.__bindgen_anon_3.uring_cmd_flags |= io_uring::sys::IORING_URING_CMD_FIXED;
+    }
+    */
+    //debug!("ULP SQE: {sqe:?}");
+    ops.push(io_uring::squeue::Entry(sqe));
+    Ok(())
+    //ktls::ffi::setup_ulp(fd)
 }
 
 fn parse_bool(input: &str) -> Result<bool, String> {
