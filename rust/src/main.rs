@@ -115,10 +115,13 @@ enum State {
     Closing,
 }
 
-#[derive(Debug)]
 struct Connection {
     id: usize,
     state: State,
+
+    // Crypto key info. Set once, before firing off setsockopts.
+    tls_rx: Option<ktls::CryptoInfo>,
+    tls_tx: Option<ktls::CryptoInfo>,
 
     // Outstanding number of io_uring ops. Don't GC the connection until it's
     // zero.
@@ -147,6 +150,8 @@ impl Connection {
             header_buf: Default::default(),
             last_action: std::time::Instant::now(),
             _pin: std::marker::PhantomPinned,
+            tls_rx: None,
+            tls_tx: None,
         }
     }
     fn init(&mut self, fd: i32, tls: rustls::ServerConnection) {
@@ -399,7 +404,6 @@ enum UserDataOp {
     SetSockOpt,
 }
 
-#[derive(Debug)]
 struct Hook<'a> {
     raw: u64,
     con: &'a mut Connection,
@@ -649,10 +653,10 @@ fn op_completion(
         if nw > 0 {
             let v = vec![];
             let mut c = std::io::Cursor::new(v);
-            let n = d.tls.write_tls(&mut c)?;
+            let _n = d.tls.write_tls(&mut c)?;
             let v = c.into_inner();
             // TODO: make this write io_uring.
-            let rc = unsafe { libc::write(d.fd, v.as_ptr() as *const libc::c_void, v.len()) };
+            let _rc = unsafe { libc::write(d.fd, v.as_ptr() as *const libc::c_void, v.len()) };
             debug!("Is handshaking: {}", d.tls.is_handshaking());
         } else {
             todo!("queue another read");
@@ -673,11 +677,23 @@ fn op_completion(
             let suite = d.tls.negotiated_cipher_suite().unwrap();
             debug!("Suite: {suite:?}");
             let keys = d.tls.dangerous_extract_secrets()?;
-            let mut ci = ktls::CryptoInfo::from_rustls(suite, keys.rx)?;
-            setup_tls_info(fd, data.con.id, libc::TLS_RX as u32, ci, &mut ops)?;
+            data.con.tls_rx = Some(ktls::CryptoInfo::from_rustls(suite, keys.rx)?);
+            setup_tls_info(
+                fd,
+                data.con.id,
+                libc::TLS_RX as u32,
+                data.con.tls_rx.as_ref().unwrap(),
+                &mut ops,
+            )?;
             data.con.outstanding += 1;
-            let ci = ktls::CryptoInfo::from_rustls(suite, keys.tx)?;
-            setup_tls_info(fd, data.con.id, libc::TLS_TX as u32, ci, &mut ops)?;
+            data.con.tls_tx = Some(ktls::CryptoInfo::from_rustls(suite, keys.tx)?);
+            setup_tls_info(
+                fd,
+                data.con.id,
+                libc::TLS_TX as u32,
+                data.con.tls_tx.as_ref().unwrap(),
+                &mut ops,
+            )?;
             data.con.outstanding += 1;
 
             data.con.state = State::EnablingKtls(fd);
@@ -790,7 +806,7 @@ fn mainloop(
                 _ => {
                     debug!("Completed: User data: {user_data:x}");
 
-                    let mut data = decode_user_data(user_data, result, connections);
+                    let data = decode_user_data(user_data, result, connections);
                     op_completion(data, &mut ops, opt, &mut pooltracker, archive)?;
                 }
             }
@@ -894,7 +910,7 @@ fn setup_ulp(fd: std::os::fd::RawFd, con_id: usize, ops: &mut SQueue) -> Result<
     //sqe.__bindgen_anon_3.uring_cmd_flags = io_uring::sys::IORING_URING_CMD_FIXED;
 
     // Set sockopt values directly.
-    let mut v = TLS_STR.as_ptr() as u64;
+    let v = TLS_STR.as_ptr() as u64;
     sqe.__bindgen_anon_2.__bindgen_anon_1.level = libc::SOL_TCP as u32;
     sqe.__bindgen_anon_2.__bindgen_anon_1.optname = libc::TCP_ULP as u32;
     sqe.__bindgen_anon_5.optlen = 3;
@@ -909,7 +925,7 @@ fn setup_tls_info(
     fd: std::os::fd::RawFd,
     con_id: usize,
     dir: u32,
-    ci: ktls::CryptoInfo,
+    ci: &ktls::CryptoInfo,
     ops: &mut SQueue,
 ) -> Result<()> {
     let mut sqe: io_uring::sys::io_uring_sqe = unsafe { std::mem::zeroed() };
@@ -921,7 +937,7 @@ fn setup_tls_info(
     //sqe.__bindgen_anon_3.uring_cmd_flags = io_uring::sys::IORING_URING_CMD_FIXED;
 
     // Set sockopt values directly.
-    let mut v = ci.as_ptr() as u64;
+    let v = ci.as_ptr() as u64;
     sqe.__bindgen_anon_2.__bindgen_anon_1.level = libc::SOL_TLS as u32;
     sqe.__bindgen_anon_2.__bindgen_anon_1.optname = dir;
     sqe.__bindgen_anon_5.optlen = ci.size() as u32;
