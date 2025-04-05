@@ -309,8 +309,62 @@ impl Connection {
                 3,
             )
             .build()
+            .flags(io_uring::squeue::Flags::IO_LINK)
             .user_data((self.id as u64) | USER_DATA_OP_SETSOCKOPT),
         );
+    }
+
+    fn enable_ktls(&mut self, fd: std::os::fd::RawFd, ops: &mut SQueue) -> Result<()> {
+        // Extract secrets.
+        let t = std::mem::replace(&mut self.state, State::Reading(fd));
+        let State::Handshaking(d) = t else { panic!() };
+        let suite = d.tls.negotiated_cipher_suite().unwrap();
+        trace!("Cipher suite: {suite:?}");
+        let keys = d.tls.dangerous_extract_secrets()?;
+        self.tls_rx = Some(ktls::CryptoInfo::from_rustls(suite, keys.rx)?);
+        self.tls_tx = Some(ktls::CryptoInfo::from_rustls(suite, keys.tx)?);
+
+        // Enable TLS RX and TX.
+        self.setsockopt_ktls(
+            fd,
+            libc::TLS_RX as u32,
+            self.tls_rx.as_ref().unwrap(),
+            true,
+            ops,
+        );
+        self.setsockopt_ktls(
+            fd,
+            libc::TLS_TX as u32,
+            self.tls_tx.as_ref().unwrap(),
+            false,
+            ops,
+        );
+        self.outstanding += 2;
+        Ok(())
+    }
+
+    fn setsockopt_ktls(
+        &self,
+        fd: std::os::fd::RawFd,
+        dir: u32,
+        ci: &ktls::CryptoInfo,
+        link: bool,
+        ops: &mut SQueue,
+    ) {
+        let op = io_uring::opcode::SetSockOpt::new(
+            io_uring::types::Fd(fd),
+            libc::SOL_TLS as u32,
+            dir,
+            ci.as_ptr() as _,
+            ci.size() as u32,
+        )
+        .build();
+        let op = if link {
+            op.flags(io_uring::squeue::Flags::IO_LINK)
+        } else {
+            op
+        };
+        ops.push(op.user_data(self.id as u64 | USER_DATA_OP_SETSOCKOPT));
     }
 
     // Queue up a read.
@@ -734,38 +788,11 @@ fn op_completion(
                 debug!("Handshaking is done");
                 let fd = d.fd;
 
-                // TODO: use IO_LINK for the three setsockopts.
-
                 // Set SOL_TCP/TCP_ULP to "tls", a prereq for enalbing kTLS.
                 data.con.setsockopt_ulp(fd, &mut ops);
 
                 // Extract TLS secrets.
-                let t = std::mem::replace(&mut data.con.state, State::Reading(fd));
-                let State::Handshaking(d) = t else { panic!() };
-                let suite = d.tls.negotiated_cipher_suite().unwrap();
-                trace!("Cipher suite: {suite:?}");
-                let keys = d.tls.dangerous_extract_secrets()?;
-                data.con.tls_rx = Some(ktls::CryptoInfo::from_rustls(suite, keys.rx)?);
-                data.con.tls_tx = Some(ktls::CryptoInfo::from_rustls(suite, keys.tx)?);
-
-                //
-                setup_tls_info(
-                    fd,
-                    data.con.id,
-                    libc::TLS_RX as u32,
-                    data.con.tls_rx.as_ref().unwrap(),
-                    &mut ops,
-                );
-                data.con.outstanding += 1;
-                setup_tls_info(
-                    fd,
-                    data.con.id,
-                    libc::TLS_TX as u32,
-                    data.con.tls_tx.as_ref().unwrap(),
-                    &mut ops,
-                );
-                data.con.outstanding += 1;
-
+                data.con.enable_ktls(fd, &mut ops)?;
                 data.con.state = State::EnablingKtls(fd);
                 return Ok(());
             }
@@ -970,26 +997,6 @@ lazy_static! {
 }
 
 const TLS_STR: &str = "tls";
-
-fn setup_tls_info(
-    fd: std::os::fd::RawFd,
-    con_id: usize,
-    dir: u32,
-    ci: &ktls::CryptoInfo,
-    ops: &mut SQueue,
-) {
-    ops.push(
-        io_uring::opcode::SetSockOpt::new(
-            io_uring::types::Fd(fd),
-            libc::SOL_TLS as u32,
-            dir,
-            ci.as_ptr() as _,
-            ci.size() as u32,
-        )
-        .build()
-        .user_data(con_id as u64 | USER_DATA_OP_SETSOCKOPT),
-    );
-}
 
 fn parse_bool(input: &str) -> Result<bool, String> {
     match input.to_lowercase().as_str() {
