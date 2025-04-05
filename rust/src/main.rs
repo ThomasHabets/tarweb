@@ -298,6 +298,21 @@ impl Connection {
         );
     }
 
+    fn setsockopt_ulp(&mut self, fd: std::os::fd::RawFd, ops: &mut SQueue) {
+        self.outstanding += 1;
+        ops.push(
+            io_uring::opcode::SetSockOpt::new(
+                io_uring::types::Fd(fd),
+                libc::SOL_TCP as u32,
+                libc::TCP_ULP as u32,
+                TLS_STR.as_ptr() as _,
+                3,
+            )
+            .build()
+            .user_data((self.id as u64) | USER_DATA_OP_SETSOCKOPT),
+        );
+    }
+
     // Queue up a read.
     fn read(&mut self, ops: &mut SQueue) {
         let read_buf = &mut self.read_buf[self.read_buf_pos..];
@@ -696,6 +711,7 @@ fn op_completion(
                 }
             }
             UserDataOp::Write => {
+                // If there's more to write, write it.
                 let v = [0u8; MAX_WRITE_BUF];
                 let mut c = std::io::Cursor::new(v);
                 let n = d.tls.write_tls(&mut c)?;
@@ -706,44 +722,51 @@ fn op_completion(
                     data.con.write(n, &mut ops);
                     return Ok(());
                 }
-                debug!("Write completed!");
+
+                // If handshake is not done, queue more reading.
+                trace!("Handshaking finished writing write buffer");
                 if d.tls.is_handshaking() {
                     // Not done. Read more.
                     data.con.read(&mut ops);
-                } else {
-                    debug!("Handshaking is done");
-                    let fd = d.fd;
-
-                    // TODO: use IO_LINK for the three setsockopts.
-                    setup_ulp(fd, data.con.id, &mut ops);
-                    data.con.outstanding += 1;
-
-                    let t = std::mem::replace(&mut data.con.state, State::Reading(fd));
-                    let State::Handshaking(d) = t else { panic!() };
-                    let suite = d.tls.negotiated_cipher_suite().unwrap();
-                    debug!("Suite: {suite:?}");
-                    let keys = d.tls.dangerous_extract_secrets()?;
-                    data.con.tls_rx = Some(ktls::CryptoInfo::from_rustls(suite, keys.rx)?);
-                    setup_tls_info(
-                        fd,
-                        data.con.id,
-                        libc::TLS_RX as u32,
-                        data.con.tls_rx.as_ref().unwrap(),
-                        &mut ops,
-                    );
-                    data.con.outstanding += 1;
-                    data.con.tls_tx = Some(ktls::CryptoInfo::from_rustls(suite, keys.tx)?);
-                    setup_tls_info(
-                        fd,
-                        data.con.id,
-                        libc::TLS_TX as u32,
-                        data.con.tls_tx.as_ref().unwrap(),
-                        &mut ops,
-                    );
-                    data.con.outstanding += 1;
-
-                    data.con.state = State::EnablingKtls(fd);
+                    return Ok(());
                 }
+
+                debug!("Handshaking is done");
+                let fd = d.fd;
+
+                // TODO: use IO_LINK for the three setsockopts.
+
+                // Set SOL_TCP/TCP_ULP to "tls", a prereq for enalbing kTLS.
+                data.con.setsockopt_ulp(fd, &mut ops);
+
+                // Extract TLS secrets.
+                let t = std::mem::replace(&mut data.con.state, State::Reading(fd));
+                let State::Handshaking(d) = t else { panic!() };
+                let suite = d.tls.negotiated_cipher_suite().unwrap();
+                trace!("Cipher suite: {suite:?}");
+                let keys = d.tls.dangerous_extract_secrets()?;
+                data.con.tls_rx = Some(ktls::CryptoInfo::from_rustls(suite, keys.rx)?);
+                data.con.tls_tx = Some(ktls::CryptoInfo::from_rustls(suite, keys.tx)?);
+
+                //
+                setup_tls_info(
+                    fd,
+                    data.con.id,
+                    libc::TLS_RX as u32,
+                    data.con.tls_rx.as_ref().unwrap(),
+                    &mut ops,
+                );
+                data.con.outstanding += 1;
+                setup_tls_info(
+                    fd,
+                    data.con.id,
+                    libc::TLS_TX as u32,
+                    data.con.tls_tx.as_ref().unwrap(),
+                    &mut ops,
+                );
+                data.con.outstanding += 1;
+
+                data.con.state = State::EnablingKtls(fd);
                 return Ok(());
             }
             _ => panic!("bad op in Handshaking"),
@@ -947,20 +970,6 @@ lazy_static! {
 }
 
 const TLS_STR: &str = "tls";
-
-fn setup_ulp(fd: std::os::fd::RawFd, con_id: usize, ops: &mut SQueue) {
-    ops.push(
-        io_uring::opcode::SetSockOpt::new(
-            io_uring::types::Fd(fd),
-            libc::SOL_TCP as u32,
-            libc::TCP_ULP as u32,
-            TLS_STR.as_ptr() as _,
-            3,
-        )
-        .build()
-        .user_data(con_id as u64 | USER_DATA_OP_SETSOCKOPT),
-    );
-}
 
 fn setup_tls_info(
     fd: std::os::fd::RawFd,
