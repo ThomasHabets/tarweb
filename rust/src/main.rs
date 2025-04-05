@@ -53,6 +53,8 @@ const MAX_IDLE: u128 = 5000;
 // size.
 const MAX_READ_BUF: usize = 1024;
 
+const MAX_WRITE_BUF: usize = 1024;
+
 // Outgoing headers max size.
 const MAX_HEADER_BUF: usize = 1024;
 
@@ -134,6 +136,9 @@ struct Connection {
     // processed, any tail is copied to the beginning.
     read_buf_pos: usize,
     read_buf: ReadBuf,
+
+    // TODO: merge these buffers. We're either reading or writing.
+    write_buf: [u8; MAX_WRITE_BUF],
     header_buf: HeaderBuf,
     _pin: std::marker::PhantomPinned,
 }
@@ -145,6 +150,7 @@ impl Connection {
             id,
             state: State::Idle,
             read_buf: [0; MAX_READ_BUF],
+            write_buf: [0; MAX_WRITE_BUF],
             read_buf_pos: 0,
             outstanding: 0,
             header_buf: Default::default(),
@@ -267,6 +273,29 @@ impl Connection {
                 );
             }
         }
+    }
+
+    fn must_get_fd(&self) -> i32 {
+        match &self.state {
+            State::Reading(fd) => *fd,
+            State::Handshaking(data) => data.fd,
+            State::EnablingKtls(fd) => *fd,
+            _ => panic!("get fd in wrong state"),
+        }
+    }
+
+    fn write(&mut self, n: usize, ops: &mut SQueue) {
+        let data = &self.write_buf[..n];
+        self.outstanding += 1;
+        ops.push(
+            io_uring::opcode::Write::new(
+                io_uring::types::Fd(self.must_get_fd()),
+                data.as_ptr(),
+                data.len() as _,
+            )
+            .build()
+            .user_data((self.id as u64) | USER_DATA_OP_WRITE),
+        );
     }
 
     // Queue up a read.
@@ -626,9 +655,10 @@ fn op_completion(
     debug!("Decoded op={:?} result={}", data.op, data.result);
     data.con.io_completed();
 
-    debug!(
+    trace!(
         "Read buf pos: {} result: {}",
-        data.con.read_buf_pos, data.result
+        data.con.read_buf_pos,
+        data.result
     );
     match data.con.state {
         State::EnablingKtls(fd) => {
@@ -645,60 +675,79 @@ fn op_completion(
     }
 
     if let State::Handshaking(d) = &mut data.con.state {
-        let io = d
-            .received(&data.con.read_buf[..data.result as usize])
-            .unwrap();
-        debug!("rustls op: {io:?}");
-        let nw = io.tls_bytes_to_write();
-        if nw > 0 {
-            let v = vec![];
-            let mut c = std::io::Cursor::new(v);
-            let _n = d.tls.write_tls(&mut c)?;
-            let v = c.into_inner();
-            // TODO: make this write io_uring.
-            let _rc = unsafe { libc::write(d.fd, v.as_ptr() as *const libc::c_void, v.len()) };
-            debug!("Is handshaking: {}", d.tls.is_handshaking());
-        } else {
-            todo!("queue another read");
+        match data.op {
+            UserDataOp::Read => {
+                let io = d
+                    .received(&data.con.read_buf[..data.result as usize])
+                    .unwrap();
+                debug!("rustls op: {io:?}");
+                let nw = io.tls_bytes_to_write();
+                if nw > 0 {
+                    let v = [0u8; MAX_WRITE_BUF];
+                    let mut c = std::io::Cursor::new(v);
+                    let n = d.tls.write_tls(&mut c)?;
+                    // TODO: fix needless copy.
+                    data.con.write_buf = c.into_inner();
+                    debug!("Is handshaking: {}", d.tls.is_handshaking());
+                    data.con.write(n, &mut ops);
+                    return Ok(());
+                } else {
+                    todo!("queue another read");
+                }
+            }
+            UserDataOp::Write => {
+                let v = [0u8; MAX_WRITE_BUF];
+                let mut c = std::io::Cursor::new(v);
+                let n = d.tls.write_tls(&mut c)?;
+                if n > 0 {
+                    // TODO: fix needless copy.
+                    data.con.write_buf = c.into_inner();
+                    debug!("Need to write {n} more");
+                    data.con.write(n, &mut ops);
+                    return Ok(());
+                }
+                debug!("Write completed!");
+                if d.tls.is_handshaking() {
+                    // Not done. Read more.
+                    data.con.read(&mut ops);
+                } else {
+                    debug!("Handshaking is done");
+                    let fd = d.fd;
+
+                    // TODO: use IO_LINK for the three setsockopts.
+                    setup_ulp(fd, data.con.id, &mut ops);
+                    data.con.outstanding += 1;
+
+                    let t = std::mem::replace(&mut data.con.state, State::Reading(fd));
+                    let State::Handshaking(d) = t else { panic!() };
+                    let suite = d.tls.negotiated_cipher_suite().unwrap();
+                    debug!("Suite: {suite:?}");
+                    let keys = d.tls.dangerous_extract_secrets()?;
+                    data.con.tls_rx = Some(ktls::CryptoInfo::from_rustls(suite, keys.rx)?);
+                    setup_tls_info(
+                        fd,
+                        data.con.id,
+                        libc::TLS_RX as u32,
+                        data.con.tls_rx.as_ref().unwrap(),
+                        &mut ops,
+                    );
+                    data.con.outstanding += 1;
+                    data.con.tls_tx = Some(ktls::CryptoInfo::from_rustls(suite, keys.tx)?);
+                    setup_tls_info(
+                        fd,
+                        data.con.id,
+                        libc::TLS_TX as u32,
+                        data.con.tls_tx.as_ref().unwrap(),
+                        &mut ops,
+                    );
+                    data.con.outstanding += 1;
+
+                    data.con.state = State::EnablingKtls(fd);
+                }
+                return Ok(());
+            }
+            _ => panic!("bad op in Handshaking"),
         }
-        if d.tls.is_handshaking() {
-            // Not done. Read more.
-            data.con.read(&mut ops);
-        } else {
-            debug!("Handshaking is done");
-            let fd = d.fd;
-
-            // TODO: use IO_LINK for the three setsockopts.
-            setup_ulp(fd, data.con.id, &mut ops);
-            data.con.outstanding += 1;
-
-            let t = std::mem::replace(&mut data.con.state, State::Reading(fd));
-            let State::Handshaking(d) = t else { panic!() };
-            let suite = d.tls.negotiated_cipher_suite().unwrap();
-            debug!("Suite: {suite:?}");
-            let keys = d.tls.dangerous_extract_secrets()?;
-            data.con.tls_rx = Some(ktls::CryptoInfo::from_rustls(suite, keys.rx)?);
-            setup_tls_info(
-                fd,
-                data.con.id,
-                libc::TLS_RX as u32,
-                data.con.tls_rx.as_ref().unwrap(),
-                &mut ops,
-            );
-            data.con.outstanding += 1;
-            data.con.tls_tx = Some(ktls::CryptoInfo::from_rustls(suite, keys.tx)?);
-            setup_tls_info(
-                fd,
-                data.con.id,
-                libc::TLS_TX as u32,
-                data.con.tls_tx.as_ref().unwrap(),
-                &mut ops,
-            );
-            data.con.outstanding += 1;
-
-            data.con.state = State::EnablingKtls(fd);
-        }
-        return Ok(());
     }
 
     if let Err(e) = handle_connection(&mut data, archive, opt.async_cancel2, ops) {
