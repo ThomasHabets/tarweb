@@ -669,7 +669,7 @@ fn op_completion(
             let fd = d.fd;
 
             // TODO: use IO_LINK for the three setsockopts.
-            setup_ulp(fd, data.con.id, &mut ops)?;
+            setup_ulp(fd, data.con.id, &mut ops);
             data.con.outstanding += 1;
 
             let t = std::mem::replace(&mut data.con.state, State::Reading(fd));
@@ -684,7 +684,7 @@ fn op_completion(
                 libc::TLS_RX as u32,
                 data.con.tls_rx.as_ref().unwrap(),
                 &mut ops,
-            )?;
+            );
             data.con.outstanding += 1;
             data.con.tls_tx = Some(ktls::CryptoInfo::from_rustls(suite, keys.tx)?);
             setup_tls_info(
@@ -693,7 +693,7 @@ fn op_completion(
                 libc::TLS_TX as u32,
                 data.con.tls_tx.as_ref().unwrap(),
                 &mut ops,
-            )?;
+            );
             data.con.outstanding += 1;
 
             data.con.state = State::EnablingKtls(fd);
@@ -899,26 +899,18 @@ lazy_static! {
 
 const TLS_STR: &str = "tls";
 
-fn setup_ulp(fd: std::os::fd::RawFd, con_id: usize, ops: &mut SQueue) -> Result<()> {
-    let mut sqe: io_uring::sys::io_uring_sqe = unsafe { std::mem::zeroed() };
-
-    // Common.
-    sqe.opcode = io_uring::sys::IORING_OP_URING_CMD as u8;
-    sqe.fd = fd;
-    sqe.__bindgen_anon_1.__bindgen_anon_1.cmd_op = io_uring::sys::SOCKET_URING_OP_SETSOCKOPT;
-    sqe.user_data = con_id as u64 | USER_DATA_OP_SETSOCKOPT;
-    //sqe.__bindgen_anon_3.uring_cmd_flags = io_uring::sys::IORING_URING_CMD_FIXED;
-
-    // Set sockopt values directly.
-    let v = TLS_STR.as_ptr() as u64;
-    sqe.__bindgen_anon_2.__bindgen_anon_1.level = libc::SOL_TCP as u32;
-    sqe.__bindgen_anon_2.__bindgen_anon_1.optname = libc::TCP_ULP as u32;
-    sqe.__bindgen_anon_5.optlen = 3;
-    sqe.__bindgen_anon_6.bindgen_union_field[0] = v;
-    sqe.len = 0;
-
-    ops.push(io_uring::squeue::Entry(sqe));
-    Ok(())
+fn setup_ulp(fd: std::os::fd::RawFd, con_id: usize, ops: &mut SQueue) {
+    ops.push(
+        io_uring::opcode::SetSockOpt::new(
+            io_uring::types::Fd(fd),
+            libc::SOL_TCP as u32,
+            libc::TCP_ULP as u32,
+            TLS_STR.as_ptr() as _,
+            3,
+        )
+        .build()
+        .user_data(con_id as u64 | USER_DATA_OP_SETSOCKOPT),
+    );
 }
 
 fn setup_tls_info(
@@ -927,26 +919,18 @@ fn setup_tls_info(
     dir: u32,
     ci: &ktls::CryptoInfo,
     ops: &mut SQueue,
-) -> Result<()> {
-    let mut sqe: io_uring::sys::io_uring_sqe = unsafe { std::mem::zeroed() };
-    sqe.opcode = io_uring::sys::IORING_OP_URING_CMD as u8;
-    sqe.fd = fd;
-
-    sqe.__bindgen_anon_1.__bindgen_anon_1.cmd_op = io_uring::sys::SOCKET_URING_OP_SETSOCKOPT;
-    sqe.user_data = con_id as u64 | USER_DATA_OP_SETSOCKOPT;
-    //sqe.__bindgen_anon_3.uring_cmd_flags = io_uring::sys::IORING_URING_CMD_FIXED;
-
-    // Set sockopt values directly.
-    let v = ci.as_ptr() as u64;
-    sqe.__bindgen_anon_2.__bindgen_anon_1.level = libc::SOL_TLS as u32;
-    sqe.__bindgen_anon_2.__bindgen_anon_1.optname = dir;
-    sqe.__bindgen_anon_5.optlen = ci.size() as u32;
-    sqe.__bindgen_anon_6.bindgen_union_field[0] = v;
-    sqe.len = 0;
-
-    ops.push(io_uring::squeue::Entry(sqe));
-    Ok(())
-    //ktls::ffi::setup_ulp(fd)
+) {
+    ops.push(
+        io_uring::opcode::SetSockOpt::new(
+            io_uring::types::Fd(fd),
+            libc::SOL_TLS as u32,
+            dir,
+            ci.as_ptr() as _,
+            ci.size() as u32,
+        )
+        .build()
+        .user_data(con_id as u64 | USER_DATA_OP_SETSOCKOPT),
+    );
 }
 
 fn parse_bool(input: &str) -> Result<bool, String> {

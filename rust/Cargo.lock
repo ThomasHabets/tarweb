@@ -582,7 +582,7 @@ dependencies = [
 [[package]]
 name = "io-uring"
 version = "0.7.4"
-source = "git+https://github.com/ThomasHabets/io-uring.git?branch=more-pub#f32e9283d1257005e80e1e8ab3e639c328b6ccdf"
+source = "git+https://github.com/ThomasHabets/io-uring.git?branch=setsockopt#7d5337cc881aa4312a43bee9916c84b2194d3add"
 dependencies = [
  "bitflags",
  "cfg-if",
