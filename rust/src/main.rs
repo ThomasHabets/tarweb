@@ -314,10 +314,20 @@ impl Connection {
         );
     }
 
-    fn enable_ktls(&mut self, fd: std::os::fd::RawFd, ops: &mut SQueue) -> Result<()> {
+    fn enable_ktls(
+        &mut self,
+        fd: std::os::fd::RawFd,
+        ops: &mut SQueue,
+        new_state: State,
+    ) -> Result<()> {
         // Extract secrets.
-        let t = std::mem::replace(&mut self.state, State::Reading(fd));
-        let State::Handshaking(d) = t else { panic!() };
+        //
+        // We need to set the new state here already, because extracting secrets
+        // consumes tls, partially moving out of the old state.
+        let t = std::mem::replace(&mut self.state, new_state);
+        let State::Handshaking(d) = t else {
+            panic!("tried to enable kTLS while in state other than Handshaking")
+        };
         let suite = d.tls.negotiated_cipher_suite().unwrap();
         trace!("Cipher suite: {suite:?}");
         let keys = d.tls.dangerous_extract_secrets()?;
@@ -792,8 +802,8 @@ fn op_completion(
                 data.con.setsockopt_ulp(fd, &mut ops);
 
                 // Extract TLS secrets.
-                data.con.enable_ktls(fd, &mut ops)?;
-                data.con.state = State::EnablingKtls(fd);
+                data.con
+                    .enable_ktls(fd, &mut ops, State::EnablingKtls(fd))?;
                 return Ok(());
             }
             _ => panic!("bad op in Handshaking"),
