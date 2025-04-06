@@ -22,3 +22,5 @@ tarweb_test
 tarweb_test.log
 tarweb_test.trs
 test-suite.log
+/target
+*.swp
