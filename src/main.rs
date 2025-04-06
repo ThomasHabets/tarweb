@@ -711,14 +711,18 @@ fn make_op_timeout(ts: Pin<&io_uring::types::Timespec>) -> io_uring::squeue::Ent
         .build()
         .user_data(USER_DATA_TIMEOUT)
 }
-fn load_certs(filename: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
+fn load_certs<P: AsRef<std::path::Path>>(
+    filename: P,
+) -> std::io::Result<Vec<CertificateDer<'static>>> {
     // Open certificate file.
     let certfile = std::fs::File::open(filename)?;
     let mut reader = std::io::BufReader::new(certfile);
     rustls_pemfile::certs(&mut reader).collect()
 }
 
-fn load_private_key(filename: &str) -> std::io::Result<PrivateKeyDer<'static>> {
+fn load_private_key<P: AsRef<std::path::Path>>(
+    filename: P,
+) -> std::io::Result<PrivateKeyDer<'static>> {
     let keyfile = std::fs::File::open(filename)?;
     let mut reader = std::io::BufReader::new(keyfile);
     rustls_pemfile::private_key(&mut reader).map(|key| key.unwrap())
@@ -837,10 +841,10 @@ fn mainloop(
     let mut last_submit = std::time::Instant::now();
     let mut syscalls = 0;
     debug!("Loading certs");
-    let certs = load_certs("fullchain.pem")?;
+    let certs = load_certs(&opt.tls_cert)?;
     // Load private key.
     debug!("Loading key");
-    let key = load_private_key("privkey.pem")?;
+    let key = load_private_key(&opt.tls_key)?;
     debug!("Creating TLS config");
     let mut config =
         rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -981,6 +985,12 @@ struct Opt {
 
     #[arg(long, default_value = "", help = "Strip prefix before looking in tar")]
     prefix: String,
+
+    #[arg(long, short = 'P', help = "TLS private key")]
+    tls_key: String,
+
+    #[arg(long, short = 'C', help = "TLS certificate chain")]
+    tls_cert: String,
 
     tarfile: String,
 }
