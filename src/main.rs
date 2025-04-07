@@ -339,7 +339,10 @@ impl Connection {
             panic!("tried to enable kTLS while in state other than Handshaking")
         };
         let suite = d.tls.negotiated_cipher_suite().unwrap();
-        debug!("Cipher suite: {suite:?} {:?}", d.tls.negotiated_key_exchange_group().unwrap());
+        debug!(
+            "Cipher suite: {suite:?} {:?}",
+            d.tls.negotiated_key_exchange_group().unwrap()
+        );
         let keys = d.tls.dangerous_extract_secrets()?;
         self.tls_rx = Some(ktls::CryptoInfo::from_rustls(suite, keys.rx)?);
         self.tls_tx = Some(ktls::CryptoInfo::from_rustls(suite, keys.tx)?);
@@ -774,6 +777,10 @@ fn op_completion(
     if let State::Handshaking(d) = &mut data.con.state {
         match data.op {
             UserDataOp::Read => {
+                if data.result == 0 {
+                    data.con.close(opt.async_cancel2, &mut ops);
+                    return Ok(());
+                }
                 let io = d
                     .received(&data.con.read_buf[..data.result as usize])
                     .unwrap();
