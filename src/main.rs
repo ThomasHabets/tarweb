@@ -473,6 +473,7 @@ fn make_op_close(fd: FixedFile, con_id: usize) -> io_uring::squeue::Entry {
 
 #[must_use]
 fn make_ops_cancel(fd: FixedFile, id: u64, modern: bool, ops: &mut SQueue) -> usize {
+    trace!("Cancelling connection");
     let mut outstanding = 0;
     if modern {
         outstanding += 1;
@@ -540,9 +541,17 @@ struct Hook<'a> {
 
 impl std::fmt::Debug for Hook<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let strerror = if self.result < 0 {
+            format!(
+                " ({})",
+                std::io::Error::from_raw_os_error(self.result.abs())
+            )
+        } else {
+            "".into()
+        };
         write!(
             f,
-            "Con={id} ({state:?}) Op={op:?} result={result} fixed={fd} raw={raw:x}",
+            "Op={op:?} result={result}{strerror} fixed={fd} raw={raw:x} Con={id} ({state:?})",
             raw = self.raw,
             op = self.op,
             result = self.result,
@@ -655,12 +664,6 @@ fn handle_connection(
         let Some(_) = hook.con.fd() else {
             return Err(Error::msg("invalid fd on completed fd"));
         };
-        if hook.result < 0 {
-            debug!(
-                "… errno {}",
-                std::io::Error::from_raw_os_error(hook.result.abs())
-            );
-        }
     }
     match hook.op {
         UserDataOp::SetSockOpt => {
@@ -669,6 +672,12 @@ fn handle_connection(
         }
         UserDataOp::Read => {
             if hook.result < 0 {
+                if hook.result.abs() == libc::EIO {
+                    // TODO: for some reason I'm getting EIO after curl is done.
+                    trace!("Got EIO on read");
+                    hook.con.close(modern, ops);
+                    return Ok(());
+                }
                 return Err(Error::msg(format!(
                     "read() failed: {}",
                     std::io::Error::from_raw_os_error(hook.result.abs())
@@ -762,7 +771,7 @@ fn load_private_key<P: AsRef<std::path::Path>>(
 }
 
 fn op_completion(
-    mut data: Hook,
+    mut data: &mut Hook,
     mut ops: &mut SQueue,
     opt: &Opt,
     pooltracker: &mut PoolTracker,
@@ -771,13 +780,16 @@ fn op_completion(
     debug!("Op completed: {data:?}");
     data.con.io_completed();
 
-    trace!(
-        "Read buf pos: {} result: {}",
-        data.con.read_buf_pos,
-        data.result
-    );
+    trace!("Read buf pos: {}", data.con.read_buf_pos);
     match data.con.state {
         State::EnablingKtls(fd) => {
+            assert!(matches![data.op, UserDataOp::SetSockOpt]);
+            if data.result != 0 {
+                return Err(Error::msg(format!(
+                    "setsockopt(): {}",
+                    std::io::Error::from_raw_os_error(data.result.abs())
+                )));
+            }
             if data.con.outstanding == 0 {
                 data.con.read(ops);
                 data.con.state = State::Reading(fd);
@@ -791,7 +803,7 @@ fn op_completion(
     }
 
     if let State::Handshaking(d) = &mut data.con.state {
-        match data.op {
+        match &data.op {
             UserDataOp::Read => {
                 if data.result == 0 {
                     data.con.close(opt.async_cancel2, &mut ops);
@@ -965,8 +977,13 @@ fn mainloop(
                     syscalls = 0;
                 }
                 _ => {
-                    let data = decode_user_data(user_data, result, connections);
-                    op_completion(data, &mut ops, opt, &mut pooltracker, archive)?;
+                    let mut data = decode_user_data(user_data, result, connections);
+                    if let Err(e) =
+                        op_completion(&mut data, &mut ops, opt, &mut pooltracker, archive)
+                    {
+                        warn!("Op error: {e:?}");
+                        data.con.close(opt.async_cancel2, &mut ops);
+                    }
                 }
             }
         }
