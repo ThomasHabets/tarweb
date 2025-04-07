@@ -535,13 +535,19 @@ struct Hook<'a> {
 
 impl std::fmt::Debug for Hook<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "Con={id} Op={op:?} result={result} fixed={fd} raw={raw:x}",
-               raw=self.raw,
-               op=self.op,
-               result=self.result,
-               id=self.con.id,
-               fd=self.con.fd().map(|x| format!("{}", x.0)).unwrap_or("<none>".to_string()),
-               )
+        write!(
+            f,
+            "Con={id} Op={op:?} result={result} fixed={fd} raw={raw:x}",
+            raw = self.raw,
+            op = self.op,
+            result = self.result,
+            id = self.con.id,
+            fd = self
+                .con
+                .fd()
+                .map(|x| format!("{}", x.0))
+                .unwrap_or("<none>".to_string()),
+        )
     }
 }
 
