@@ -637,8 +637,9 @@ dependencies = [
 
 [[package]]
 name = "ktls"
-version = "6.0.1"
-source = "git+https://github.com/ThomasHabets/ktls.git?branch=more-pub#f2bb1e1352eefedae5a34a8c7c4002553ad55cad"
+version = "6.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5b79b6ec9c9d56656298df28f92dbaf2e83816be6d12c5b896461087e52d701"
 dependencies = [
  "futures-util",
  "ktls-sys",
