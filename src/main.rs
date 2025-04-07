@@ -339,7 +339,7 @@ impl Connection {
             panic!("tried to enable kTLS while in state other than Handshaking")
         };
         let suite = d.tls.negotiated_cipher_suite().unwrap();
-        trace!("Cipher suite: {suite:?}");
+        debug!("Cipher suite: {suite:?} {:?}", d.tls.negotiated_key_exchange_group().unwrap());
         let keys = d.tls.dangerous_extract_secrets()?;
         self.tls_rx = Some(ktls::CryptoInfo::from_rustls(suite, keys.rx)?);
         self.tls_tx = Some(ktls::CryptoInfo::from_rustls(suite, keys.tx)?);
