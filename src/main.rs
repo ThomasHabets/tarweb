@@ -533,6 +533,18 @@ struct Hook<'a> {
     result: i32,
 }
 
+impl std::fmt::Debug for Hook<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Con={id} Op={op:?} result={result} fixed={fd} raw={raw:x}",
+               raw=self.raw,
+               op=self.op,
+               result=self.result,
+               id=self.con.id,
+               fd=self.con.fd().map(|x| format!("{}", x.0)).unwrap_or("<none>".to_string()),
+               )
+    }
+}
+
 struct Request<'a> {
     path: &'a str,
     len: usize,
@@ -628,17 +640,9 @@ fn handle_connection(
     ops: &mut SQueue,
 ) -> Result<()> {
     {
-        let Some(fd) = hook.con.fd() else {
+        let Some(_) = hook.con.fd() else {
             return Err(Error::msg("invalid fd on completed fd"));
         };
-        debug!(
-            "Op {op:?} completed on con {con} fd {fd}, res={res} raw={raw:x}",
-            fd = fd.0,
-            op = hook.op,
-            con = hook.con.id,
-            raw = hook.raw,
-            res = hook.result,
-        );
         if hook.result < 0 {
             debug!(
                 "… errno {}",
@@ -752,7 +756,7 @@ fn op_completion(
     pooltracker: &mut PoolTracker,
     archive: &Archive,
 ) -> Result<()> {
-    debug!("Decoded op={:?} result={}", data.op, data.result);
+    debug!("Op completed: {data:?}");
     data.con.io_completed();
 
     trace!(
@@ -938,8 +942,6 @@ fn mainloop(
                     syscalls = 0;
                 }
                 _ => {
-                    debug!("Completed: User data: {user_data:x}");
-
                     let data = decode_user_data(user_data, result, connections);
                     op_completion(data, &mut ops, opt, &mut pooltracker, archive)?;
                 }
