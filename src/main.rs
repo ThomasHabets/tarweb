@@ -789,7 +789,8 @@ fn op_completion(
                     data.con.write(n, &mut ops);
                     return Ok(());
                 } else {
-                    todo!("queue another read");
+                    data.con.read(&mut ops);
+                    return Ok(());
                 }
             }
             UserDataOp::Write => {
@@ -926,8 +927,7 @@ fn mainloop(
                             con.close(opt.async_cancel2, &mut ops);
                         }
                     });
-                    trace!("Timeout");
-                    debug!("Syscalls: {syscalls}");
+                    trace!("Timeout: Syscalls: {syscalls}");
                     syscalls = 0;
                 }
                 _ => {
