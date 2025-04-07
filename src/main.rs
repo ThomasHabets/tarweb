@@ -21,12 +21,14 @@ use rtsan_standalone::nonblocking;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
+type FixedFile = io_uring::types::Fixed;
+
 // We don't use file descriptors for our io_uring operations. We use offsets
 // into the io_uring fixed file table.
 //
 // The index for new accepted connections are automatically picked by the
 // kernel, except for our listening socket which is number 0.
-const LISTEN_FIXED_FILE: io_uring::types::Fixed = io_uring::types::Fixed(0);
+const LISTEN_FIXED_FILE: FixedFile = io_uring::types::Fixed(0);
 
 // The maximum number of concurrent connections. This is only set to 100 because
 // ulimit tends to be much lower than that.
@@ -79,13 +81,13 @@ type HeaderBuf = ArrayVec<u8, MAX_HEADER_BUF>;
 
 #[derive(Debug)]
 struct HandshakeData {
-    fd: i32,
+    fixed: FixedFile,
     tls: rustls::ServerConnection,
 }
 
 impl HandshakeData {
-    fn new(fd: i32, tls: rustls::ServerConnection) -> Self {
-        Self { fd, tls }
+    fn new(fixed: FixedFile, tls: rustls::ServerConnection) -> Self {
+        Self { fixed, tls }
     }
     fn received(&mut self, data: &[u8]) -> Result<rustls::IoState, rustls::Error> {
         debug!("Got some handshaky data: {data:?}");
@@ -106,25 +108,25 @@ enum State {
     //
     // The associated buffers are not part of the state, in order to ensure
     // nothing outstanding points to it, even if we go to Closing state.
-    EnablingKtls(i32),
+    EnablingKtls(FixedFile),
 
     // Reading new request. Note that because of pipelining, we may enter this
     // state with a nonzero read_buf, and may exit it with more full requests
     // ready to go.
     //
     // This state means no pending Write or Close, at least.
-    Reading(i32),
+    Reading(FixedFile),
 
     // header_buf could be inside this enum, but I'm not sure I can create it on
     // state change without copying it. No placement new.
     //
     // This state has a pending Write.
-    WritingHeaders(i32, usize, usize),
+    WritingHeaders(FixedFile, usize, usize),
 
     // This state has a pending Write.
     //
     // TODO: add data file.
-    WritingData(i32, usize, usize),
+    WritingData(FixedFile, usize, usize),
 
     // Close and possibly Cancel has been sent, but we don't reuse the
     // connection object until all ops have completed. (`outstdanding == 0`)
@@ -174,8 +176,8 @@ impl Connection {
             tls_tx: None,
         }
     }
-    fn init(&mut self, fd: i32, tls: rustls::ServerConnection) {
-        self.state = State::Handshaking(HandshakeData::new(fd, tls));
+    fn init(&mut self, fixed: FixedFile, tls: rustls::ServerConnection) {
+        self.state = State::Handshaking(HandshakeData::new(fixed, tls));
         self.last_action = std::time::Instant::now();
     }
     fn deinit(&mut self) {
@@ -203,10 +205,10 @@ impl Connection {
         self.last_action = std::time::Instant::now();
         self.outstanding -= 1;
     }
-    fn fd(&self) -> Option<i32> {
+    fn fd(&self) -> Option<FixedFile> {
         match self.state {
             State::Idle => None,
-            State::Handshaking(ref data) => Some(data.fd),
+            State::Handshaking(ref data) => Some(data.fixed),
             State::EnablingKtls(fd) => Some(fd),
             State::Reading(fd) => Some(fd),
             State::WritingHeaders(fd, _, _) => Some(fd),
@@ -226,34 +228,37 @@ impl Connection {
 
         // TODO: anything we can do about this copy? Create headers in-place?
         self.header_buf.extend(msg.iter().copied());
-        self.write_headers(ops, fd as u32, pos, len);
+        self.write_headers(ops, fd, pos, len);
     }
 
-    fn write_headers(&mut self, ops: &mut SQueue, fd: u32, pos: usize, len: usize) {
+    fn write_headers(&mut self, ops: &mut SQueue, fd: FixedFile, pos: usize, len: usize) {
         // TODO: change to SendZc?
         // Or in some cases Splice?
         // Surely at least writev()
         // If writev, make sure to handle the over-consumption in write_done()
         self.outstanding += 1;
-        let op = io_uring::opcode::Write::new(
-            io_uring::types::Fixed(fd),
-            self.header_buf.as_ptr(),
-            self.header_buf.len() as _,
-        )
-        .build()
-        .user_data((self.id as u64) | USER_DATA_OP_WRITE);
-        ops.push(op);
-        self.state = State::WritingHeaders(fd as i32, pos, len);
-    }
-
-    fn write_data(&mut self, ops: &mut SQueue, archive: &Archive, fd: u32, pos: usize, len: usize) {
-        let msg = archive.get_slice(pos, len);
-        self.state = State::WritingData(fd as i32, pos, len);
-        self.outstanding += 1;
         let op =
-            io_uring::opcode::Write::new(io_uring::types::Fixed(fd), msg.as_ptr(), msg.len() as _)
+            io_uring::opcode::Write::new(fd, self.header_buf.as_ptr(), self.header_buf.len() as _)
                 .build()
                 .user_data((self.id as u64) | USER_DATA_OP_WRITE);
+        ops.push(op);
+        self.state = State::WritingHeaders(fd, pos, len);
+    }
+
+    fn write_data(
+        &mut self,
+        ops: &mut SQueue,
+        archive: &Archive,
+        fd: FixedFile,
+        pos: usize,
+        len: usize,
+    ) {
+        let msg = archive.get_slice(pos, len);
+        self.state = State::WritingData(fd, pos, len);
+        self.outstanding += 1;
+        let op = io_uring::opcode::Write::new(fd, msg.as_ptr(), msg.len() as _)
+            .build()
+            .user_data((self.id as u64) | USER_DATA_OP_WRITE);
         ops.push(op);
     }
 
@@ -263,18 +268,18 @@ impl Connection {
                 let fd = *fd;
                 self.header_buf.drain(..wrote);
                 if self.header_buf.is_empty() {
-                    self.write_data(ops, archive, fd as u32, *pos, *len);
+                    self.write_data(ops, archive, fd, *pos, *len);
                 } else {
-                    self.write_headers(ops, fd as u32, *pos, *len);
+                    self.write_headers(ops, fd, *pos, *len);
                 }
                 false
             }
             State::WritingData(fd, pos, len) => {
-                let fd = *fd as u32;
+                let fd = *fd as FixedFile;
                 let pos = *pos + wrote;
                 let len = *len - wrote;
                 if len == 0 {
-                    self.state = State::Reading(fd as i32);
+                    self.state = State::Reading(fd);
                     true
                 } else {
                     self.write_data(ops, archive, fd, pos, len);
@@ -289,34 +294,30 @@ impl Connection {
         }
     }
 
-    fn must_get_fd(&self) -> u32 {
+    fn must_get_fd(&self) -> FixedFile {
         (match &self.state {
             State::Reading(fd) => *fd,
-            State::Handshaking(data) => data.fd,
+            State::Handshaking(data) => data.fixed,
             State::EnablingKtls(fd) => *fd,
             _ => panic!("get fd in wrong state"),
-        }) as u32
+        }) as _
     }
 
     fn write(&mut self, n: usize, ops: &mut SQueue) {
         let data = &self.write_buf[..n];
         self.outstanding += 1;
         ops.push(
-            io_uring::opcode::Write::new(
-                io_uring::types::Fixed(self.must_get_fd()),
-                data.as_ptr(),
-                data.len() as _,
-            )
-            .build()
-            .user_data((self.id as u64) | USER_DATA_OP_WRITE),
+            io_uring::opcode::Write::new(self.must_get_fd(), data.as_ptr(), data.len() as _)
+                .build()
+                .user_data((self.id as u64) | USER_DATA_OP_WRITE),
         );
     }
 
-    fn setsockopt_ulp(&mut self, fd: std::os::fd::RawFd, ops: &mut SQueue) {
+    fn setsockopt_ulp(&mut self, fd: FixedFile, ops: &mut SQueue) {
         self.outstanding += 1;
         ops.push(
             io_uring::opcode::SetSockOpt::new(
-                io_uring::types::Fixed(fd as u32),
+                fd,
                 libc::SOL_TCP as u32,
                 libc::TCP_ULP as u32,
                 TLS_STR.as_ptr() as _,
@@ -328,12 +329,7 @@ impl Connection {
         );
     }
 
-    fn enable_ktls(
-        &mut self,
-        fd: std::os::fd::RawFd,
-        ops: &mut SQueue,
-        new_state: State,
-    ) -> Result<()> {
+    fn enable_ktls(&mut self, fd: FixedFile, ops: &mut SQueue, new_state: State) -> Result<()> {
         // Extract secrets.
         //
         // We need to set the new state here already, because extracting secrets
@@ -369,14 +365,14 @@ impl Connection {
 
     fn setsockopt_ktls(
         &self,
-        fd: std::os::fd::RawFd,
+        fd: FixedFile,
         dir: u32,
         ci: &ktls::CryptoInfo,
         link: bool,
         ops: &mut SQueue,
     ) {
         let op = io_uring::opcode::SetSockOpt::new(
-            io_uring::types::Fixed(fd as u32),
+            fd,
             libc::SOL_TLS as u32,
             dir,
             ci.as_ptr() as _,
@@ -396,20 +392,16 @@ impl Connection {
         let read_buf = &mut self.read_buf[self.read_buf_pos..];
         let fd = match &self.state {
             State::Reading(fd) => *fd,
-            State::Handshaking(data) => data.fd,
+            State::Handshaking(data) => data.fixed,
             State::EnablingKtls(fd) => *fd,
             _ => panic!("read in wrong state"),
         };
         // Try RecvMulti/RecvMsgMulti/RecvMultiBundle?
         self.outstanding += 1;
         ops.push(
-            io_uring::opcode::Read::new(
-                io_uring::types::Fixed(fd as u32),
-                read_buf.as_mut_ptr(),
-                read_buf.len() as _,
-            )
-            .build()
-            .user_data((self.id as u64) | USER_DATA_OP_READ),
+            io_uring::opcode::Read::new(fd, read_buf.as_mut_ptr(), read_buf.len() as _)
+                .build()
+                .user_data((self.id as u64) | USER_DATA_OP_READ),
         );
     }
 
@@ -465,23 +457,21 @@ impl PoolTracker {
 }
 
 #[must_use]
-fn make_op_close(fd: i32, con_id: usize) -> io_uring::squeue::Entry {
-    io_uring::opcode::Close::new(io_uring::types::Fixed(fd as u32))
+fn make_op_close(fd: FixedFile, con_id: usize) -> io_uring::squeue::Entry {
+    io_uring::opcode::Close::new(fd)
         .build()
         .user_data((con_id as u64) | USER_DATA_OP_CLOSE)
 }
 
 #[must_use]
-fn make_ops_cancel(fd: i32, id: u64, modern: bool, ops: &mut SQueue) -> usize {
+fn make_ops_cancel(fd: FixedFile, id: u64, modern: bool, ops: &mut SQueue) -> usize {
     let mut outstanding = 0;
     if modern {
         outstanding += 1;
         ops.push(
-            io_uring::opcode::AsyncCancel2::new(io_uring::types::CancelBuilder::fd(
-                io_uring::types::Fixed(fd as u32),
-            ))
-            .build()
-            .user_data(id | USER_DATA_OP_CANCEL),
+            io_uring::opcode::AsyncCancel2::new(io_uring::types::CancelBuilder::fd(fd))
+                .build()
+                .user_data(id | USER_DATA_OP_CANCEL),
         );
     } else {
         for opname in [USER_DATA_OP_WRITE, USER_DATA_OP_READ] {
@@ -527,9 +517,16 @@ enum UserDataOp {
 }
 
 struct Hook<'a> {
+    // Raw io_uring "user data".
     raw: u64,
+
+    // Associated connectio.
     con: &'a mut Connection,
+
+    // Operation that finished.
     op: UserDataOp,
+
+    // Result of the syscall.
     result: i32,
 }
 
@@ -628,9 +625,12 @@ fn handle_connection(
     ops: &mut SQueue,
 ) -> Result<()> {
     {
-        let fd = hook.con.fd().unwrap_or(-1);
+        let Some(fd) = hook.con.fd() else {
+            return Err(Error::msg("invalid fd on completed fd"));
+        };
         debug!(
             "Op {op:?} completed on con {con} fd {fd}, res={res} raw={raw:x}",
+            fd = fd.0,
             op = hook.op,
             con = hook.con.id,
             raw = hook.raw,
@@ -814,7 +814,7 @@ fn op_completion(
                 }
 
                 debug!("Handshaking is done");
-                let fd = d.fd;
+                let fd = d.fixed;
 
                 // Set SOL_TCP/TCP_ULP to "tls", a prereq for enalbing kTLS.
                 data.con.setsockopt_ulp(fd, &mut ops);
@@ -909,12 +909,13 @@ fn mainloop(
                         );
                         continue;
                     }
+                    let fixed = io_uring::types::Fixed(result as u32);
                     // disable_nodelay(result);
                     let id = pooltracker.alloc().unwrap();
                     debug!("Allocated {id} result {result}");
                     let new_conn = connections.get(id);
                     let tls = rustls::ServerConnection::new(config.clone())?;
-                    new_conn.init(result, tls);
+                    new_conn.init(fixed, tls);
                     new_conn.read(&mut ops);
                 }
                 USER_DATA_TIMEOUT => {
@@ -1175,8 +1176,7 @@ fn main() -> Result<()> {
                         let timeout = Pin::new(&timeout);
                         let init_ops = [make_op_accept(opt.accept_multi), make_op_timeout(timeout)];
                         use std::os::fd::AsRawFd;
-                        //let mut registered = vec![-1i32; MAX_CONNECTIONS];
-                        let mut registered = vec![-1i32; 100];
+                        let mut registered = vec![-1i32; MAX_CONNECTIONS];
                         registered[0] = listener.as_raw_fd();
                         ring.submitter().register_files(&registered)?;
                         unsafe {
