@@ -401,6 +401,11 @@ impl Connection {
         };
         // Try RecvMulti/RecvMsgMulti/RecvMultiBundle?
         self.outstanding += 1;
+        trace!(
+            "Issuing read to {:?} {}",
+            read_buf.as_mut_ptr(),
+            read_buf.len()
+        );
         ops.push(
             io_uring::opcode::Read::new(fd, read_buf.as_mut_ptr(), read_buf.len() as _)
                 .build()
@@ -537,11 +542,12 @@ impl std::fmt::Debug for Hook<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "Con={id} Op={op:?} result={result} fixed={fd} raw={raw:x}",
+            "Con={id} ({state:?}) Op={op:?} result={result} fixed={fd} raw={raw:x}",
             raw = self.raw,
             op = self.op,
             result = self.result,
             id = self.con.id,
+            state = self.con.state,
             fd = self
                 .con
                 .fd()
@@ -791,6 +797,12 @@ fn op_completion(
                     data.con.close(opt.async_cancel2, &mut ops);
                     return Ok(());
                 }
+                if data.result < 0 {
+                    warn!("Read error: {}", data.result);
+                    data.con.close(opt.async_cancel2, &mut ops);
+                    return Ok(());
+                }
+
                 let io = d
                     .received(&data.con.read_buf[..data.result as usize])
                     .unwrap();
@@ -802,13 +814,14 @@ fn op_completion(
                     let n = d.tls.write_tls(&mut c)?;
                     // TODO: fix needless copy.
                     data.con.write_buf = c.into_inner();
-                    debug!("Is handshaking: {}", d.tls.is_handshaking());
+                    debug!("Handshaking: still handshaking: {}", d.tls.is_handshaking());
                     data.con.write(n, &mut ops);
-                    return Ok(());
                 } else {
+                    // Read completed, nothing to write. Must mean we need to
+                    // read more.
                     data.con.read(&mut ops);
-                    return Ok(());
                 }
+                return Ok(());
             }
             UserDataOp::Write => {
                 // If there's more to write, write it.
@@ -818,20 +831,22 @@ fn op_completion(
                 if n > 0 {
                     // TODO: fix needless copy.
                     data.con.write_buf = c.into_inner();
-                    debug!("Need to write {n} more");
+                    debug!("Handshaking: Need to write {n} more");
                     data.con.write(n, &mut ops);
                     return Ok(());
                 }
 
                 // If handshake is not done, queue more reading.
-                trace!("Handshaking finished writing write buffer");
+                trace!(
+                    "Handshaking: finished writing write buffer. Handshaking done: {}",
+                    !d.tls.is_handshaking()
+                );
                 if d.tls.is_handshaking() {
                     // Not done. Read more.
                     data.con.read(&mut ops);
                     return Ok(());
                 }
 
-                debug!("Handshaking is done");
                 let fd = d.fixed;
 
                 // Set SOL_TCP/TCP_ULP to "tls", a prereq for enalbing kTLS.
@@ -842,13 +857,15 @@ fn op_completion(
                     .enable_ktls(fd, &mut ops, State::EnablingKtls(fd))?;
                 return Ok(());
             }
-            _ => panic!("bad op in Handshaking"),
+            op => panic!("bad op in Handshaking: {op:?}"),
         }
     }
 
-    if let Err(e) = handle_connection(&mut data, archive, opt.async_cancel2, ops) {
-        info!("Error handling connection: {e:?}");
-        data.con.close(opt.async_cancel2, ops);
+    if !matches![data.op, UserDataOp::Close] {
+        if let Err(e) = handle_connection(&mut data, archive, opt.async_cancel2, ops) {
+            info!("Error handling connection: {e:?}");
+            data.con.close(opt.async_cancel2, ops);
+        }
     }
     if data.con.closing() && data.con.outstanding == 0 {
         data.con.deinit();
