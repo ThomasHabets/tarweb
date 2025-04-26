@@ -1,7 +1,7 @@
 // TODO:
 // * Does ASYNC flag help performance?
 // * buffers?
-// * fixed file thingy?
+// * sendfile
 //
 //
 // On my laptop, the best performance is:
@@ -1161,6 +1161,45 @@ impl Archive {
     }
 }
 
+fn is_ktls_loaded() -> Result<bool> {
+    use std::os::fd::AsRawFd;
+    // Step 1: Bind a local listener to a free port
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+
+    // Step 2: Spawn a thread to accept the connection
+    let handle = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        socket
+    });
+
+    // Step 3: Connect as a client
+    let stream = std::net::TcpStream::connect(addr)?;
+    let server_stream = handle.join().unwrap();
+
+    // Step 4: Try to set TCP_ULP on the client socket
+    let fd = stream.as_raw_fd();
+    let ulp_name = b"tls\0";
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_TCP,
+            libc::TCP_ULP,
+            ulp_name.as_ptr() as *const libc::c_void,
+            ulp_name.len() as libc::socklen_t,
+        )
+    };
+
+    Ok(if ret == 0 {
+        trace!("Successfully set TCP_ULP to 'tls' as a test");
+        true
+    } else {
+        let err = std::io::Error::last_os_error();
+        debug!("Failed to set TCP_ULP on client socket: {}", err);
+        false
+    })
+}
+
 fn main() -> Result<()> {
     let opt = Opt::parse();
     use std::str::FromStr;
@@ -1179,6 +1218,11 @@ fn main() -> Result<()> {
     trace!("AsyncCancel2: {}", opt.async_cancel2);
     trace!("Ring size: {}", opt.ring_size);
     trace!("Single issuer: {}", opt.single_issuer);
+
+    if !is_ktls_loaded()? {
+        return Err(Error::msg("Kernel TLS does not seem to be supported. Either CONFIG_TLS=n, or you need to load the `tls` module using `modprobe tls`"));
+    }
+    trace!("Kernel TLS seems supported");
 
     let archive = Archive::new(&opt.tarfile, &opt.prefix)?;
 
