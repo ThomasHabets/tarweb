@@ -1175,7 +1175,7 @@ fn is_ktls_loaded() -> Result<bool> {
 
     // Step 3: Connect as a client
     let stream = std::net::TcpStream::connect(addr)?;
-    let server_stream = handle.join().unwrap();
+    let _server_stream = handle.join().unwrap();
 
     // Step 4: Try to set TCP_ULP on the client socket
     let fd = stream.as_raw_fd();
