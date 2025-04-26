@@ -1161,6 +1161,48 @@ impl Archive {
     }
 }
 
+fn is_setsockopt_supported() -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    // Set up a TCP connection.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let handle = std::thread::spawn(move || {
+        let (socket, _) = listener.accept().unwrap();
+        socket
+    });
+    let stream = std::net::TcpStream::connect(addr)?;
+    let _server_stream = handle.join().unwrap();
+
+    // Set up io_uring.
+    let mut ring: io_uring::IoUring = io_uring::IoUring::builder().dontfork().build(10)?;
+
+    // Step 4: Try to set TCP_ULP on the client socket
+    let fd = stream.as_raw_fd();
+    let optval = b"tls\0";
+    let op = io_uring::opcode::SetSockOpt::new(
+        io_uring::types::Fd(fd),
+        libc::SOL_TCP as u32,
+        libc::TCP_ULP as u32,
+        &optval as *const _ as *const libc::c_void,
+        3).build();
+    unsafe {
+        ring.submission().push(&op.into())?;
+    }
+    loop {
+        ring.submit_and_wait(1)?;
+        let cqes: Vec<io_uring::cqueue::Entry> = ring.completion().map(Into::into).collect();
+        if cqes.is_empty() {
+            continue;
+        }
+        let rc = cqes[0].result();
+        if rc == 0 {
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+}
+
 fn is_ktls_loaded() -> Result<bool> {
     use std::os::fd::AsRawFd;
     // Step 1: Bind a local listener to a free port
@@ -1223,6 +1265,9 @@ fn main() -> Result<()> {
         return Err(Error::msg("Kernel TLS does not seem to be supported. Either CONFIG_TLS=n, or you need to load the `tls` module using `modprobe tls`"));
     }
     trace!("Kernel TLS seems supported");
+    if !is_setsockopt_supported()? {
+        return Err(Error::msg("io-uring setsockopt not supported. Support was added in Linux kernel 6.7, so this must be older than that."));
+    }
 
     let archive = Archive::new(&opt.tarfile, &opt.prefix)?;
 
