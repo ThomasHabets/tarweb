@@ -1178,14 +1178,15 @@ fn is_setsockopt_supported() -> Result<bool> {
     let mut ring: io_uring::IoUring = io_uring::IoUring::builder().dontfork().build(10)?;
 
     // Step 4: Try to set TCP_ULP on the client socket
-    let fd = stream.as_raw_fd();
     let optval = b"tls\0";
     let op = io_uring::opcode::SetSockOpt::new(
-        io_uring::types::Fd(fd),
+        io_uring::types::Fd(stream.as_raw_fd()),
         libc::SOL_TCP as u32,
         libc::TCP_ULP as u32,
-        &optval as *const _ as *const libc::c_void,
-        3).build();
+        optval.as_ptr() as *const libc::c_void,
+        3,
+    )
+    .build();
     unsafe {
         ring.submission().push(&op.into())?;
     }
