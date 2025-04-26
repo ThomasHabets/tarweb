@@ -1165,7 +1165,7 @@ fn is_setsockopt_supported() -> Result<bool> {
     use std::os::fd::AsRawFd;
 
     // Set up a TCP connection.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let listener = std::net::TcpListener::bind("[::1]:0")?;
     let addr = listener.local_addr()?;
     let handle = std::thread::spawn(move || {
         let (socket, _) = listener.accept().unwrap();
@@ -1206,7 +1206,7 @@ fn is_setsockopt_supported() -> Result<bool> {
 fn is_ktls_loaded() -> Result<bool> {
     use std::os::fd::AsRawFd;
     // Step 1: Bind a local listener to a free port
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let listener = std::net::TcpListener::bind("[::1]:0")?;
     let addr = listener.local_addr()?;
 
     // Step 2: Spawn a thread to accept the connection
