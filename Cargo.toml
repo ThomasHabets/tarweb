@@ -14,7 +14,7 @@ core_affinity = "0.8.1"
 
 # bindgen and overwrite are needed on the StarFive VisionFive V2.
 # io-uring = { version = "0.7.3", features = ["bindgen", "overwrite"] }
-# io-uring = {path="vendor/io-uring"}
+# io-uring = {path="vendor/io-uring", features = ["bindgen", "overwrite"] }
 io-uring = {git = "https://github.com/ThomasHabets/io-uring.git", branch="setsockopt", features = ["bindgen", "overwrite"] }
 ktls = "6.0.2"
 lazy_static = "1.5.0"
