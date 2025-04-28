@@ -12,11 +12,14 @@ boring = "4.14.0"
 clap = { version = "4.5.27", features = ["derive"] }
 core_affinity = "0.8.1"
 
-# bindgen and overwrite are needed on the StarFive VisionFive V2.
-# io-uring = { version = "0.7.3", features = ["bindgen", "overwrite"] }
-# io-uring = {path="vendor/io-uring", features = ["bindgen", "overwrite"] }
-io-uring = {git = "https://github.com/ThomasHabets/io-uring.git", branch="setsockopt", features = ["bindgen", "overwrite"] }
+# Need at least 0.7.5 for setsockopt support.
+# Cannot use feature "bindgen" because it requires too modern headers for debian
+# stable.
+io-uring = "0.7.5"
+
+# Need at least 6.0.2 for public CryptoInfo.as_ptr().
 ktls = "6.0.2"
+
 lazy_static = "1.5.0"
 libc = "0.2.169"
 log = "0.4.25"
