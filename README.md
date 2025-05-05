@@ -48,3 +48,16 @@ $ tarweb \
 ## Kernel
 
 * Need kernel 6.7 for setsockopt
+
+## Future work
+
+* Use io-uring buffers for read operations.
+* use `writev` to reduce queue roundtrips.
+* `TCP_CORK`?
+
+## Random notes
+
+* There's no `sendfile()` in io-uring, but while there's `slice()` which could
+  be used to implement `sendfile()` while bouncing on a pipe, there's no
+  `pipe(2)` in io-uring either, so that'd force a syscall per connection. But I
+  guess a pool of pipes can be pre-created?
