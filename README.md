@@ -51,7 +51,6 @@ $ tarweb \
 
 ## Future work
 
-* Use io-uring buffers for read operations.
 * use `writev` to reduce queue roundtrips.
 * `TCP_CORK`?
 
@@ -61,3 +60,7 @@ $ tarweb \
   be used to implement `sendfile()` while bouncing on a pipe, there's no
   `pipe(2)` in io-uring either, so that'd force a syscall per connection. But I
   guess a pool of pipes can be pre-created?
+* Maybe it'd be possible to use io-uring buffers for read operations, but then
+  either it'd require copying from the fixed buffer to the connection buffer, or
+  parse request from a non-contiguous buffer (all the while holding on to the
+  buffer, and there can only be 65536 of them).
