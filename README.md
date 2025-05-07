@@ -7,7 +7,11 @@ io-uring & ktls based webserver serving files from a tar file.
 
 ## Prerequisites
 
-Needs `CONFIG_TLS=y` or `=m` with the module loaded.
+You need at least kernel 6.7, with `IO_URING` and `TLS` enabled. 6.7 introduced
+io-uring enabled `setsockopt`, which is required.
+
+If `CONFIG_TLS=m` then the `tls` kernel module needs to be loaded. At least on
+my system, it doesn't automatically load on demand.
 
 ```
 $ grep ^CONFIG_TLS= /boot/config-$(uname -r)
@@ -16,6 +20,12 @@ $ lsmod | grep ^tls
 $ sudo modprobe tls
 $ tlmod | grep ^tls
 tls                   151552  0
+```
+
+To load it automatically on every boot, add it to `/etc/modules`:
+
+```
+$ echo tls | sudo tee -a /etc/modules
 ```
 
 ## Example use
@@ -45,10 +55,6 @@ $ tarweb \
   site1.tar
 ```
 
-## Kernel
-
-* Need kernel 6.7 for setsockopt
-
 ## Future work
 
 * use `writev` to reduce queue roundtrips.
@@ -60,6 +66,8 @@ $ tarweb \
   be used to implement `sendfile()` while bouncing on a pipe, there's no
   `pipe(2)` in io-uring either, so that'd force a syscall per connection. But I
   guess a pool of pipes can be pre-created?
+  * I think I'll just wait for `sendfile()` to be supported natively in
+    io-uring.
 * Maybe it'd be possible to use io-uring buffers for read operations, but then
   either it'd require copying from the fixed buffer to the connection buffer, or
   parse request from a non-contiguous buffer (all the while holding on to the
