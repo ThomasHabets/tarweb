@@ -414,6 +414,7 @@ impl Connection {
     }
 
     // Get the read buffer.
+    #[allow(dead_code)]
     fn get_read_buf(&self) -> &[u8] {
         &self.read_buf[self.read_buf_pos..]
     }
