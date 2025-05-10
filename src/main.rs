@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::LazyLock;
 
 use anyhow::{Error, Result};
 use arrayvec::ArrayVec;
