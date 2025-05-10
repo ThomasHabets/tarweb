@@ -98,10 +98,13 @@ impl HandshakeData {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum State {
     Idle,
 
     // rustls handshaking happening.
+    //
+    // This is the big enum variant. Over a kB.
     Handshaking(HandshakeData),
 
     // KTLS setsockopt()s in flight. Awaiting their completion.
@@ -1316,7 +1319,7 @@ fn main() -> Result<()> {
         debug!("All threads joined!");
         Ok(())
     })?;
-    //debug!("All threads done: {ret:?}");
+    debug!("All threads done");
     Ok(())
 }
 /* vim: textwidth=80
