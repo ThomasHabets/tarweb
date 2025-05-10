@@ -620,7 +620,7 @@ fn decode_user_data(user_data: u64, result: i32, cons: &mut Connections) -> Hook
 fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Result<()> {
     let data = &hook.con.read_buf[..hook.con.read_buf_pos];
     let s = std::str::from_utf8(data)?;
-    trace!("Let's see if there's a request in {:?}", s);
+    trace!("Let's see if there's a request in {s:?}");
     let req = parse_request(data)?;
     let Some(req) = req else {
         // No full request yet.
@@ -772,8 +772,8 @@ fn load_private_key<P: AsRef<std::path::Path>>(
 }
 
 fn op_completion(
-    mut data: &mut Hook,
-    mut ops: &mut SQueue,
+    data: &mut Hook,
+    ops: &mut SQueue,
     opt: &Opt,
     pooltracker: &mut PoolTracker,
     archive: &Archive,
@@ -782,37 +782,34 @@ fn op_completion(
     data.con.io_completed();
 
     trace!("Read buf pos: {}", data.con.read_buf_pos);
-    match data.con.state {
-        State::EnablingKtls(fd) => {
-            assert!(matches![data.op, UserDataOp::SetSockOpt]);
-            if data.result != 0 {
-                return Err(Error::msg(format!(
-                    "setsockopt(): {}",
-                    std::io::Error::from_raw_os_error(data.result.abs())
-                )));
-            }
-            if data.con.outstanding == 0 {
-                data.con.read(ops);
-                data.con.state = State::Reading(fd);
-                data.con.read_buf_pos = 0;
-            } else {
-                debug!("EnablingKtls: still waiting for {}", data.con.outstanding);
-            }
-            return Ok(());
+    if let State::EnablingKtls(fd) = data.con.state {
+        assert!(matches![data.op, UserDataOp::SetSockOpt]);
+        if data.result != 0 {
+            return Err(Error::msg(format!(
+                "setsockopt(): {}",
+                std::io::Error::from_raw_os_error(data.result.abs())
+            )));
         }
-        _ => {}
+        if data.con.outstanding == 0 {
+            data.con.read(ops);
+            data.con.state = State::Reading(fd);
+            data.con.read_buf_pos = 0;
+        } else {
+            debug!("EnablingKtls: still waiting for {}", data.con.outstanding);
+        }
+        return Ok(());
     }
 
     if let State::Handshaking(d) = &mut data.con.state {
         match &data.op {
             UserDataOp::Read => {
                 if data.result == 0 {
-                    data.con.close(opt.async_cancel2, &mut ops);
+                    data.con.close(opt.async_cancel2, ops);
                     return Ok(());
                 }
                 if data.result < 0 {
                     warn!("Read error: {}", data.result);
-                    data.con.close(opt.async_cancel2, &mut ops);
+                    data.con.close(opt.async_cancel2, ops);
                     return Ok(());
                 }
 
@@ -828,11 +825,11 @@ fn op_completion(
                     // TODO: fix needless copy.
                     data.con.write_buf = c.into_inner();
                     debug!("Handshaking: still handshaking: {}", d.tls.is_handshaking());
-                    data.con.write(n, &mut ops);
+                    data.con.write(n, ops);
                 } else {
                     // Read completed, nothing to write. Must mean we need to
                     // read more.
-                    data.con.read(&mut ops);
+                    data.con.read(ops);
                 }
                 return Ok(());
             }
@@ -845,7 +842,7 @@ fn op_completion(
                     // TODO: fix needless copy.
                     data.con.write_buf = c.into_inner();
                     debug!("Handshaking: Need to write {n} more");
-                    data.con.write(n, &mut ops);
+                    data.con.write(n, ops);
                     return Ok(());
                 }
 
@@ -856,18 +853,18 @@ fn op_completion(
                 );
                 if d.tls.is_handshaking() {
                     // Not done. Read more.
-                    data.con.read(&mut ops);
+                    data.con.read(ops);
                     return Ok(());
                 }
 
                 let fd = d.fixed;
 
                 // Set SOL_TCP/TCP_ULP to "tls", a prereq for enalbing kTLS.
-                data.con.setsockopt_ulp(fd, &mut ops);
+                data.con.setsockopt_ulp(fd, ops);
 
                 // Extract TLS secrets.
                 data.con
-                    .enable_ktls(fd, &mut ops, State::EnablingKtls(fd))?;
+                    .enable_ktls(fd, ops, State::EnablingKtls(fd))?;
                 return Ok(());
             }
             op => panic!("bad op in Handshaking: {op:?}"),
@@ -875,7 +872,7 @@ fn op_completion(
     }
 
     if !matches![data.op, UserDataOp::Close] {
-        if let Err(e) = handle_connection(&mut data, archive, opt.async_cancel2, ops) {
+        if let Err(e) = handle_connection(data, archive, opt.async_cancel2, ops) {
             info!("Error handling connection: {e:?}");
             data.con.close(opt.async_cancel2, ops);
         }
@@ -1065,7 +1062,7 @@ fn parse_bool(input: &str) -> Result<bool, String> {
     match input.to_lowercase().as_str() {
         "true" | "1" | "yes" => Ok(true),
         "false" | "0" | "no" => Ok(false),
-        _ => Err(format!("Invalid value for flag: {}", input)),
+        _ => Err(format!("Invalid value for flag: {input}")),
     }
 }
 fn parse_duration(time_str: &str) -> Result<std::time::Duration, String> {
@@ -1167,11 +1164,11 @@ fn is_setsockopt_supported() -> Result<bool> {
     )
     .build();
     unsafe {
-        ring.submission().push(&op.into())?;
+        ring.submission().push(&op)?;
     }
     loop {
         ring.submit_and_wait(1)?;
-        let cqes: Vec<io_uring::cqueue::Entry> = ring.completion().map(Into::into).collect();
+        let cqes: Vec<io_uring::cqueue::Entry> = ring.completion().collect();
         if cqes.is_empty() {
             continue;
         }
@@ -1217,7 +1214,7 @@ fn is_ktls_loaded() -> Result<bool> {
         true
     } else {
         let err = std::io::Error::last_os_error();
-        debug!("Failed to set TCP_ULP on client socket: {}", err);
+        debug!("Failed to set TCP_ULP on client socket: {err}");
         false
     })
 }
@@ -1259,7 +1256,7 @@ fn main() -> Result<()> {
         disable_nodelay(listener.as_raw_fd())?;
     }
 
-    let ret = std::thread::scope(|s| -> Result<()> {
+    std::thread::scope(|s| -> Result<()> {
         let mut handles = Vec::new();
         for n in 0..opt.threads {
             let listener = listener.try_clone()?;
@@ -1319,7 +1316,7 @@ fn main() -> Result<()> {
         debug!("All threads joined!");
         Ok(())
     })?;
-    debug!("All threads done: {ret:?}");
+    //debug!("All threads done: {ret:?}");
     Ok(())
 }
 /* vim: textwidth=80
