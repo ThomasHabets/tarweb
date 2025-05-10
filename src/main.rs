@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use anyhow::{Error, Result};
 use arrayvec::ArrayVec;
@@ -1058,28 +1059,7 @@ struct Opt {
     tarfile: String,
 }
 
-#[derive(Default)]
-#[repr(C)]
-struct SetSockOptTls {
-    level: u32,
-    optname: u32,
-    optval: u64,
-    optlen: u32,
-    _pad: u32,
-}
-
-use lazy_static::lazy_static;
-lazy_static! {
-    static ref SETSOCKOPT_TLS: SetSockOptTls = SetSockOptTls {
-        level: libc::SOL_TCP as u32,
-        optname: libc::TCP_ULP as u32,
-        optval: "tls".as_ptr() as u64,
-        optlen: 3,
-        _pad: 0,
-    };
-}
-
-const TLS_STR: &str = "tls";
+const TLS_STR: &[u8; 4] = b"tls\0";
 
 fn parse_bool(input: &str) -> Result<bool, String> {
     match input.to_lowercase().as_str() {
@@ -1178,12 +1158,11 @@ fn is_setsockopt_supported() -> Result<bool> {
     let mut ring: io_uring::IoUring = io_uring::IoUring::builder().dontfork().build(10)?;
 
     // Step 4: Try to set TCP_ULP on the client socket
-    let optval = b"tls\0";
     let op = io_uring::opcode::SetSockOpt::new(
         io_uring::types::Fd(stream.as_raw_fd()),
         libc::SOL_TCP as u32,
         libc::TCP_ULP as u32,
-        optval.as_ptr() as *const libc::c_void,
+        TLS_STR.as_ptr() as *const libc::c_void,
         3,
     )
     .build();
