@@ -1822,7 +1822,6 @@ dependencies = [
  "core_affinity",
  "io-uring",
  "ktls",
- "lazy_static",
  "libc",
  "log",
  "memmap2",
