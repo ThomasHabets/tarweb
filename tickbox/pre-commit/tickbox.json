@@ -1,0 +1,6 @@
+{
+    "envs": {
+	"RUSTFLAGS": "--deny warnings",
+	"CARGO_TERM_COLOR": "always"
+    }
+}
