@@ -866,8 +866,7 @@ fn op_completion(
                 data.con.setsockopt_ulp(fd, ops);
 
                 // Extract TLS secrets.
-                data.con
-                    .enable_ktls(fd, ops, State::EnablingKtls(fd))?;
+                data.con.enable_ktls(fd, ops, State::EnablingKtls(fd))?;
                 return Ok(());
             }
             op => panic!("bad op in Handshaking: {op:?}"),
