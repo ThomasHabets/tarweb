@@ -820,6 +820,15 @@ fn op_completion(
                     .received(&data.con.read_buf[..data.result as usize])
                     .unwrap();
                 debug!("rustls op: {io:?}");
+
+                // Check if handshake is done *and* there are plaintext bytes.
+                let nread = io.plaintext_bytes_to_read();
+                if nread > 0 {
+                    assert!(!d.tls.is_handshaking());
+                    // TODO: actually handle this early data read case.
+                    return Err(Error::msg("got nonzero plaintext while handshaking"));
+                }
+
                 let nw = io.tls_bytes_to_write();
                 if nw > 0 {
                     let v = [0u8; MAX_WRITE_BUF];
