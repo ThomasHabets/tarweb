@@ -10,6 +10,7 @@
 // * --cpu-affinity=false (not sure why, but CPU affinity hurts a lot)
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -44,7 +45,7 @@ const THREAD_STACK_SIZE: usize = 10 * 1048576;
 // Every io_uring op has a "handle" of sorts. We use it to stuff the connection
 // ID, and the operation.
 // This mask allows for 2^32 concurrent connections.
-const USER_DATA_CON_MASK: u64 = 0xffffffff;
+const USER_DATA_CON_MASK: u64 = 0xffff_ffff;
 
 // Special user data "handle" to indicate a new connection coming in.
 const USER_DATA_LISTENER: u64 = u64::MAX;
@@ -55,12 +56,13 @@ const USER_DATA_TIMEOUT: u64 = USER_DATA_LISTENER - 1;
 
 // This is the op type part of the user data "handle".
 // If more ops are added, add them to make_ops_cancel for !modern path.
-const USER_DATA_OP_MASK: u64 = 0xf00000000;
-const USER_DATA_OP_WRITE: u64 = 0x100000000;
-const USER_DATA_OP_CLOSE: u64 = 0x200000000;
-const USER_DATA_OP_READ: u64 = 0x300000000;
-const USER_DATA_OP_CANCEL: u64 = 0x400000000;
-const USER_DATA_OP_SETSOCKOPT: u64 = 0x800000000;
+const USER_DATA_OP_MASK: u64 = 0xff_0000_0000;
+const USER_DATA_OP_WRITE: u64 = 0x1_0000_0000;
+const USER_DATA_OP_CLOSE: u64 = 0x2_0000_0000;
+const USER_DATA_OP_READ: u64 = 0x3_0000_0000;
+const USER_DATA_OP_CANCEL: u64 = 0x4_0000_0000;
+const USER_DATA_OP_SETSOCKOPT: u64 = 0x8_0000_0000;
+const USER_DATA_OP_NOP: u64 = 0x10_0000_0000;
 
 // Max milliseconds that a connection is allowed to be idle, before we close it.
 const MAX_IDLE: u128 = 5000;
@@ -333,6 +335,8 @@ impl Connection {
     }
 
     fn enable_ktls(&mut self, fd: FixedFile, ops: &mut SQueue, new_state: State) -> Result<()> {
+        // Set SOL_TCP/TCP_ULP to "tls", a prereq for enalbing kTLS.
+        self.setsockopt_ulp(fd, ops);
         // Extract secrets.
         //
         // We need to set the new state here already, because extracting secrets
@@ -391,6 +395,31 @@ impl Connection {
             op
         };
         ops.push(op.user_data(self.id as u64 | USER_DATA_OP_SETSOCKOPT));
+    }
+
+    // Perform fake synchronous read. This will never be a syscall, because
+    // rustls promises it already has the data.
+    fn read_sync(&mut self, buf: &[u8], ops: &mut SQueue) -> Result<()> {
+        self.read_buf[self.read_buf_pos..(self.read_buf_pos + buf.len())].copy_from_slice(buf);
+        self.read_buf_pos += buf.len();
+        if false {
+            self.outstanding += 1;
+            ops.push(
+                io_uring::opcode::Nop::new()
+                    .build()
+                    .user_data((self.id as u64) | USER_DATA_OP_NOP),
+            );
+        }
+        Ok(())
+    }
+
+    fn issue_nop(&mut self, ops: &mut SQueue) {
+        self.outstanding += 1;
+        ops.push(
+            io_uring::opcode::Nop::new()
+                .build()
+                .user_data((self.id as u64) | USER_DATA_OP_NOP),
+        );
     }
 
     // Queue up a read.
@@ -527,6 +556,7 @@ enum UserDataOp {
     Close,
     Cancel,
     SetSockOpt,
+    Nop,
 }
 
 struct Hook<'a> {
@@ -608,6 +638,7 @@ fn decode_user_data(user_data: u64, result: i32, cons: &mut Connections) -> Hook
         USER_DATA_OP_CLOSE => UserDataOp::Close,
         USER_DATA_OP_CANCEL => UserDataOp::Cancel,
         USER_DATA_OP_SETSOCKOPT => UserDataOp::SetSockOpt,
+        USER_DATA_OP_NOP => UserDataOp::Nop,
         _ => panic!("Invalid op {user_data:x} result {result}"),
     };
     assert_eq!(user_data & !(USER_DATA_CON_MASK | USER_DATA_OP_MASK), 0);
@@ -669,12 +700,13 @@ fn handle_connection(
             return Err(Error::msg("invalid fd on completed fd"));
         };
     }
+    let is_nop = matches![hook.op, UserDataOp::Nop];
     match hook.op {
         UserDataOp::SetSockOpt => {
             debug!("Setsockopt returned {}", hook.result);
             assert_eq!(hook.result, 0);
         }
-        UserDataOp::Read => {
+        UserDataOp::Read | UserDataOp::Nop => {
             if hook.result < 0 {
                 if hook.result.abs() == libc::EIO {
                     // TODO: for some reason I'm getting EIO after curl is done.
@@ -687,7 +719,8 @@ fn handle_connection(
                     std::io::Error::from_raw_os_error(hook.result.abs())
                 )));
             }
-            if hook.result == 0 {
+            if !is_nop && hook.result == 0 {
+                // EOF.
                 if hook.con.read_buf_pos == 0 {
                     // Normal EOF.
                     hook.con.close(modern, ops);
@@ -786,7 +819,11 @@ fn op_completion(
 
     trace!("Read buf pos: {}", data.con.read_buf_pos);
     if let State::EnablingKtls(fd) = data.con.state {
-        assert!(matches![data.op, UserDataOp::SetSockOpt]);
+        assert!(
+            matches![data.op, UserDataOp::SetSockOpt],
+            "Expected SetSockOpt, got {:?}",
+            data.op
+        );
         if data.result != 0 {
             return Err(Error::msg(format!(
                 "setsockopt(): {}",
@@ -794,9 +831,12 @@ fn op_completion(
             )));
         }
         if data.con.outstanding == 0 {
-            data.con.read(ops);
+            if data.con.read_buf_pos == 0 {
+                data.con.read(ops);
+            } else {
+                data.con.issue_nop(ops);
+            }
             data.con.state = State::Reading(fd);
-            data.con.read_buf_pos = 0;
         } else {
             debug!("EnablingKtls: still waiting for {}", data.con.outstanding);
         }
@@ -819,26 +859,52 @@ fn op_completion(
                 let io = d
                     .received(&data.con.read_buf[..data.result as usize])
                     .unwrap();
+                let still_handshaking = d.tls.is_handshaking();
+                let fd = d.fixed;
                 debug!("rustls op: {io:?}");
 
-                // Check if handshake is done *and* there are plaintext bytes.
-                let nread = io.plaintext_bytes_to_read();
-                if nread > 0 {
-                    assert!(!d.tls.is_handshaking());
-                    // TODO: actually handle this early data read case.
-                    return Err(Error::msg("got nonzero plaintext while handshaking"));
+                // Handle bytes write.
+                // TODO: fix needless copy.
+                let bytes_to_write = io.tls_bytes_to_write();
+                let write_buf = [0u8; MAX_WRITE_BUF];
+                let mut write_cursor = std::io::Cursor::new(write_buf);
+                let bytes_written = if bytes_to_write > 0 {
+                    d.tls.write_tls(&mut write_cursor)?
+                } else {
+                    0
+                };
+
+                // Handle bytes read.
+                // TODO: fix needless copy.
+                let bytes_to_read = io.plaintext_bytes_to_read();
+                let mut read_buf = [0u8; MAX_READ_BUF];
+                let bytes_read = if bytes_to_read > 0 {
+                    trace!("Early plaintext bytes: {bytes_to_read}");
+                    assert!(!still_handshaking);
+                    d.tls.reader().read(&mut read_buf[..bytes_to_read])?
+                } else {
+                    0
+                };
+
+                // `d` implicitly dropped here.
+
+                if bytes_written > 0 {
+                    data.con.write_buf = write_cursor.into_inner();
+                    debug!("Handshaking: still handshaking: {}", d.tls.is_handshaking());
+                    data.con.write(bytes_written, ops);
+                }
+                if bytes_read > 0 {
+                    data.con.read_sync(&read_buf[..bytes_read], ops)?;
                 }
 
-                let nw = io.tls_bytes_to_write();
-                if nw > 0 {
-                    let v = [0u8; MAX_WRITE_BUF];
-                    let mut c = std::io::Cursor::new(v);
-                    let n = d.tls.write_tls(&mut c)?;
-                    // TODO: fix needless copy.
-                    data.con.write_buf = c.into_inner();
-                    debug!("Handshaking: still handshaking: {}", d.tls.is_handshaking());
-                    data.con.write(n, ops);
-                } else {
+                if bytes_to_write == 0 && !still_handshaking {
+                    // If handshake is finished, but there's still bytes to
+                    // write, then we wait for the Write to complete.
+                    assert_eq!(bytes_to_read, bytes_read);
+                    // Nothing to write, handshake is done. Let's go to enable
+                    // kTLS.
+                    data.con.enable_ktls(fd, ops, State::EnablingKtls(fd))?;
+                } else if bytes_to_write == 0 {
                     // Read completed, nothing to write. Must mean we need to
                     // read more.
                     data.con.read(ops);
@@ -870,11 +936,6 @@ fn op_completion(
                 }
 
                 let fd = d.fixed;
-
-                // Set SOL_TCP/TCP_ULP to "tls", a prereq for enalbing kTLS.
-                data.con.setsockopt_ulp(fd, ops);
-
-                // Extract TLS secrets.
                 data.con.enable_ktls(fd, ops, State::EnablingKtls(fd))?;
                 return Ok(());
             }
