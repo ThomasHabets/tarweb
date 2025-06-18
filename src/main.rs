@@ -62,6 +62,8 @@ const USER_DATA_OP_CLOSE: u64 = 0x2_0000_0000;
 const USER_DATA_OP_READ: u64 = 0x3_0000_0000;
 const USER_DATA_OP_CANCEL: u64 = 0x4_0000_0000;
 const USER_DATA_OP_SETSOCKOPT: u64 = 0x8_0000_0000;
+// TODO: NOP is an ugly hack to trigger Reading to look for a request. It should
+// just trigger it some other way.
 const USER_DATA_OP_NOP: u64 = 0x10_0000_0000;
 
 // Max milliseconds that a connection is allowed to be idle, before we close it.
@@ -81,6 +83,10 @@ type SQueue = ArrayVec<io_uring::squeue::Entry, 10_000>;
 type ReadBuf = [u8; MAX_READ_BUF];
 type HeaderBuf = ArrayVec<u8, MAX_HEADER_BUF>;
 
+// State only needed during handshake.
+//
+// After handshake is completed, we'll enable kernel TLS, and won't need to use
+// any state.
 #[derive(Debug)]
 struct HandshakeData {
     fixed: FixedFile,
@@ -91,6 +97,8 @@ impl HandshakeData {
     fn new(fixed: FixedFile, tls: rustls::ServerConnection) -> Self {
         Self { fixed, tls }
     }
+    // We have received handshake data from the remote end.
+    // send it on to rustls for processing.
     fn received(&mut self, data: &[u8]) -> Result<rustls::IoState, rustls::Error> {
         debug!("Got some handshaky data: {data:?}");
         let mut reader = std::io::Cursor::new(data);
@@ -99,14 +107,19 @@ impl HandshakeData {
     }
 }
 
+// State of a connection.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum State {
+    // This connection is currently not in use.
     Idle,
 
     // rustls handshaking happening.
     //
     // This is the big enum variant. Over a kB.
+    //
+    // When handshake completes, we send off setsockopt()s and go to
+    // EnablingKtls.
     Handshaking(HandshakeData),
 
     // KTLS setsockopt()s in flight. Awaiting their completion.
@@ -120,12 +133,17 @@ enum State {
     // ready to go.
     //
     // This state means no pending Write or Close, at least.
+    //
+    // Reads are issued until a request is found. When found, state moves on to
+    // WritingHeaders.
     Reading(FixedFile),
 
     // header_buf could be inside this enum, but I'm not sure I can create it on
     // state change without copying it. No placement new.
     //
     // This state has a pending Write.
+    //
+    // When writing headers finishes, state goes to WritingData.
     WritingHeaders(FixedFile, usize, usize),
 
     // This state has a pending Write.
@@ -135,9 +153,13 @@ enum State {
 
     // Close and possibly Cancel has been sent, but we don't reuse the
     // connection object until all ops have completed. (`outstdanding == 0`)
+    //
+    // When outstanding goes to 0, we go back to state Idle.
     Closing,
 }
 
+// Connection slot. There is a fixed number of them for the lifetime of the
+// process.
 struct Connection {
     id: usize,
     state: State,
@@ -608,7 +630,7 @@ struct Request<'a> {
 // Return error if a request is bad.
 // Some(req) if it's a good request.
 // None if more data is needed.
-fn parse_request(heads: &[u8]) -> Result<Option<Request>> {
+fn parse_request(heads: &[u8]) -> Result<Option<Request<'_>>> {
     let s = std::str::from_utf8(heads)?;
 
     let Some(end) = s.find("\r\n\r\n") else {
@@ -631,7 +653,7 @@ fn parse_request(heads: &[u8]) -> Result<Option<Request>> {
 }
 
 #[must_use]
-fn decode_user_data(user_data: u64, result: i32, cons: &mut Connections) -> Hook {
+fn decode_user_data(user_data: u64, result: i32, cons: &mut Connections) -> Hook<'_> {
     let op = match user_data & USER_DATA_OP_MASK {
         USER_DATA_OP_WRITE => UserDataOp::Write,
         USER_DATA_OP_READ => UserDataOp::Read,
