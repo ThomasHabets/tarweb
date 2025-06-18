@@ -856,9 +856,7 @@ fn op_completion(
                     return Ok(());
                 }
 
-                let io = d
-                    .received(&data.con.read_buf[..data.result as usize])
-                    .unwrap();
+                let io = d.received(&data.con.read_buf[..data.result as usize])?;
                 let still_handshaking = d.tls.is_handshaking();
                 let fd = d.fixed;
                 debug!("rustls op: {io:?}");
