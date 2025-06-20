@@ -31,4 +31,8 @@ tar = "0.4.43"
 zeroize = { version = "1.8.1", features = ["simd"] }
 
 [features]
-rtsan = ["rtsan-standalone/enable"]
+# Not supported on riscv64
+#rtsan = ["rtsan-standalone/enable"]
+
+[profile.release]
+debug = true

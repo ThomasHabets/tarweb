@@ -773,6 +773,7 @@ fn handle_connection(
         }
         UserDataOp::Close => {
             assert_eq!(hook.result, 0);
+            panic!("Nothing here, right?)");
         }
         UserDataOp::Cancel => {
             if hook.result != 0 {
@@ -837,137 +838,148 @@ fn op_completion(
     archive: &Archive,
 ) -> Result<()> {
     debug!("Op completed: {data:?}");
+    let op_string = format!("{data:?}");
     data.con.io_completed();
 
     trace!("Read buf pos: {}", data.con.read_buf_pos);
-    if let State::EnablingKtls(fd) = data.con.state {
-        assert!(
-            matches![data.op, UserDataOp::SetSockOpt],
-            "Expected SetSockOpt, got {:?}",
-            data.op
-        );
-        if data.result != 0 {
-            return Err(Error::msg(format!(
-                "setsockopt(): {}",
-                std::io::Error::from_raw_os_error(data.result.abs())
-            )));
-        }
-        if data.con.outstanding == 0 {
-            if data.con.read_buf_pos == 0 {
-                data.con.read(ops);
+    match &mut data.con.state {
+        State::Idle => panic!("Can't happen: op {op_string} on Idle connection"),
+        State::Closing => {}
+
+        // Post-handshake states handled below.
+        State::Reading(_) => {}
+        State::WritingData(_, _, _) => {}
+        State::WritingHeaders(_, _, _) => {}
+
+        // Handshake states.
+        State::EnablingKtls(fd) => {
+            assert!(
+                matches![data.op, UserDataOp::SetSockOpt],
+                "Expected SetSockOpt, got {:?}",
+                data.op
+            );
+            if data.result != 0 {
+                return Err(Error::msg(format!(
+                    "setsockopt(): {}",
+                    std::io::Error::from_raw_os_error(data.result.abs())
+                )));
+            }
+            let fd = *fd;
+            if data.con.outstanding == 0 {
+                if data.con.read_buf_pos == 0 {
+                    data.con.read(ops);
+                } else {
+                    data.con.issue_nop(ops);
+                }
+                data.con.state = State::Reading(fd);
             } else {
-                data.con.issue_nop(ops);
+                debug!("EnablingKtls: still waiting for {}", data.con.outstanding);
             }
-            data.con.state = State::Reading(fd);
-        } else {
-            debug!("EnablingKtls: still waiting for {}", data.con.outstanding);
+            return Ok(());
         }
-        return Ok(());
-    }
 
-    if let State::Handshaking(d) = &mut data.con.state {
-        match &data.op {
-            UserDataOp::Read => {
-                if data.result == 0 {
-                    data.con.close(opt.async_cancel2, ops);
-                    return Ok(());
-                }
-                if data.result < 0 {
-                    warn!("Read error: {}", data.result);
-                    data.con.close(opt.async_cancel2, ops);
-                    return Ok(());
-                }
+        State::Handshaking(d) => {
+            match &data.op {
+                UserDataOp::Read => {
+                    if data.result == 0 {
+                        data.con.close(opt.async_cancel2, ops);
+                        return Ok(());
+                    }
+                    if data.result < 0 {
+                        warn!("Read error: {}", data.result);
+                        data.con.close(opt.async_cancel2, ops);
+                        return Ok(());
+                    }
 
-                let io = d.received(&data.con.read_buf[..data.result as usize])?;
-                let still_handshaking = d.tls.is_handshaking();
-                let fd = d.fixed;
-                debug!("rustls op: {io:?}");
+                    let io = d.received(&data.con.read_buf[..data.result as usize])?;
+                    let still_handshaking = d.tls.is_handshaking();
+                    let fd = d.fixed;
+                    debug!("rustls op: {io:?}");
 
-                // Handle bytes write.
-                // TODO: fix needless copy.
-                let bytes_to_write = io.tls_bytes_to_write();
-                let write_buf = [0u8; MAX_WRITE_BUF];
-                let mut write_cursor = std::io::Cursor::new(write_buf);
-                let bytes_written = if bytes_to_write > 0 {
-                    d.tls.write_tls(&mut write_cursor)?
-                } else {
-                    0
-                };
-
-                // Handle bytes read.
-                // TODO: fix needless copy.
-                let bytes_to_read = io.plaintext_bytes_to_read();
-                let mut read_buf = [0u8; MAX_READ_BUF];
-                let bytes_read = if bytes_to_read > 0 {
-                    trace!("Early plaintext bytes: {bytes_to_read}");
-                    assert!(!still_handshaking);
-                    d.tls.reader().read(&mut read_buf[..bytes_to_read])?
-                } else {
-                    0
-                };
-
-                // `d` implicitly dropped here.
-
-                if bytes_written > 0 {
-                    data.con.write_buf = write_cursor.into_inner();
-                    debug!("Handshaking: still handshaking: {}", d.tls.is_handshaking());
-                    data.con.write(bytes_written, ops);
-                }
-                if bytes_read > 0 {
-                    data.con.read_sync(&read_buf[..bytes_read], ops)?;
-                }
-
-                if bytes_to_write == 0 && !still_handshaking {
-                    // If handshake is finished, but there's still bytes to
-                    // write, then we wait for the Write to complete.
-                    assert_eq!(bytes_to_read, bytes_read);
-                    // Nothing to write, handshake is done. Let's go to enable
-                    // kTLS.
-                    data.con.enable_ktls(fd, ops, State::EnablingKtls(fd))?;
-                } else if bytes_to_write == 0 {
-                    // Read completed, nothing to write. Must mean we need to
-                    // read more.
-                    data.con.read(ops);
-                }
-                return Ok(());
-            }
-            UserDataOp::Write => {
-                // If there's more to write, write it.
-                let v = [0u8; MAX_WRITE_BUF];
-                let mut c = std::io::Cursor::new(v);
-                let n = d.tls.write_tls(&mut c)?;
-                if n > 0 {
+                    // Handle bytes write.
                     // TODO: fix needless copy.
-                    data.con.write_buf = c.into_inner();
-                    debug!("Handshaking: Need to write {n} more");
-                    data.con.write(n, ops);
+                    let bytes_to_write = io.tls_bytes_to_write();
+                    let write_buf = [0u8; MAX_WRITE_BUF];
+                    let mut write_cursor = std::io::Cursor::new(write_buf);
+                    let bytes_written = if bytes_to_write > 0 {
+                        d.tls.write_tls(&mut write_cursor)?
+                    } else {
+                        0
+                    };
+
+                    // Handle bytes read.
+                    // TODO: fix needless copy.
+                    let bytes_to_read = io.plaintext_bytes_to_read();
+                    let mut read_buf = [0u8; MAX_READ_BUF];
+                    let bytes_read = if bytes_to_read > 0 {
+                        trace!("Early plaintext bytes: {bytes_to_read}");
+                        assert!(!still_handshaking);
+                        d.tls.reader().read(&mut read_buf[..bytes_to_read])?
+                    } else {
+                        0
+                    };
+
+                    // `d` implicitly dropped here.
+
+                    if bytes_written > 0 {
+                        data.con.write_buf = write_cursor.into_inner();
+                        debug!("Handshaking: still handshaking: {}", d.tls.is_handshaking());
+                        data.con.write(bytes_written, ops);
+                    }
+                    if bytes_read > 0 {
+                        data.con.read_sync(&read_buf[..bytes_read], ops)?;
+                    }
+
+                    if bytes_to_write == 0 && !still_handshaking {
+                        // If handshake is finished, but there's still bytes to
+                        // write, then we wait for the Write to complete.
+                        assert_eq!(bytes_to_read, bytes_read);
+                        // Nothing to write, handshake is done. Let's go to enable
+                        // kTLS.
+                        data.con.enable_ktls(fd, ops, State::EnablingKtls(fd))?;
+                    } else if bytes_to_write == 0 {
+                        // Read completed, nothing to write. Must mean we need to
+                        // read more.
+                        data.con.read(ops);
+                    }
                     return Ok(());
                 }
+                UserDataOp::Write => {
+                    // If there's more to write, write it.
+                    let v = [0u8; MAX_WRITE_BUF];
+                    let mut c = std::io::Cursor::new(v);
+                    let n = d.tls.write_tls(&mut c)?;
+                    if n > 0 {
+                        // TODO: fix needless copy.
+                        data.con.write_buf = c.into_inner();
+                        debug!("Handshaking: Need to write {n} more");
+                        data.con.write(n, ops);
+                        return Ok(());
+                    }
 
-                // If handshake is not done, queue more reading.
-                trace!(
-                    "Handshaking: finished writing write buffer. Handshaking done: {}",
-                    !d.tls.is_handshaking()
-                );
-                if d.tls.is_handshaking() {
-                    // Not done. Read more.
-                    data.con.read(ops);
+                    // If handshake is not done, queue more reading.
+                    trace!(
+                        "Handshaking: finished writing write buffer. Handshaking done: {}",
+                        !d.tls.is_handshaking()
+                    );
+                    if d.tls.is_handshaking() {
+                        // Not done. Read more.
+                        data.con.read(ops);
+                        return Ok(());
+                    }
+
+                    let fd = d.fixed;
+                    data.con.enable_ktls(fd, ops, State::EnablingKtls(fd))?;
                     return Ok(());
                 }
-
-                let fd = d.fixed;
-                data.con.enable_ktls(fd, ops, State::EnablingKtls(fd))?;
-                return Ok(());
+                op => panic!("bad op in Handshaking: {op:?}"),
             }
-            op => panic!("bad op in Handshaking: {op:?}"),
         }
     }
 
-    if !matches![data.op, UserDataOp::Close] {
-        if let Err(e) = handle_connection(data, archive, opt.async_cancel2, ops) {
-            info!("Error handling connection: {e:?}");
-            data.con.close(opt.async_cancel2, ops);
-        }
+    if let Err(e) = handle_connection(data, archive, opt.async_cancel2, ops) {
+        info!("Error handling connection: {e:?}");
+        data.con.close(opt.async_cancel2, ops);
     }
     if data.con.closing() && data.con.outstanding == 0 {
         data.con.deinit();
