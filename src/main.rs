@@ -1373,9 +1373,8 @@ fn main() -> Result<()> {
                     .spawn_scoped(s, move || -> Result<()> {
                         if opt.cpu_affinity {
                             // Set affinity mapping 1:1.
-                            if !core_affinity::set_for_current(core_affinity::CoreId { id: 2 * n })
-                            {
-                                error!("Failed to bind to core {n}");
+                            if !core_affinity::set_for_current(core_affinity::CoreId { id: n }) {
+                                error!("Failed to bind thread {n} to core {n}");
                             }
                         }
                         let mut ring = io_uring::IoUring::builder();
