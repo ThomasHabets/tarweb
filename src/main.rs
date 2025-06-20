@@ -1021,7 +1021,7 @@ fn mainloop(
         cq.sync();
         if cq.is_empty() {
             drop(cq);
-            if last_submit.elapsed() > opt.busyloop {
+            if opt.busyloop.as_millis() == 0 || last_submit.elapsed() > opt.busyloop {
                 syscalls += 1;
                 // Nothing has completed, so submit anything pending, and sleep.
                 if let Err(ref e) = ring.submit_and_wait(1) {
@@ -1127,7 +1127,7 @@ struct Opt {
     #[arg(long, default_value_t = 10, help = "Kernel side polling time.")]
     sqpoll_ms: u32,
 
-    #[arg(long, default_value = "50ms", value_parser = parse_duration, help = "User side polling time.")]
+    #[arg(long, default_value = "0ms", value_parser = parse_duration, help = "User side polling time.")]
     busyloop: std::time::Duration,
 
     #[arg(long, default_value = "1s", value_parser = parse_duration, help = "Periodic wakeup.")]

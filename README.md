@@ -55,6 +55,36 @@ $ tarweb \
   site1.tar
 ```
 
+## Benchmarking
+
+oha is a nice tool.
+
+```
+cargo install oha
+oha https://localhost:8080/
+```
+
+Flamegraph
+
+On VisionFive 2:
+
+```
+$ sudo sysctl -w kernel.perf_event_paranoid=-1
+$ cargo install flamegraph
+$ mkdir ~/bin; cat > ~/bin/myperf
+set -ueo pipefail
+echo "$@" >> wrapcmd
+CMD="$1"
+shift
+if [[ $CMD = "record" ]]; then
+        exec perf "$CMD" -e task-clock "$@"
+fi
+exec perf "$CMD" "$@"
+^D
+$ chmod +x ~/bin/myperf
+$ PERF=$HOME/bin/myperf cargo flamegraph
+```
+
 ## Future work
 
 * use `writev` to reduce queue roundtrips.
