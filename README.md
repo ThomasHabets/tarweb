@@ -89,6 +89,10 @@ On the VF2 for an ~24kB file, 1-2% of CPU is userspace. 75% of userspace CPU is
 the RSA signing operation.
 In kernel space it's all AES and TCP.
 
+On a beefier machine, though still a laptop, `parse_request` is 35% of
+userspace. `Archive::get_ofs` is 7%. Still, this laptop could probably saturate
+a 10Gbps link at least, with small requests.
+
 ## Future work
 
 * use `writev` to reduce queue roundtrips.
