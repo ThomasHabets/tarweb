@@ -73,7 +73,9 @@ const MAX_IDLE: u128 = 5000;
 // size.
 const MAX_READ_BUF: usize = 1024;
 
-const MAX_WRITE_BUF: usize = 1024;
+// This is also used for TLS writing, and a ServerHello can exceed 1KiB.
+// In any case it should be at least one MSS/MTU.
+const MAX_WRITE_BUF: usize = 2048;
 
 // Outgoing headers max size.
 const MAX_HEADER_BUF: usize = 1024;
@@ -838,12 +840,11 @@ fn op_completion(
     archive: &Archive,
 ) -> Result<()> {
     debug!("Op completed: {data:?}");
-    let op_string = format!("{data:?}");
     data.con.io_completed();
 
     trace!("Read buf pos: {}", data.con.read_buf_pos);
     match &mut data.con.state {
-        State::Idle => panic!("Can't happen: op {op_string} on Idle connection"),
+        State::Idle => panic!("Can't happen: op {data:?} on Idle connection"),
         State::Closing => {}
 
         // Post-handshake states handled below.

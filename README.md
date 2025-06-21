@@ -85,6 +85,10 @@ $ chmod +x ~/bin/myperf
 $ PERF=$HOME/bin/myperf cargo flamegraph
 ```
 
+On the VF2 for an ~24kB file, 1-2% of CPU is userspace. 75% of userspace CPU is
+the RSA signing operation.
+In kernel space it's all AES and TCP.
+
 ## Future work
 
 * use `writev` to reduce queue roundtrips.
