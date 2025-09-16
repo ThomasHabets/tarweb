@@ -24,6 +24,9 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 type FixedFile = io_uring::types::Fixed;
 
+// If enabled, skip some accounting not needed for functionality.
+const FULL_SPEED: bool = false;
+
 // We don't use file descriptors for our io_uring operations. We use offsets
 // into the io_uring fixed file table.
 //
@@ -1098,12 +1101,14 @@ fn mainloop(
             let res = unsafe { sq.push_multiple(&ops[..to_push]) };
             res.expect("Can't happen: no room, but we checked");
             ops.drain(..to_push);
+
+            if !FULL_SPEED && sq.need_wakeup() {
+                // Disable in full speed mode because of a memory fence.
+                syscalls += 1;
+            }
             drop(sq);
             // This will only trigger a syscall if the kernel thread went to
             // sleep.
-            //
-            // There doesn't seem to be a way to know if it in fact did trigger
-            // a syscall.
             ring.submit()?;
         }
     }
