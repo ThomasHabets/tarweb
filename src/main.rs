@@ -663,6 +663,8 @@ impl std::fmt::Debug for Hook<'_> {
 struct Request<'a> {
     path: &'a str,
     len: usize,
+    encoding_gzip: bool,
+    encoding_zstd: bool,
 }
 
 // Return error if a request is bad.
@@ -675,10 +677,27 @@ fn parse_request(heads: &[u8]) -> Result<Option<Request<'_>>> {
         return Ok(None);
     };
     let s = &s[..end];
-    trace!("Found req len {end}: {s:?}");
+    debug!("Found req len {end}: {s:?}");
 
     let mut lines = s.split("\r\n");
     let mut first = lines.next().ok_or(Error::msg("no first line"))?.split(' ');
+    let mut encoding_gzip = false;
+    let mut encoding_zstd = false;
+    for header in lines {
+        let mut kv = header.splitn(2, ' ');
+        let k = kv.next().unwrap_or("");
+        let v = kv.next().unwrap_or("");
+        if k.to_lowercase() == "accept-encoding:" {
+            for enc in v.split(", ") {
+                if enc == "gzip" {
+                    encoding_gzip = true;
+                }
+                if enc == "zstd" {
+                    encoding_zstd = true;
+                }
+            }
+        }
+    }
     let method = first.next().ok_or(Error::msg("no method"))?;
     if method != "GET" {
         return Err(Error::msg(format!("Invalid HTTP method {method}")));
@@ -687,7 +706,12 @@ fn parse_request(heads: &[u8]) -> Result<Option<Request<'_>>> {
     let _version = first.next().ok_or(Error::msg("no version"))?;
 
     // Headers ignored.
-    Ok(Some(Request { path, len: end }))
+    Ok(Some(Request {
+        path,
+        len: end,
+        encoding_gzip,
+        encoding_zstd,
+    }))
 }
 
 #[must_use]
@@ -724,11 +748,30 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
     debug!("Got request for path {}", req.path);
     // TODO: replace with writev?
     let len = req.len + 4;
-    if let Some((pos, resp_len)) = archive.get_ofs(req.path) {
+
+    let (ofs, encoding) = (|| {
+        if req.encoding_zstd {
+            let path = req.path.to_string() + ".zstd";
+            if let Some(ofs) = archive.get_ofs(&path) {
+                return (Some(ofs), "zstd");
+            }
+        }
+        if req.encoding_gzip {
+            let path = req.path.to_string() + ".gz";
+            if let Some(ofs) = archive.get_ofs(&path) {
+                return (Some(ofs), "gzip");
+            }
+        }
+        if let Some(ofs) = archive.get_ofs(req.path) {
+            return (Some(ofs), "identity");
+        }
+        (None, "identity")
+    })();
+    if let Some((pos, resp_len)) = ofs {
         hook.con.write_header_bytes(
             ops,
             format!(
-                "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: {resp_len}\r\n\r\n"
+                "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Encoding: {encoding}\r\nContent-Length: {resp_len}\r\n\r\n"
             )
             .as_bytes(),
             pos,
