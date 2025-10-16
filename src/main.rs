@@ -1,7 +1,20 @@
-// TODO:
-// * Does ASYNC flag help performance?
-// * buffers?
-// * sendfile
+// ## ASYNC flag
+//
+// TODO: does ASYNC flag help performance?
+//
+// ## buffers
+//
+// TODO: Experiment with io-uring buffers.
+//
+// ## sendfile
+//
+// io_uring doesn't support sendfile. It does support splice, so one could
+// create a pipe, and splice into it, and then splice from it to the socket.
+//
+// This would consume two extra file handles per connection, which is not very
+// neat.
+//
+// Conclusion: Wait for direct kernel support for io_uring sendfile.
 //
 //
 // On my laptop, the best performance is:
@@ -192,6 +205,7 @@ struct Connection {
 }
 
 impl Connection {
+    /// Create a new Connection "slot" in Idle state.
     #[must_use]
     fn new(id: usize) -> Self {
         Self {
@@ -208,10 +222,18 @@ impl Connection {
             tls_tx: None,
         }
     }
+
+    /// Init a new connection.
+    ///
+    /// We reuse `Connection` objects between connections, which is why this is
+    /// not just part of `new()`.
     fn init(&mut self, fixed: FixedFile, tls: rustls::ServerConnection) {
+        debug_assert!(matches![self.state, State::Idle]);
         self.state = State::Handshaking(HandshakeData::new(fixed, tls));
         self.last_action = std::time::Instant::now();
     }
+
+    /// Put the Connection object back in Idle state.
     fn deinit(&mut self) {
         assert_eq!(self.outstanding, 0);
         self.state = State::Idle;
@@ -222,6 +244,8 @@ impl Connection {
         self.header_buf.clear();
         self.outstanding = 0;
     }
+
+    /// Issue `CLOSE`, and wait for all outstanding ops to complete.
     fn close(&mut self, modern: bool, ops: &mut SQueue) {
         if self.closing() {
             return;
@@ -233,10 +257,14 @@ impl Connection {
         ops.push(make_op_close(self.fd().unwrap(), self.id));
         self.state = State::Closing;
     }
+
+    /// Register that an operation has completed.
     fn io_completed(&mut self) {
         self.last_action = std::time::Instant::now();
         self.outstanding -= 1;
     }
+
+    /// If the Connection is active, return the file handle.
     fn fd(&self) -> Option<FixedFile> {
         match self.state {
             State::Idle => None,
@@ -277,6 +305,11 @@ impl Connection {
         self.state = State::WritingHeaders(fd, pos, len);
     }
 
+    // Writing headers has finished. Now we send data.
+    //
+    // This call may or may not be the first bytes of writing data.
+    //
+    // `pos` is position in the tar file.
     fn write_data(
         &mut self,
         ops: &mut SQueue,
