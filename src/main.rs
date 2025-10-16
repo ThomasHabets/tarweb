@@ -1080,6 +1080,10 @@ fn mainloop(
             //   io_uring::cqueue::more(cqe.flags());
             //   io_uring::cqueue::notif(cqe.flags());
             let result = cqe.result();
+            if io_uring::cqueue::notif(cqe.flags()) {
+                info!("Got io-uring notification");
+                continue;
+            }
             //println!("Got some user_data: {user_data:?} {result:?}");
             match user_data {
                 USER_DATA_LISTENER => {
