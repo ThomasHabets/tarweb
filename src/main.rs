@@ -664,6 +664,7 @@ struct Request<'a> {
     path: &'a str,
     len: usize,
     encoding_gzip: bool,
+    encoding_brotli: bool,
     encoding_zstd: bool,
 }
 
@@ -682,6 +683,7 @@ fn parse_request(heads: &[u8]) -> Result<Option<Request<'_>>> {
     let mut lines = s.split("\r\n");
     let mut first = lines.next().ok_or(Error::msg("no first line"))?.split(' ');
     let mut encoding_gzip = false;
+    let mut encoding_brotli = false;
     let mut encoding_zstd = false;
     for header in lines {
         let mut kv = header.splitn(2, ' ');
@@ -689,11 +691,11 @@ fn parse_request(heads: &[u8]) -> Result<Option<Request<'_>>> {
         let v = kv.next().unwrap_or("");
         if k.to_lowercase() == "accept-encoding:" {
             for enc in v.split(", ") {
-                if enc == "gzip" {
-                    encoding_gzip = true;
-                }
-                if enc == "zstd" {
-                    encoding_zstd = true;
+                match enc {
+                    "gzip" => encoding_gzip = true,
+                    "br" => encoding_brotli = true,
+                    "zstd" => encoding_zstd = true,
+                    _ => {}
                 }
             }
         }
@@ -711,6 +713,7 @@ fn parse_request(heads: &[u8]) -> Result<Option<Request<'_>>> {
         len: end,
         encoding_gzip,
         encoding_zstd,
+        encoding_brotli,
     }))
 }
 
@@ -750,6 +753,12 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
     let len = req.len + 4;
 
     let (ofs, encoding) = (|| {
+        if req.encoding_brotli {
+            let path = req.path.to_string() + ".br";
+            if let Some(ofs) = archive.get_ofs(&path) {
+                return (Some(ofs), "br");
+            }
+        }
         if req.encoding_zstd {
             let path = req.path.to_string() + ".zstd";
             if let Some(ofs) = archive.get_ofs(&path) {
