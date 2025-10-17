@@ -754,39 +754,31 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
     // TODO: replace with writev?
     let len = req.len + 4;
 
-    let (ofs, encoding) = (|| {
-        if req.encoding_brotli {
-            let path = req.path.to_string() + ".br";
-            if let Some(ofs) = archive.get_ofs(&path) {
-                return (Some(ofs), "br");
-            }
-        }
-        if req.encoding_zstd {
-            let path = req.path.to_string() + ".zstd";
-            if let Some(ofs) = archive.get_ofs(&path) {
-                return (Some(ofs), "zstd");
-            }
-        }
-        if req.encoding_gzip {
-            let path = req.path.to_string() + ".gz";
-            if let Some(ofs) = archive.get_ofs(&path) {
-                return (Some(ofs), "gzip");
-            }
-        }
-        if let Some(ofs) = archive.get_ofs(req.path) {
-            return (Some(ofs), "identity");
-        }
-        (None, "identity")
-    })();
-    if let Some(ArchiveEntry { pos, len: resp_len }) = ofs {
+    if let Some(entry) = archive.entry(req.path) {
+        let (entry, encoding) = if req.encoding_brotli
+            && let Some(ref e) = entry.brotli
+        {
+            (e, "br")
+        } else if req.encoding_zstd
+            && let Some(ref e) = entry.zstd
+        {
+            (e, "zstd")
+        } else if req.encoding_gzip
+            && let Some(ref e) = entry.gzip
+        {
+            (e, "gzip")
+        } else {
+            (&entry.plain, "identity")
+        };
+
         hook.con.write_header_bytes(
             ops,
             format!(
-                "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Encoding: {encoding}\r\nContent-Length: {resp_len}\r\n\r\n"
+                "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Encoding: {encoding}\r\nContent-Length: {}\r\n\r\n", entry.len,
             )
             .as_bytes(),
-            pos,
-            resp_len,
+            entry.pos,
+            entry.len,
         );
     } else {
         let msg404 = "Not found\n";
@@ -1288,7 +1280,7 @@ fn parse_duration(time_str: &str) -> Result<std::time::Duration, String> {
 
 struct Archive {
     mmap: memmap2::Mmap,
-    content: HashMap<String, (u64, u64)>,
+    content: HashMap<String, ArchiveEntry>,
 }
 
 impl Archive {
@@ -1305,13 +1297,45 @@ impl Archive {
             let name = e.path()?;
             let name = name.to_string_lossy();
             let name = name.strip_prefix(prefix).unwrap_or(name.as_ref());
-            content.insert(name.to_string(), (e.raw_file_position(), e.size()));
+            content.insert(
+                name.to_string(),
+                ArchiveEntry {
+                    plain: ArchiveEntry2 {
+                        pos: e.raw_file_position() as usize,
+                        len: e.size() as usize,
+                    },
+                    brotli: None,
+                    gzip: None,
+                    zstd: None,
+                },
+            );
+        }
+        let c2 = content.clone();
+        for (k, v) in c2.iter() {
+            if k.ends_with(".br") {
+                let k = &k[..(k.len() - 3)];
+                if let Some(r) = content.get_mut(k) {
+                    r.brotli = Some(v.plain.clone());
+                }
+            }
+            if k.ends_with(".zstd") {
+                let k = &k[..(k.len() - 5)];
+                if let Some(r) = content.get_mut(k) {
+                    r.zstd = Some(v.plain.clone());
+                }
+            }
+            if k.ends_with(".gz") {
+                let k = &k[..(k.len() - 3)];
+                if let Some(r) = content.get_mut(k) {
+                    r.gzip = Some(v.plain.clone());
+                }
+            }
         }
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         Ok(Self { content, mmap })
     }
     #[must_use]
-    fn get_ofs(&self, filename: &str) -> Option<ArchiveEntry> {
+    fn entry(&self, filename: &str) -> Option<&ArchiveEntry> {
         use std::borrow::Cow;
         if filename.is_empty() {
             return None;
@@ -1327,13 +1351,7 @@ impl Archive {
         };
 
         trace!("Looking up {filename}");
-        self.content
-            .get(filename.as_ref())
-            .copied()
-            .map(|(a, b)| ArchiveEntry {
-                pos: a as usize,
-                len: b as usize,
-            })
+        self.content.get(filename.as_ref())
     }
     #[must_use]
     fn get_slice(&self, pos: usize, len: usize) -> &[u8] {
@@ -1342,10 +1360,18 @@ impl Archive {
     }
 }
 
-// TODO: have this point to all the variations, to only do one lookup.
-struct ArchiveEntry {
+#[derive(Clone, Debug)]
+struct ArchiveEntry2 {
     pos: usize,
     len: usize,
+}
+
+#[derive(Clone)]
+struct ArchiveEntry {
+    plain: ArchiveEntry2,
+    gzip: Option<ArchiveEntry2>,
+    brotli: Option<ArchiveEntry2>,
+    zstd: Option<ArchiveEntry2>,
 }
 
 fn is_setsockopt_supported() -> Result<bool> {
@@ -1449,11 +1475,15 @@ fn main() -> Result<()> {
     trace!("Single issuer: {}", opt.single_issuer);
 
     if !is_ktls_loaded()? {
-        return Err(Error::msg("Kernel TLS does not seem to be supported. Either CONFIG_TLS=n, or you need to load the `tls` module using `modprobe tls`"));
+        return Err(Error::msg(
+            "Kernel TLS does not seem to be supported. Either CONFIG_TLS=n, or you need to load the `tls` module using `modprobe tls`",
+        ));
     }
     trace!("Kernel TLS seems supported");
     if !is_setsockopt_supported()? {
-        return Err(Error::msg("io-uring setsockopt not supported. Support was added in Linux kernel 6.7, so this must be older than that."));
+        return Err(Error::msg(
+            "io-uring setsockopt not supported. Support was added in Linux kernel 6.7, so this must be older than that.",
+        ));
     }
 
     let archive = Archive::new(&opt.tarfile, &opt.prefix)?;
