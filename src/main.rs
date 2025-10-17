@@ -760,6 +760,8 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
     let len = req.len + 4;
 
     if let Some(entry) = archive.entry(req.path) {
+        // TODO: actually, go with the smallest option. My experience just is
+        // that it's always this order.
         let (entry, encoding) = if req.encoding_brotli
             && let Some(ref e) = entry.brotli
         {
