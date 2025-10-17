@@ -668,53 +668,55 @@ struct Request<'a> {
     encoding_zstd: bool,
 }
 
-// Return error if a request is bad.
-// Some(req) if it's a good request.
-// None if more data is needed.
-fn parse_request(heads: &[u8]) -> Result<Option<Request<'_>>> {
-    let s = std::str::from_utf8(heads)?;
+impl Request<'_> {
+    // Return error if a request is bad.
+    // Some(req) if it's a good request.
+    // None if more data is needed.
+    fn parse(heads: &[u8]) -> Result<Option<Request<'_>>> {
+        let s = std::str::from_utf8(heads)?;
 
-    let Some(end) = s.find("\r\n\r\n") else {
-        return Ok(None);
-    };
-    let s = &s[..end];
-    debug!("Found req len {end}: {s:?}");
+        let Some(end) = s.find("\r\n\r\n") else {
+            return Ok(None);
+        };
+        let s = &s[..end];
+        debug!("Found req len {end}: {s:?}");
 
-    let mut lines = s.split("\r\n");
-    let mut first = lines.next().ok_or(Error::msg("no first line"))?.split(' ');
-    let mut encoding_gzip = false;
-    let mut encoding_brotli = false;
-    let mut encoding_zstd = false;
-    for header in lines {
-        let mut kv = header.splitn(2, ' ');
-        let k = kv.next().unwrap_or("");
-        let v = kv.next().unwrap_or("");
-        if k.to_lowercase() == "accept-encoding:" {
-            for enc in v.split(", ") {
-                match enc {
-                    "gzip" => encoding_gzip = true,
-                    "br" => encoding_brotli = true,
-                    "zstd" => encoding_zstd = true,
-                    _ => {}
+        let mut lines = s.split("\r\n");
+        let mut first = lines.next().ok_or(Error::msg("no first line"))?.split(' ');
+        let mut encoding_gzip = false;
+        let mut encoding_brotli = false;
+        let mut encoding_zstd = false;
+        for header in lines {
+            let mut kv = header.splitn(2, ' ');
+            let k = kv.next().unwrap_or("");
+            let v = kv.next().unwrap_or("");
+            if k.to_lowercase() == "accept-encoding:" {
+                for enc in v.split(", ") {
+                    match enc {
+                        "gzip" => encoding_gzip = true,
+                        "br" => encoding_brotli = true,
+                        "zstd" => encoding_zstd = true,
+                        _ => {}
+                    }
                 }
             }
         }
-    }
-    let method = first.next().ok_or(Error::msg("no method"))?;
-    if method != "GET" {
-        return Err(Error::msg(format!("Invalid HTTP method {method}")));
-    }
-    let path = first.next().ok_or(Error::msg("no path"))?;
-    let _version = first.next().ok_or(Error::msg("no version"))?;
+        let method = first.next().ok_or(Error::msg("no method"))?;
+        if method != "GET" {
+            return Err(Error::msg(format!("Invalid HTTP method {method}")));
+        }
+        let path = first.next().ok_or(Error::msg("no path"))?;
+        let _version = first.next().ok_or(Error::msg("no version"))?;
 
-    // Headers ignored.
-    Ok(Some(Request {
-        path,
-        len: end,
-        encoding_gzip,
-        encoding_zstd,
-        encoding_brotli,
-    }))
+        // Headers ignored.
+        Ok(Some(Request {
+            path,
+            len: end,
+            encoding_gzip,
+            encoding_zstd,
+            encoding_brotli,
+        }))
+    }
 }
 
 #[must_use]
@@ -742,7 +744,7 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
     let data = &hook.con.read_buf[..hook.con.read_buf_pos];
     let s = std::str::from_utf8(data)?;
     trace!("Let's see if there's a request in {s:?}");
-    let req = parse_request(data)?;
+    let req = Request::parse(data)?;
     let Some(req) = req else {
         // No full request yet.
         hook.con.read(ops);
