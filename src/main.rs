@@ -112,6 +112,7 @@ struct HandshakeData {
 }
 
 impl HandshakeData {
+    #[must_use]
     fn new(fixed: FixedFile, tls: rustls::ServerConnection) -> Self {
         Self { fixed, tls }
     }
@@ -276,6 +277,7 @@ impl Connection {
             State::Closing => None,
         }
     }
+    #[must_use]
     fn closing(&self) -> bool {
         matches![self.state, State::Closing]
     }
@@ -327,6 +329,7 @@ impl Connection {
         ops.push(op);
     }
 
+    #[must_use]
     fn write_done(&mut self, ops: &mut SQueue, archive: &Archive, wrote: usize) -> bool {
         match &self.state {
             State::WritingHeaders(fd, pos, len) => {
@@ -359,6 +362,7 @@ impl Connection {
         }
     }
 
+    #[must_use]
     fn must_get_fd(&self) -> FixedFile {
         (match &self.state {
             State::Reading(fd) => *fd,
@@ -506,6 +510,7 @@ impl Connection {
     }
 
     // Get the read buffer.
+    #[must_use]
     #[allow(dead_code)]
     fn get_read_buf(&self) -> &[u8] {
         &self.read_buf[self.read_buf_pos..]
