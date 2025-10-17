@@ -765,23 +765,24 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
         let (entry, encoding) = if req.encoding_brotli
             && let Some(ref e) = entry.brotli
         {
-            (e, "br")
+            (e, "Content-Encoding: br\r\n")
         } else if req.encoding_zstd
             && let Some(ref e) = entry.zstd
         {
-            (e, "zstd")
+            (e, "Content-Encoding: zstd\r\n")
         } else if req.encoding_gzip
             && let Some(ref e) = entry.gzip
         {
-            (e, "gzip")
+            (e, "Content-Encoding: gzip\r\n")
         } else {
-            (&entry.plain, "identity")
+            (&entry.plain, "")
         };
 
         hook.con.write_header_bytes(
             ops,
             format!(
-                "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Encoding: {encoding}\r\nContent-Length: {}\r\n\r\n", entry.len,
+                "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n{encoding}Content-Length: {}\r\n\r\n",
+                entry.len,
             )
             .as_bytes(),
             entry.pos,
