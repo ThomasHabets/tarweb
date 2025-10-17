@@ -778,7 +778,7 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
         }
         (None, "identity")
     })();
-    if let Some((pos, resp_len)) = ofs {
+    if let Some(ArchiveEntry { pos, len: resp_len }) = ofs {
         hook.con.write_header_bytes(
             ops,
             format!(
@@ -1311,7 +1311,7 @@ impl Archive {
         Ok(Self { content, mmap })
     }
     #[must_use]
-    fn get_ofs(&self, filename: &str) -> Option<(usize, usize)> {
+    fn get_ofs(&self, filename: &str) -> Option<ArchiveEntry> {
         use std::borrow::Cow;
         if filename.is_empty() {
             return None;
@@ -1330,13 +1330,22 @@ impl Archive {
         self.content
             .get(filename.as_ref())
             .copied()
-            .map(|(a, b)| (a as usize, b as usize))
+            .map(|(a, b)| ArchiveEntry {
+                pos: a as usize,
+                len: b as usize,
+            })
     }
     #[must_use]
     fn get_slice(&self, pos: usize, len: usize) -> &[u8] {
         let data: &[u8] = &self.mmap;
         &data[pos..(pos + len)]
     }
+}
+
+// TODO: have this point to all the variations, to only do one lookup.
+struct ArchiveEntry {
+    pos: usize,
+    len: usize,
 }
 
 fn is_setsockopt_supported() -> Result<bool> {
