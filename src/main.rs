@@ -593,7 +593,7 @@ fn make_ops_cancel(fd: FixedFile, id: u64, modern: bool, ops: &mut SQueue) -> us
     outstanding
 }
 
-fn disable_nodelay(fd: i32) -> std::io::Result<()> {
+fn set_nodelay(fd: i32) -> std::io::Result<()> {
     use libc;
     use std::mem;
     let flag: libc::c_int = 1; // Enable TCP_NODELAY (disable Nagle)
@@ -1154,7 +1154,7 @@ fn mainloop(
                         continue;
                     }
                     let fixed = io_uring::types::Fixed(result as u32);
-                    // disable_nodelay(result);
+                    // set_nodelay(result);
                     let id = pooltracker.alloc().unwrap();
                     debug!("Allocated {id} result {result}");
                     let new_conn = connections.get(id);
@@ -1501,7 +1501,7 @@ fn main() -> Result<()> {
     // that option on all incoming connections, which is what we want.
     {
         use std::os::fd::AsRawFd;
-        disable_nodelay(listener.as_raw_fd())?;
+        set_nodelay(listener.as_raw_fd())?;
     }
 
     std::thread::scope(|s| -> Result<()> {
