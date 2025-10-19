@@ -1364,6 +1364,7 @@ struct Archive {
 impl Archive {
     fn new(filename: &str, prefix: &str) -> Result<Self> {
         let file = std::fs::File::open(filename)?;
+        // memmap2() checks that file is no larger than isize::MAX.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         let mut archive = tar::Archive::new(&file);
         let mut content = HashMap::new();
