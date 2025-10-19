@@ -1175,11 +1175,11 @@ fn mainloop(
     let mut syscalls = 0;
     debug!("Loading certs");
     let certs = load_certs(&opt.tls_cert)
-        .with_context(|| format!("Loading certs from {}", opt.tls_cert))?;
+        .with_context(|| format!("Loading certs from {}", opt.tls_cert.display()))?;
     // Load private key.
     debug!("Loading key");
     let key = load_private_key(&opt.tls_key)
-        .with_context(|| format!("Loading private key from {}", opt.tls_key))?;
+        .with_context(|| format!("Loading private key from {}", opt.tls_key.display()))?;
     debug!("Creating TLS config");
     let mut config =
         rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -1347,12 +1347,12 @@ struct Opt {
     prefix: String,
 
     #[arg(long, short = 'P', help = "TLS private key")]
-    tls_key: String,
+    tls_key: std::path::PathBuf,
 
     #[arg(long, short = 'C', help = "TLS certificate chain")]
-    tls_cert: String,
+    tls_cert: std::path::PathBuf,
 
-    tarfile: String,
+    tarfile: std::path::PathBuf,
 }
 
 const TLS_STR: &[u8; 4] = b"tls\0";
@@ -1390,14 +1390,14 @@ struct Archive {
 }
 
 impl Archive {
-    fn new(filename: &str, prefix: &str) -> Result<Self> {
+    fn new<P: AsRef<std::path::Path>>(filename: P, prefix: &str) -> Result<Self> {
         let file = std::fs::File::open(filename)?;
         let map = unsafe { memmap2::Mmap::map(&file)? };
         // Can't hurt to at least ask to be hugepages or mergable.
         map.advise(memmap2::Advice::HugePage)?;
         Self::new_inner(map, file, prefix)
     }
-    fn hugepages(filename: &str, prefix: &str, bits: u8) -> Result<Self> {
+    fn hugepages<P: AsRef<std::path::Path>>(filename: P, prefix: &str, bits: u8) -> Result<Self> {
         use std::io::Seek;
 
         let mut file = std::fs::File::open(filename)?;
@@ -1638,13 +1638,19 @@ fn main() -> Result<()> {
     }
 
     let archive = if let Some(hugepages) = opt.hugepages {
-        Archive::hugepages(&opt.tarfile, &opt.prefix, hugepages)
-            .with_context(|| "Mapping file with hugepages")?
+        Archive::hugepages(&opt.tarfile, &opt.prefix, hugepages).with_context(|| {
+            format!(
+                "Mapping file {:?} with {hugepages} hugepages bits.",
+                opt.tarfile.display()
+            )
+        })?
     } else {
-        Archive::new(&opt.tarfile, &opt.prefix).with_context(|| "Mapping file")?
+        Archive::new(&opt.tarfile, &opt.prefix)
+            .with_context(|| format!("Memory mapping file {:?}.", opt.tarfile.display()))?
     };
 
-    let listener = std::net::TcpListener::bind(&opt.listen)?;
+    let listener = std::net::TcpListener::bind(&opt.listen)
+        .with_context(|| format!("Binding to {}", opt.listen))?;
     // The Rust API doesn't allow it, but setting TCP_NODELAY on a listening socket seems to set
     // that option on all incoming connections, which is what we want.
     {
