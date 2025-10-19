@@ -794,26 +794,30 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
         } else {
             (&entry.plain, "")
         };
-        let date = httpdate::fmt_http_date(std::time::SystemTime::now());
         let mtime = entry
             .modified
             .map(|mtime| format!("Last-Modified: {}\r\n", httpdate::fmt_http_date(mtime)))
             .unwrap_or("".to_string());
+        let common = format!(
+            "Connection: keep-alive\r\nDate: {}\r\nVary: accept-encoding\r\n{mtime}",
+            httpdate::fmt_http_date(std::time::SystemTime::now())
+        );
 
         if let Some((h, e)) = req.if_modified_since.zip(entry.modified)
             && e <= h
         {
             hook.con.write_header_bytes(
-                    ops,
-                    format!("HTTP/1.1 304 Not Modified\r\nConnection: keep-alive\r\nDate: {date}\r\n{mtime}Content-Length: 0\r\n\r\n").as_bytes(),
-                    subentry.pos,
-                    subentry.len,
-                );
+                ops,
+                format!("HTTP/1.1 304 Not Modified\r\n{common}Content-Length: 0\r\n\r\n")
+                    .as_bytes(),
+                subentry.pos,
+                subentry.len,
+            );
         } else {
             hook.con.write_header_bytes(
                 ops,
                 format!(
-                    "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nDate: {date}\r\n{mtime}{encoding}Content-Length: {}\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\n{common}{encoding}Content-Length: {}\r\n\r\n",
                     subentry.len,
                 )
                 .as_bytes(),
