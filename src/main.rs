@@ -18,9 +18,7 @@
 //
 // ## Other TODOs
 // * ETag caching
-// * Expires header
-// * Cache-Control / max-age & public
-// * Last-Modified
+// * Ranged get
 //
 // On my laptop, the best performance is:
 // * --threads=2
@@ -41,6 +39,9 @@ use rtsan_standalone::nonblocking;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 type FixedFile = io_uring::types::Fixed;
+
+// Cache max age.
+const CACHE_AGE_SECS: u64 = 300;
 
 // If enabled, skip some accounting not needed for functionality.
 const FULL_SPEED: bool = false;
@@ -794,12 +795,19 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
         } else {
             (&entry.plain, "")
         };
+        // TODO: pre-calculate many of these headers.
         let mtime = entry
             .modified
             .map(|mtime| format!("Last-Modified: {}\r\n", httpdate::fmt_http_date(mtime)))
             .unwrap_or("".to_string());
+        let caching = if CACHE_AGE_SECS > 0 {
+            // Expires header is ignored when providing max-age.
+            &format!("Cache-Control: public, max-age={CACHE_AGE_SECS}\r\n")
+        } else {
+            ""
+        };
         let common = format!(
-            "Connection: keep-alive\r\nDate: {}\r\nVary: accept-encoding\r\n{mtime}",
+            "Connection: keep-alive\r\nDate: {}\r\nVary: accept-encoding\r\n{caching}{mtime}",
             httpdate::fmt_http_date(std::time::SystemTime::now())
         );
 
