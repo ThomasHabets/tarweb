@@ -17,7 +17,6 @@
 // Conclusion: Wait for direct kernel support for io_uring sendfile.
 //
 // ## Other TODOs
-// * ETag caching
 // * Ranged get
 //
 // On my laptop, the best performance is:
@@ -39,6 +38,10 @@ use rtsan_standalone::nonblocking;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 type FixedFile = io_uring::types::Fixed;
+
+// Enable etags for caching. Slows down startup, since we need to hash all
+// files.
+const ENABLE_ETAGS: bool = true;
 
 // Cache max age.
 const CACHE_AGE_SECS: u64 = 300;
@@ -106,6 +109,14 @@ const MAX_HEADER_BUF: usize = 1024;
 type SQueue = ArrayVec<io_uring::squeue::Entry, 10_000>;
 type ReadBuf = [u8; MAX_READ_BUF];
 type HeaderBuf = ArrayVec<u8, MAX_HEADER_BUF>;
+
+#[must_use]
+fn calculate_etag(bytes: &[u8]) -> String {
+    use sha3::Digest;
+    let mut h = sha3::Sha3_256::new();
+    h.update(bytes);
+    format!("{:#x}", h.finalize()).to_string()
+}
 
 // State only needed during handshake.
 //
@@ -678,6 +689,7 @@ struct Request<'a> {
     encoding_brotli: bool,
     encoding_zstd: bool,
     if_modified_since: Option<std::time::SystemTime>,
+    if_none_match: Option<std::str::Split<'a, char>>,
 }
 
 impl Request<'_> {
@@ -699,6 +711,7 @@ impl Request<'_> {
         let mut encoding_brotli = false;
         let mut encoding_zstd = false;
         let mut if_modified_since = None;
+        let mut if_none_match = None;
         for header in lines {
             let mut kv = header.splitn(2, ' ');
             let k = kv.next().unwrap_or("").to_lowercase();
@@ -720,6 +733,9 @@ impl Request<'_> {
                         if_modified_since = Some(ims);
                     }
                 }
+                "if-none-match:" => {
+                    if_none_match = Some(v.split(','));
+                }
                 _ => {}
             }
         }
@@ -738,6 +754,7 @@ impl Request<'_> {
             encoding_zstd,
             encoding_brotli,
             if_modified_since,
+            if_none_match,
         }))
     }
 }
@@ -806,13 +823,21 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
         } else {
             ""
         };
+        let etag = if let Some(e) = &entry.etag {
+            &format!("ETag: {e}\r\n")
+        } else {
+            ""
+        };
         let common = format!(
-            "Connection: keep-alive\r\nDate: {}\r\nVary: accept-encoding\r\n{caching}{mtime}",
-            httpdate::fmt_http_date(std::time::SystemTime::now())
+            "Connection: keep-alive\r\nDate: {}\r\nVary: accept-encoding\r\n{caching}{etag}{mtime}",
+            httpdate::fmt_http_date(std::time::SystemTime::now()),
         );
 
-        if let Some((h, e)) = req.if_modified_since.zip(entry.modified)
-            && e <= h
+        if req.if_modified_since.zip(entry.modified).map(|(h,e)| e <= h).unwrap_or(false)
+            // Split can only be iterated once, hence mut here.
+            || req.if_none_match.zip(entry.etag.as_ref()).map(|(mut h,e)| {
+                h.any(|x| x.trim() == e)
+            }).unwrap_or(false)
         {
             hook.con.write_header_bytes(
                 ops,
@@ -1339,8 +1364,10 @@ struct Archive {
 impl Archive {
     fn new(filename: &str, prefix: &str) -> Result<Self> {
         let file = std::fs::File::open(filename)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
         let mut archive = tar::Archive::new(&file);
         let mut content = HashMap::new();
+        info!("Indexing…");
         for e in archive.entries()? {
             let e = e?;
             if let tar::EntryType::Regular = e.header().entry_type() {
@@ -1353,11 +1380,6 @@ impl Archive {
             content.insert(
                 name.to_string(),
                 ArchiveEntry {
-                    modified: e
-                        .header()
-                        .mtime()
-                        .map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
-                        .ok(),
                     plain: ArchiveEntry2 {
                         pos: e.raw_file_position() as usize,
                         len: e.size() as usize,
@@ -1365,8 +1387,24 @@ impl Archive {
                     brotli: None,
                     gzip: None,
                     zstd: None,
+                    modified: e
+                        .header()
+                        .mtime()
+                        .map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
+                        .ok(),
+                    etag: None, // Set later.
                 },
             );
+        }
+        if ENABLE_ETAGS {
+            info!("Hashing etags…");
+            use rayon::iter::IntoParallelRefMutIterator;
+            use rayon::iter::ParallelIterator;
+            content.par_iter_mut().for_each(|(_k, v)| {
+                v.etag = Some(calculate_etag(
+                    &mmap[v.plain.pos..(v.plain.pos + v.plain.len)],
+                ));
+            });
         }
         let c2 = content.clone();
         for (k, v) in c2.iter() {
@@ -1389,7 +1427,6 @@ impl Archive {
                 }
             }
         }
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
         Ok(Self { content, mmap })
     }
     #[must_use]
@@ -1431,7 +1468,7 @@ struct ArchiveEntry {
     brotli: Option<ArchiveEntry2>,
     zstd: Option<ArchiveEntry2>,
     modified: Option<std::time::SystemTime>,
-    // TODO: ETag support.
+    etag: Option<String>,
 }
 
 fn is_setsockopt_supported() -> Result<bool> {
