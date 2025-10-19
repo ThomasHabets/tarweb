@@ -683,8 +683,7 @@ impl std::fmt::Debug for Hook<'_> {
             fd = self
                 .con
                 .fd()
-                .map(|x| format!("{}", x.0))
-                .unwrap_or("<none>".to_string()),
+                .map_or("<none>".to_string(), |x| format!("{}", x.0)),
         )
     }
 }
@@ -820,10 +819,9 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
             (&entry.plain, "")
         };
         // TODO: pre-calculate many of these headers.
-        let mtime = entry
-            .modified
-            .map(|mtime| format!("Last-Modified: {}\r\n", httpdate::fmt_http_date(mtime)))
-            .unwrap_or("".to_string());
+        let mtime = entry.modified.map_or("".to_string(), |mtime| {
+            format!("Last-Modified: {}\r\n", httpdate::fmt_http_date(mtime))
+        });
         let caching = if CACHE_AGE_SECS > 0 {
             // Expires header is ignored when providing max-age.
             &format!("Cache-Control: public, max-age={CACHE_AGE_SECS}\r\n")
@@ -840,11 +838,11 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
             httpdate::fmt_http_date(std::time::SystemTime::now()),
         );
 
-        if req.if_modified_since.zip(entry.modified).map(|(h,e)| e <= h).unwrap_or(false)
+        if req.if_modified_since.zip(entry.modified).is_some_and(|(h,e)| e <= h)
             // Split can only be iterated once, hence mut here.
-            || req.if_none_match.zip(entry.etag.as_ref()).map(|(mut h,e)| {
+            || req.if_none_match.zip(entry.etag.as_ref()).is_some_and(|(mut h,e)| {
                 h.any(|x| x.trim() == e)
-            }).unwrap_or(false)
+            })
         {
             hook.con.write_header_bytes(
                 ops,
