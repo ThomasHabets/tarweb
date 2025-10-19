@@ -902,8 +902,9 @@ fn handle_connection(
     ops: &mut SQueue,
 ) -> Result<()> {
     {
-        let Some(_) = hook.con.fd() else {
-            return Err(Error::msg("invalid fd on completed fd"));
+        if hook.con.fd().is_none() {
+            debug!("got an operation on a nonexisting fd (happens during close)");
+            return Ok(());
         };
     }
     let is_nop = matches![hook.op, UserDataOp::Nop];
@@ -1180,7 +1181,7 @@ fn mainloop(
     opt: &Opt,
     archive: &Archive,
 ) -> Result<()> {
-    eprintln!("Thread main");
+    info!("Thread main");
     let mut pooltracker = PoolTracker::new();
     let mut ops: SQueue = ArrayVec::new();
     let mut last_submit = std::time::Instant::now();
@@ -1197,7 +1198,7 @@ fn mainloop(
             .with_single_cert(certs, key)?;
     config.enable_secret_extraction = true;
     let config = Arc::new(config);
-    eprintln!("Starting main thread loop");
+    info!("Starting main thread loop");
     loop {
         let mut cq = ring.completion();
         assert_eq!(cq.overflow(), 0);
@@ -1700,10 +1701,10 @@ fn main() -> Result<()> {
                             }
                         }
                         ring.submit()?; // Or sq.sync?
-                        eprintln!("Running thread {n}");
+                        info!("Running thread {n}");
                         let mut connections = Connections::new();
                         mainloop(ring, timeout, &mut connections, opt, archive)?;
-                        eprintln!("Exiting thread {n}");
+                        info!("Exiting thread {n}");
                         Ok(())
                     })?,
             );
