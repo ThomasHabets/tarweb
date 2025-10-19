@@ -16,6 +16,11 @@
 //
 // Conclusion: Wait for direct kernel support for io_uring sendfile.
 //
+// ## Other TODOs
+// * ETag caching
+// * Expires header
+// * Cache-Control / max-age & public
+// * Last-Modified
 //
 // On my laptop, the best performance is:
 // * --threads=2
@@ -671,6 +676,7 @@ struct Request<'a> {
     encoding_gzip: bool,
     encoding_brotli: bool,
     encoding_zstd: bool,
+    if_modified_since: Option<std::time::SystemTime>,
 }
 
 impl Request<'_> {
@@ -691,19 +697,29 @@ impl Request<'_> {
         let mut encoding_gzip = false;
         let mut encoding_brotli = false;
         let mut encoding_zstd = false;
+        let mut if_modified_since = None;
         for header in lines {
             let mut kv = header.splitn(2, ' ');
-            let k = kv.next().unwrap_or("");
+            let k = kv.next().unwrap_or("").to_lowercase();
             let v = kv.next().unwrap_or("");
-            if k.to_lowercase() == "accept-encoding:" {
-                for enc in v.split(", ") {
-                    match enc {
-                        "gzip" => encoding_gzip = true,
-                        "br" => encoding_brotli = true,
-                        "zstd" => encoding_zstd = true,
-                        _ => {}
+            match k.as_str() {
+                "accept-encoding:" => {
+                    for enc in v.split(", ") {
+                        match enc {
+                            "gzip" => encoding_gzip = true,
+                            "br" => encoding_brotli = true,
+                            "zstd" => encoding_zstd = true,
+                            _ => {}
+                        }
                     }
                 }
+                "if-modified-since:" => {
+                    if let Ok(ims) = httpdate::parse_http_date(v) {
+                        debug!("If modified since: {ims:?}");
+                        if_modified_since = Some(ims);
+                    }
+                }
+                _ => {}
             }
         }
         let method = first.next().ok_or(Error::msg("no method"))?;
@@ -720,6 +736,7 @@ impl Request<'_> {
             encoding_gzip,
             encoding_zstd,
             encoding_brotli,
+            if_modified_since,
         }))
     }
 }
@@ -762,7 +779,7 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
     if let Some(entry) = archive.entry(req.path) {
         // TODO: actually, go with the smallest option. My experience just is
         // that it's always this order.
-        let (entry, encoding) = if req.encoding_brotli
+        let (subentry, encoding) = if req.encoding_brotli
             && let Some(ref e) = entry.brotli
         {
             (e, "Content-Encoding: br\r\n")
@@ -777,17 +794,33 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
         } else {
             (&entry.plain, "")
         };
+        let date = httpdate::fmt_http_date(std::time::SystemTime::now());
+        let mtime = entry
+            .modified
+            .map(|mtime| format!("Last-Modified: {}\r\n", httpdate::fmt_http_date(mtime)))
+            .unwrap_or("".to_string());
 
-        hook.con.write_header_bytes(
-            ops,
-            format!(
-                "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n{encoding}Content-Length: {}\r\n\r\n",
-                entry.len,
-            )
-            .as_bytes(),
-            entry.pos,
-            entry.len,
-        );
+        if let Some((h, e)) = req.if_modified_since.zip(entry.modified)
+            && e <= h
+        {
+            hook.con.write_header_bytes(
+                    ops,
+                    format!("HTTP/1.1 304 Not Modified\r\nConnection: keep-alive\r\nDate: {date}\r\n{mtime}Content-Length: 0\r\n\r\n").as_bytes(),
+                    subentry.pos,
+                    subentry.len,
+                );
+        } else {
+            hook.con.write_header_bytes(
+                ops,
+                format!(
+                    "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nDate: {date}\r\n{mtime}{encoding}Content-Length: {}\r\n\r\n",
+                    subentry.len,
+                )
+                .as_bytes(),
+                subentry.pos,
+                subentry.len,
+            );
+        }
     } else {
         let msg404 = "Not found\n";
         let len404 = msg404.len();
@@ -1308,6 +1341,11 @@ impl Archive {
             content.insert(
                 name.to_string(),
                 ArchiveEntry {
+                    modified: e
+                        .header()
+                        .mtime()
+                        .map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
+                        .ok(),
                     plain: ArchiveEntry2 {
                         pos: e.raw_file_position() as usize,
                         len: e.size() as usize,
@@ -1380,6 +1418,8 @@ struct ArchiveEntry {
     gzip: Option<ArchiveEntry2>,
     brotli: Option<ArchiveEntry2>,
     zstd: Option<ArchiveEntry2>,
+    modified: Option<std::time::SystemTime>,
+    // TODO: ETag support.
 }
 
 fn is_setsockopt_supported() -> Result<bool> {

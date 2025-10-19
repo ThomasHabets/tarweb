@@ -11,6 +11,7 @@ arrayvec = { version = "0.7.6", features = ["zeroize"]}
 boring = "4.14.0"
 clap = { version = "4.5.27", features = ["derive"] }
 core_affinity = "0.8.1"
+httpdate = "1.0.3"
 
 # Need at least 0.7.5 for setsockopt support.
 # Cannot use feature "bindgen" because it requires too modern headers for debian
