@@ -921,6 +921,10 @@ fn handle_connection(
                     hook.con.close(modern, ops);
                     return Ok(());
                 }
+                // TODO: create an error type so that we have bubble up the
+                // severity. This, for example, is triggered by the client
+                // disconnecting in the middle of a request, which should be
+                // debug level logging.
                 return Err(Error::msg(format!(
                     "read() failed: {}",
                     std::io::Error::from_raw_os_error(hook.result.abs())
