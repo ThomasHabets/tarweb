@@ -39,6 +39,13 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 type FixedFile = io_uring::types::Fixed;
 
+// memmap2() checks that file is no larger than isize::MAX.
+//
+// After https://github.com/RazrFalcon/memmap2-rs/pull/155 it'll even
+// check correctly on 128bit architectures. Until that PR is merged,
+// asserting here that we are not on such a platform.
+const _: () = assert!(usize::BITS <= 64, "Need to confirm memmap2 is 128bit safe");
+
 // Enable etags for caching. Slows down startup, since we need to hash all
 // files.
 const ENABLE_ETAGS: bool = true;
@@ -1364,7 +1371,6 @@ struct Archive {
 impl Archive {
     fn new(filename: &str, prefix: &str) -> Result<Self> {
         let file = std::fs::File::open(filename)?;
-        // memmap2() checks that file is no larger than isize::MAX.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         let mut archive = tar::Archive::new(&file);
         let mut content = HashMap::new();
