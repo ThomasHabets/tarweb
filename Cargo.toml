@@ -22,7 +22,7 @@ io-uring = "0.7.5"
 ktls = "6.0.2"
 libc = "0.2.169"
 log = "0.4.25"
-memmap2 = "0.9.5"
+memmap2 = "0.9.8"
 nix = { version = "0.29.0", features = ["feature"]}
 rayon = "1.11.0"
 rtsan-standalone = "0.1.0"

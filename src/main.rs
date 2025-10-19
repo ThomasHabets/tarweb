@@ -46,18 +46,20 @@ type FixedFile = io_uring::types::Fixed;
 // asserting here that we are not on such a platform.
 const _: () = assert!(usize::BITS <= 64, "Need to confirm memmap2 is 128bit safe");
 
-// Enable huge page support. Requires reserving some huge pages in the kernel,
-// via:
+// Huge page support. Requires reserving some huge pages in the kernel via:
 //
 // `sudo sysctl -w vm.nr_hugepages=100`
 //
-// Hugepages are used for anonymous mapping, so this means the site will no
-// longer be file-backed. This means even cold parts will take up RAM.
+// Hugepages imply anonymous mapping, so this means the tarfile will no longer
+// be file-backed. This means even cold parts will take up RAM.
 //
 // On x86_64 21 (2MiB) and 30 (1GiB) should be possible.
 //
+// Set to empty to disable hugepages, and instead use file backed.
+//
 // Disabled by default since hugepages may not be enabled.
-const ENABLE_HUGEPAGE_BITS: u8 = 0;
+// const HUGEPAGES: &[u8] = &[30, 21];
+const HUGEPAGES: &[u8] = &[];
 
 // Enable etags for caching. Slows down startup, since we need to hash all
 // files.
@@ -1384,24 +1386,47 @@ struct Archive {
 impl Archive {
     fn new(filename: &str, prefix: &str) -> Result<Self> {
         let mut file = std::fs::File::open(filename)?;
-        #[allow(clippy::absurd_extreme_comparisons)]
-        let mmap = if ENABLE_HUGEPAGE_BITS > 0 {
+        #[allow(clippy::const_is_empty)]
+        let mmap = if !HUGEPAGES.is_empty() {
             use std::io::Seek;
 
             let len = file.metadata()?.len();
-            let bits = ENABLE_HUGEPAGE_BITS;
-            let page_size = 1 << bits;
-            let maplen = (len + (page_size - 1)) & !(page_size - 1);
-            let mut mem = memmap2::MmapOptions::new()
-                .huge(Some(bits))
-                .len(maplen as usize)
-                .map_anon()?;
-            file.read_exact(&mut mem.as_mut()[..len.try_into()?])?;
-            file.seek(std::io::SeekFrom::Start(0))?;
-            mem.make_read_only()?
+
+            let mut mem = None;
+            for bits in HUGEPAGES {
+                debug!("Trying hugepage size with {bits} bits");
+                let page_size = 1 << bits;
+                let maplen = (len + (page_size - 1)) & !(page_size - 1);
+                let mut m = match memmap2::MmapOptions::new()
+                    .len(maplen as usize)
+                    .huge(Some(*bits))
+                    .map_anon()
+                {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("mmap() failed with bit size {bits}: {e}");
+                        continue;
+                    }
+                };
+                file.read_exact(&mut m.as_mut()[..len.try_into()?])?;
+                file.seek(std::io::SeekFrom::Start(0))?;
+                mem = Some(match m.make_read_only() {
+                    Ok(m) => m,
+                    Err(_) => {
+                        warn!("mmap mark read only with page bit size {bits} failed");
+                        continue;
+                    }
+                });
+                break;
+            }
+            mem.expect("failed to find a page size that worked")
         } else {
-            unsafe { memmap2::Mmap::map(&file)? }
+            let map = unsafe { memmap2::Mmap::map(&file)? };
+            // Can't hurt to at least ask to be hugepages or mergable.
+            map.advise(memmap2::Advice::HugePage)?;
+            map
         };
+        mmap.advise(memmap2::Advice::Mergeable)?;
         let mut archive = tar::Archive::new(&file);
         let mut content = HashMap::new();
         info!("Indexing…");
