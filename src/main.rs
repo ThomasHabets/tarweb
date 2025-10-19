@@ -29,7 +29,7 @@ use std::io::Read;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::{Error, Result};
+use anyhow::{Context, Error, Result};
 use arrayvec::ArrayVec;
 use clap::Parser;
 use log::{debug, error, info, trace, warn};
@@ -1174,10 +1174,12 @@ fn mainloop(
     let mut last_submit = std::time::Instant::now();
     let mut syscalls = 0;
     debug!("Loading certs");
-    let certs = load_certs(&opt.tls_cert)?;
+    let certs = load_certs(&opt.tls_cert)
+        .with_context(|| format!("Loading certs from {}", opt.tls_cert))?;
     // Load private key.
     debug!("Loading key");
-    let key = load_private_key(&opt.tls_key)?;
+    let key = load_private_key(&opt.tls_key)
+        .with_context(|| format!("Loading private key from {}", opt.tls_key))?;
     debug!("Creating TLS config");
     let mut config =
         rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -1406,7 +1408,8 @@ impl Archive {
         let mut m = memmap2::MmapOptions::new()
             .len(maplen as usize)
             .huge(Some(bits))
-            .map_anon()?;
+            .map_anon()
+            .with_context(|| format!("Failed allocating 1<<{bits}={} bytes", 1 << bits))?;
 
         // Rewind the file.
         file.read_exact(&mut m.as_mut()[..len.try_into()?])?;
@@ -1635,9 +1638,10 @@ fn main() -> Result<()> {
     }
 
     let archive = if let Some(hugepages) = opt.hugepages {
-        Archive::hugepages(&opt.tarfile, &opt.prefix, hugepages)?
+        Archive::hugepages(&opt.tarfile, &opt.prefix, hugepages)
+            .with_context(|| "Mapping file with hugepages")?
     } else {
-        Archive::new(&opt.tarfile, &opt.prefix)?
+        Archive::new(&opt.tarfile, &opt.prefix).with_context(|| "Mapping file")?
     };
 
     let listener = std::net::TcpListener::bind(&opt.listen)?;
