@@ -1041,7 +1041,7 @@ fn handle_connection(
         }
         UserDataOp::FilesUpdate => {
             assert!(hook.result >= 0, "FilesUpdate returned {}", hook.result);
-            println!(
+            trace!(
                 "HABETS {}: FilesUpdate done returning {}",
                 hook.con.id, hook.result
             );
@@ -1261,7 +1261,7 @@ fn op_completion(
                     return Ok(());
                 }
                 UserDataOp::CloseRaw => {
-                    println!("HABETS {} CloseRaw finished", data.con.id);
+                    trace!("HABETS {} CloseRaw finished", data.con.id);
                 }
                 op => panic!("bad op in Handshaking: {op:?}"),
             }
@@ -1277,12 +1277,12 @@ fn op_completion(
             else {
                 unreachable!();
             };
-            println!("HABETS register finished");
+            trace!("HABETS register finished");
             assert_eq!(data.op, UserDataOp::FilesUpdate);
             ops.push(make_op_close_raw(raw_fd));
             data.con.outstanding += 1;
             data.con.pre_read(fd, tls, &clienthello, ops)?;
-            println!("Now in state {:?}", data.con.state);
+            trace!("Now in state {:?}", data.con.state);
         }
     }
 
@@ -1395,7 +1395,7 @@ fn mainloop(
                     syscalls = 0;
                 }
                 USER_DATA_PASSED_FD => {
-                    println!("PASSFD {result} {}", passfd_msghdr.msg_iovlen);
+                    trace!("PASSFD {result} {}", passfd_msghdr.msg_iovlen);
                     assert_eq!(passfd_msghdr.msg_iovlen, 1);
                     let iov = passfd_msghdr.msg_iov;
                     let clienthello: &[u8] = unsafe {
@@ -1404,7 +1404,7 @@ fn mainloop(
                     let mut cmsg =
                         unsafe { libc::CMSG_FIRSTHDR(passfd_msghdr as *const libc::msghdr) };
                     while !cmsg.is_null() {
-                        println!("Control message!");
+                        trace!("Control message!");
                         let level = unsafe { (*cmsg).cmsg_level };
                         let typ = unsafe { (*cmsg).cmsg_type };
                         if (level, typ) != (libc::SOL_SOCKET, libc::SCM_RIGHTS) {
@@ -1413,7 +1413,7 @@ fn mainloop(
                             };
                             continue;
                         }
-                        println!("Control message: file descriptor!");
+                        trace!("Control message: file descriptor!");
                         let data = unsafe {
                             let data_ptr = libc::CMSG_DATA(cmsg) as *const u8;
                             let cmsg_len = (*cmsg).cmsg_len as usize;
@@ -1431,7 +1431,7 @@ fn mainloop(
                         };
                         assert_eq!(data.len(), std::mem::size_of::<libc::c_int>());
                         let fd = libc::c_int::from_ne_bytes(data.try_into().unwrap());
-                        println!("Is fd: {fd}");
+                        trace!("Is fd: {fd}");
                         // TODO: get an ID from a reserved range or something.
                         let id = pooltracker.alloc().unwrap();
                         let fixed = io_uring::types::Fixed(20 + id as u32);
@@ -1883,7 +1883,7 @@ fn main() -> Result<()> {
 
                         //let mut cmsgspace = nix::cmsg_space!([std::os::fd::RawFd; 1]);
                         let mut cmsgspace = vec![0u8; 128];
-                        println!("Msg space: {}", cmsgspace.len());
+                        trace!("Msg space: {}", cmsgspace.len());
                         let mut iov_space = [0u8; 1024];
                         let mut iov = libc::iovec {
                             iov_len: iov_space.len(),
