@@ -82,7 +82,8 @@ async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<(Vec
                     msg_type
                 ));
             }
-            let body_len = ((hello[1] as usize) << 16) | ((hello[2] as usize) << 8) | (hello[3] as usize);
+            let body_len =
+                ((hello[1] as usize) << 16) | ((hello[2] as usize) << 8) | (hello[3] as usize);
             needed = Some(4 + body_len);
         }
     }
@@ -108,7 +109,10 @@ fn pass_fd_over_uds(fd: std::os::unix::io::RawFd, sock: &UnixDatagram, bytes: &[
     let sent =
         sendmsg::<()>(raw, &iov, &cmsg, MsgFlags::empty(), None).context("sendmsg SCM_RIGHTS")?;
     if sent != bytes.len() {
-        return Err(anyhow!("sendmsg: expected to send {} bytes, sent {sent}", bytes.len()));
+        return Err(anyhow!(
+            "sendmsg: expected to send {} bytes, sent {sent}",
+            bytes.len()
+        ));
     }
     Ok(())
 }
@@ -226,7 +230,7 @@ fn extract_sni(clienthello: &[u8]) -> Result<Option<String>> {
 
 async fn handle_conn(stream: &mut tokio::net::TcpStream, uds_path: &std::path::Path) -> Result<()> {
     // Read and validate a full TLS ClientHello.
-    let (bytes, clienthello)= read_tls_clienthello(stream).await?;
+    let (bytes, clienthello) = read_tls_clienthello(stream).await?;
     println!("ClientHello len={} bytes", clienthello.len());
     let Some(sni) = extract_sni(&clienthello)? else {
         println!("Failed to extract SNI");

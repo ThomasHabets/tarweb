@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -41,7 +42,7 @@ type FixedFile = io_uring::types::Fixed;
 
 // Enable etags for caching. Slows down startup, since we need to hash all
 // files.
-const ENABLE_ETAGS: bool = true;
+const ENABLE_ETAGS: bool = false;
 
 // Cache max age.
 const CACHE_AGE_SECS: u64 = 300;
@@ -55,6 +56,7 @@ const FULL_SPEED: bool = false;
 // The index for new accepted connections are automatically picked by the
 // kernel, except for our listening socket which is number 0.
 const LISTEN_FIXED_FILE: FixedFile = io_uring::types::Fixed(0);
+const LISTEN_PASS_FIXED_FILE: FixedFile = io_uring::types::Fixed(1);
 
 // The maximum number of concurrent connections. This is only set to 100 because
 // ulimit tends to be much lower than that.
@@ -78,6 +80,9 @@ const USER_DATA_LISTENER: u64 = u64::MAX;
 // Special user data "handle" to indicate timeout. At timeout, we do some
 // housekeeping.
 const USER_DATA_TIMEOUT: u64 = USER_DATA_LISTENER - 1;
+
+// Special user data "handle" to indicate passed fd.
+const USER_DATA_PASSED_FD: u64 = USER_DATA_LISTENER - 2;
 
 // This is the op type part of the user data "handle".
 // If more ops are added, add them to make_ops_cancel for !modern path.
@@ -978,6 +983,21 @@ fn make_op_timeout(ts: Pin<&io_uring::types::Timespec>) -> io_uring::squeue::Ent
         .build()
         .user_data(USER_DATA_TIMEOUT)
 }
+
+#[must_use]
+fn make_op_recvmsg(fd: i32, hdr: *mut libc::msghdr) -> io_uring::squeue::Entry {
+    io_uring::opcode::RecvMsg::new(io_uring::types::Fd(fd), hdr)
+        .build()
+        .user_data(USER_DATA_PASSED_FD)
+}
+
+#[must_use]
+fn make_op_recvmsg_fixed(hdr: *mut libc::msghdr) -> io_uring::squeue::Entry {
+    io_uring::opcode::RecvMsg::new(LISTEN_PASS_FIXED_FILE, hdr)
+        .build()
+        .user_data(USER_DATA_PASSED_FD)
+}
+
 fn load_certs<P: AsRef<std::path::Path>>(
     filename: P,
 ) -> std::io::Result<Vec<CertificateDer<'static>>> {
@@ -1157,6 +1177,8 @@ fn op_completion(
 fn mainloop(
     mut ring: io_uring::IoUring,
     timeout: Pin<&io_uring::types::Timespec>,
+    passfd: std::os::unix::net::UnixDatagram,
+    passfd_msghdr: &mut libc::msghdr,
     connections: &mut Connections,
     opt: &Opt,
     archive: &Archive,
@@ -1247,6 +1269,13 @@ fn mainloop(
                     });
                     trace!("Timeout: Syscalls: {syscalls}");
                     syscalls = 0;
+                }
+                USER_DATA_PASSED_FD => {
+                    println!("PASSFD {result}");
+                    ops.push(make_op_recvmsg(
+                        passfd.as_raw_fd(),
+                        passfd_msghdr as *mut libc::msghdr,
+                    ));
                 }
                 _ => {
                     let mut data = decode_user_data(user_data, result, connections);
@@ -1344,6 +1373,9 @@ struct Opt {
 
     #[arg(long, short = 'C', help = "TLS certificate chain")]
     tls_cert: std::path::PathBuf,
+
+    #[arg(long)]
+    passfd: std::path::PathBuf,
 
     tarfile: std::path::PathBuf,
 }
@@ -1519,8 +1551,6 @@ struct ArchiveEntry {
 }
 
 fn is_setsockopt_supported() -> Result<bool> {
-    use std::os::fd::AsRawFd;
-
     // Set up a TCP connection.
     let listener = std::net::TcpListener::bind("[::1]:0")?;
     let addr = listener.local_addr()?;
@@ -1561,7 +1591,6 @@ fn is_setsockopt_supported() -> Result<bool> {
 }
 
 fn is_ktls_loaded() -> Result<bool> {
-    use std::os::fd::AsRawFd;
     // Step 1: Bind a local listener to a free port
     let listener = std::net::TcpListener::bind("[::1]:0")?;
     let addr = listener.local_addr()?;
@@ -1646,15 +1675,16 @@ fn main() -> Result<()> {
         .with_context(|| format!("Binding to {}", opt.listen))?;
     // The Rust API doesn't allow it, but setting TCP_NODELAY on a listening socket seems to set
     // that option on all incoming connections, which is what we want.
-    {
-        use std::os::fd::AsRawFd;
-        set_nodelay(listener.as_raw_fd())?;
-    }
+    set_nodelay(listener.as_raw_fd())?;
+
+    let _ = std::fs::remove_file(&opt.passfd);
+    let passfd = std::os::unix::net::UnixDatagram::bind(&opt.passfd).context("binding passfd")?;
 
     std::thread::scope(|s| -> Result<()> {
         let mut handles = Vec::new();
         for n in 0..opt.threads {
             let listener = listener.try_clone()?;
+            let passfd = passfd.try_clone()?;
             let opt = &opt;
             let archive = &archive;
             handles.push(
@@ -1683,10 +1713,34 @@ fn main() -> Result<()> {
                         // Needs a wrapping struct that is not Unpin, apparently.
                         let timeout = opt.periodic_wakeup.into();
                         let timeout = Pin::new(&timeout);
-                        let init_ops = [make_op_accept(opt.accept_multi), make_op_timeout(timeout)];
-                        use std::os::fd::AsRawFd;
+
+                        let mut cmsgspace = nix::cmsg_space!([std::os::fd::RawFd; 1]);
+                        let mut iov_space = [0u8; 1024];
+                        let mut iov = libc::iovec {
+                            iov_len: iov_space.len(),
+                            iov_base: iov_space.as_mut_ptr() as *mut libc::c_void,
+                        };
+                        let mut passfd_msghdr = libc::msghdr {
+                            msg_name: std::ptr::null_mut(),
+                            msg_namelen: 0,
+                            msg_iov: &mut iov as *mut libc::iovec,
+                            msg_iovlen: 1,
+                            msg_control: cmsgspace.as_mut_ptr() as *mut libc::c_void,
+                            msg_controllen: cmsgspace.len(),
+                            msg_flags: 0,
+                        };
+                        let init_ops = [
+                            make_op_accept(opt.accept_multi),
+                            make_op_timeout(timeout),
+                            //make_op_recvmsg(passfd, unsafe {&mut passfd_msghdr as *mut libc::msghdr}),
+                            make_op_recvmsg(
+                                passfd.as_raw_fd(),
+                                &mut passfd_msghdr as *mut libc::msghdr,
+                            ),
+                        ];
                         let mut registered = vec![-1i32; MAX_CONNECTIONS];
                         registered[0] = listener.as_raw_fd();
+                        //registered[LISTEN_PASS_FIXED_FILE.0 as usize] = passfd.as_raw_fd();
                         ring.submitter().register_files(&registered)?;
                         unsafe {
                             for op in init_ops {
@@ -1699,7 +1753,15 @@ fn main() -> Result<()> {
                         drop(listener);
                         info!("Running thread {n}");
                         let mut connections = Connections::new();
-                        mainloop(ring, timeout, &mut connections, opt, archive)?;
+                        mainloop(
+                            ring,
+                            timeout,
+                            passfd,
+                            &mut passfd_msghdr,
+                            &mut connections,
+                            opt,
+                            archive,
+                        )?;
                         info!("Exiting thread {n}");
                         Ok(())
                     })?,
