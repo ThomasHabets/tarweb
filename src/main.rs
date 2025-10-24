@@ -143,7 +143,7 @@ impl HandshakeData {
     // We have received handshake data from the remote end.
     // send it on to rustls for processing.
     fn received(&mut self, data: &[u8]) -> Result<rustls::IoState, rustls::Error> {
-        debug!("Got some handshaky data: {data:?}");
+        debug!("Got some handshaky data len {}: {data:?}", data.len());
         let mut reader = std::io::Cursor::new(data);
         self.tls.read_tls(&mut reader).unwrap();
         self.tls.process_new_packets()
@@ -289,8 +289,7 @@ impl Connection {
             tls,
         });
         self.last_action = std::time::Instant::now();
-        self.outstanding += 1;
-        ops.push(make_op_files_update(raw_fd));
+        self.make_op_files_update(ops);
     }
 
     /// Put the Connection object back in Idle state.
@@ -321,6 +320,11 @@ impl Connection {
     /// Register that an operation has completed.
     fn io_completed(&mut self) {
         self.last_action = std::time::Instant::now();
+        assert!(
+            self.outstanding > 0,
+            "IO underflow for connection {}",
+            self.id
+        );
         self.outstanding -= 1;
     }
 
@@ -459,6 +463,19 @@ impl Connection {
         );
     }
 
+    fn make_op_files_update(&mut self, ops: &mut SQueue) {
+        let State::Registering(RegisteringData { raw_fd, fd, .. }) = self.state else {
+            panic!();
+        };
+        ops.push(
+            io_uring::opcode::FilesUpdate::new(&raw_fd as *const i32, 1)
+                .offset(fd.0 as i32)
+                .build()
+                .user_data((self.id as u64) | USER_DATA_OP_FILES_UPDATE),
+        );
+        self.outstanding += 1;
+    }
+
     fn enable_ktls(&mut self, fd: FixedFile, ops: &mut SQueue, new_state: State) -> Result<()> {
         // Set SOL_TCP/TCP_ULP to "tls", a prereq for enalbing kTLS.
         self.setsockopt_ulp(fd, ops);
@@ -547,6 +564,33 @@ impl Connection {
         );
     }
 
+    // TODO: deduplicate with op_completion.
+    fn pre_read(
+        &mut self,
+        fixed: FixedFile,
+        mut tls: rustls::ServerConnection,
+        data: &[u8],
+        ops: &mut SQueue,
+    ) -> Result<()> {
+        let mut d = HandshakeData { fixed, tls };
+        trace!("Giving {} bytes to TLS impl", data.len());
+        let io = d.received(&data)?;
+        let bytes_to_write = io.tls_bytes_to_write();
+        trace!("pre_read bytes to write: {bytes_to_write}");
+        if bytes_to_write > 0 {
+            let write_buf = [0u8; MAX_WRITE_BUF];
+            let mut cur = std::io::Cursor::new(write_buf);
+            let written = d.tls.write_tls(&mut cur)?;
+            self.write_buf = cur.into_inner();
+            self.state = State::Handshaking(d);
+            self.write(written, ops);
+        } else {
+            self.state = State::Handshaking(d);
+            self.read(ops);
+        }
+        Ok(())
+    }
+
     // Queue up a read.
     fn read(&mut self, ops: &mut SQueue) {
         let read_buf = &mut self.read_buf[self.read_buf_pos..];
@@ -554,7 +598,7 @@ impl Connection {
             State::Reading(fd) => *fd,
             State::Handshaking(data) => data.fixed,
             State::EnablingKtls(fd) => *fd,
-            _ => panic!("read in wrong state"),
+            s => panic!("read in wrong state {s:?}"),
         };
         // Try RecvMulti/RecvMsgMulti/RecvMultiBundle?
         self.outstanding += 1;
@@ -996,13 +1040,11 @@ fn handle_connection(
             panic!("Nothing here, right?)");
         }
         UserDataOp::FilesUpdate => {
-            assert!(hook.result >= 0);
-            println!("HABETS: FilesUpdate done returning {}", hook.result);
-            let State::Registering(ref reg) = hook.con.state else {
-                panic!();
-            };
-            ops.push(make_op_close_raw(reg.raw_fd));
-            hook.con.outstanding += 1;
+            assert!(hook.result >= 0, "FilesUpdate returned {}", hook.result);
+            println!(
+                "HABETS {}: FilesUpdate done returning {}",
+                hook.con.id, hook.result
+            );
         }
         UserDataOp::Cancel => {
             if hook.result != 0 {
@@ -1058,14 +1100,6 @@ fn make_op_recvmsg_fixed(hdr: *mut libc::msghdr) -> io_uring::squeue::Entry {
     io_uring::opcode::RecvMsg::new(LISTEN_PASS_FIXED_FILE, hdr)
         .build()
         .user_data(USER_DATA_PASSED_FD)
-}
-
-#[must_use]
-fn make_op_files_update(fd: i32) -> io_uring::squeue::Entry {
-    io_uring::opcode::FilesUpdate::new(&fd as *const i32, 1)
-        .offset(20) // TODO
-        .build()
-        .user_data(USER_DATA_OP_FILES_UPDATE)
 }
 
 fn load_certs<P: AsRef<std::path::Path>>(
@@ -1226,11 +1260,29 @@ fn op_completion(
                     data.con.enable_ktls(fd, ops, State::EnablingKtls(fd))?;
                     return Ok(());
                 }
+                UserDataOp::CloseRaw => {
+                    println!("HABETS {} CloseRaw finished", data.con.id);
+                }
                 op => panic!("bad op in Handshaking: {op:?}"),
             }
         }
-        State::Registering(_) => {
+        State::Registering(reg) => {
+            let State::Registering(RegisteringData {
+                raw_fd,
+                fd,
+                tls,
+                clienthello,
+                ..
+            }) = std::mem::replace(&mut data.con.state, State::Idle)
+            else {
+                unreachable!();
+            };
             println!("HABETS register finished");
+            assert_eq!(data.op, UserDataOp::FilesUpdate);
+            ops.push(make_op_close_raw(raw_fd));
+            data.con.outstanding += 1;
+            data.con.pre_read(fd, tls, &clienthello, ops)?;
+            println!("Now in state {:?}", data.con.state);
         }
     }
 
@@ -1344,6 +1396,11 @@ fn mainloop(
                 }
                 USER_DATA_PASSED_FD => {
                     println!("PASSFD {result} {}", passfd_msghdr.msg_iovlen);
+                    assert_eq!(passfd_msghdr.msg_iovlen, 1);
+                    let iov = passfd_msghdr.msg_iov;
+                    let clienthello: &[u8] = unsafe {
+                        std::slice::from_raw_parts((*iov).iov_base as *const u8, result as usize)
+                    };
                     let mut cmsg =
                         unsafe { libc::CMSG_FIRSTHDR(passfd_msghdr as *const libc::msghdr) };
                     while !cmsg.is_null() {
@@ -1375,14 +1432,14 @@ fn mainloop(
                         assert_eq!(data.len(), std::mem::size_of::<libc::c_int>());
                         let fd = libc::c_int::from_ne_bytes(data.try_into().unwrap());
                         println!("Is fd: {fd}");
-                        let fixed = io_uring::types::Fixed(20); // TODO: these must be reserved
-                        // somehow.
+                        // TODO: get an ID from a reserved range or something.
                         let id = pooltracker.alloc().unwrap();
+                        let fixed = io_uring::types::Fixed(20 + id as u32);
                         debug!("Allocated {id} result {result}");
                         let new_conn = connections.get(id);
                         let tls = rustls::ServerConnection::new(config.clone())?;
                         // TODO: pass in clienthello data.
-                        new_conn.init_fd(fd, fixed, Vec::new(), tls, &mut ops);
+                        new_conn.init_fd(fd, fixed, clienthello.to_vec(), tls, &mut ops);
                         break;
                     }
                     ops.push(make_op_recvmsg_fixed(passfd_msghdr as *mut libc::msghdr));
