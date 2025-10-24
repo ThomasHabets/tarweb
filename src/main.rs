@@ -92,6 +92,8 @@ const USER_DATA_OP_CLOSE: u64 = 0x2_0000_0000;
 const USER_DATA_OP_READ: u64 = 0x3_0000_0000;
 const USER_DATA_OP_CANCEL: u64 = 0x4_0000_0000;
 const USER_DATA_OP_SETSOCKOPT: u64 = 0x8_0000_0000;
+const USER_DATA_OP_FILES_UPDATE: u64 = 0x10_0000_0000;
+const USER_DATA_OP_CLOSE_RAW: u64 = 0x20_0000_0000;
 // TODO: NOP is an ugly hack to trigger Reading to look for a request. It should
 // just trigger it some other way.
 const USER_DATA_OP_NOP: u64 = 0x10_0000_0000;
@@ -148,12 +150,23 @@ impl HandshakeData {
     }
 }
 
+#[derive(Debug)]
+struct RegisteringData {
+    fd: FixedFile,
+    raw_fd: i32,
+    clienthello: Vec<u8>,
+    tls: rustls::ServerConnection,
+}
+
 // State of a connection.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 enum State {
     // This connection is currently not in use.
     Idle,
+
+    // Registering FD as fixed.
+    Registering(RegisteringData),
 
     // rustls handshaking happening.
     //
@@ -256,6 +269,30 @@ impl Connection {
         self.last_action = std::time::Instant::now();
     }
 
+    /// Init a new connection from fd.
+    ///
+    /// We reuse `Connection` objects between connections, which is why this is
+    /// not just part of `new()`.
+    fn init_fd(
+        &mut self,
+        raw_fd: i32,
+        fd: FixedFile,
+        bytes: Vec<u8>,
+        tls: rustls::ServerConnection,
+        ops: &mut SQueue,
+    ) {
+        debug_assert!(matches![self.state, State::Idle]);
+        self.state = State::Registering(RegisteringData {
+            fd,
+            raw_fd,
+            clienthello: bytes,
+            tls,
+        });
+        self.last_action = std::time::Instant::now();
+        self.outstanding += 1;
+        ops.push(make_op_files_update(raw_fd));
+    }
+
     /// Put the Connection object back in Idle state.
     fn deinit(&mut self) {
         assert_eq!(self.outstanding, 0);
@@ -296,9 +333,11 @@ impl Connection {
             State::Reading(fd) => Some(fd),
             State::WritingHeaders(fd, _, _) => Some(fd),
             State::WritingData(fd, _, _) => Some(fd),
+            State::Registering(RegisteringData { fd, .. }) => Some(fd),
             State::Closing => None,
         }
     }
+
     #[must_use]
     fn closing(&self) -> bool {
         matches![self.state, State::Closing]
@@ -592,6 +631,13 @@ fn make_op_close(fd: FixedFile, con_id: usize) -> io_uring::squeue::Entry {
 }
 
 #[must_use]
+fn make_op_close_raw(fd: i32) -> io_uring::squeue::Entry {
+    io_uring::opcode::Close::new(io_uring::types::Fd(fd))
+        .build()
+        .user_data(USER_DATA_OP_CLOSE_RAW)
+}
+
+#[must_use]
 fn make_ops_cancel(fd: FixedFile, id: u64, modern: bool, ops: &mut SQueue) -> usize {
     trace!("Cancelling connection");
     let mut outstanding = 0;
@@ -641,8 +687,10 @@ enum UserDataOp {
     Write,
     Read,
     Close,
+    CloseRaw,
     Cancel,
     SetSockOpt,
+    FilesUpdate,
     Nop,
 }
 
@@ -771,6 +819,8 @@ fn decode_user_data(user_data: u64, result: i32, cons: &mut Connections) -> Hook
         USER_DATA_OP_CLOSE => UserDataOp::Close,
         USER_DATA_OP_CANCEL => UserDataOp::Cancel,
         USER_DATA_OP_SETSOCKOPT => UserDataOp::SetSockOpt,
+        USER_DATA_OP_FILES_UPDATE => UserDataOp::FilesUpdate,
+        USER_DATA_OP_CLOSE_RAW => UserDataOp::CloseRaw,
         USER_DATA_OP_NOP => UserDataOp::Nop,
         _ => panic!("Invalid op {user_data:x} result {result}"),
     };
@@ -945,6 +995,15 @@ fn handle_connection(
             assert_eq!(hook.result, 0);
             panic!("Nothing here, right?)");
         }
+        UserDataOp::FilesUpdate => {
+            assert!(hook.result >= 0);
+            println!("HABETS: FilesUpdate done returning {}", hook.result);
+            let State::Registering(ref reg) = hook.con.state else {
+                panic!();
+            };
+            ops.push(make_op_close_raw(reg.raw_fd));
+            hook.con.outstanding += 1;
+        }
         UserDataOp::Cancel => {
             if hook.result != 0 {
                 debug!(
@@ -953,6 +1012,9 @@ fn handle_connection(
                     std::io::Error::from_raw_os_error(hook.result.abs())
                 );
             }
+        }
+        UserDataOp::CloseRaw => {
+            assert_eq!(hook.result, 0);
         }
     }
     Ok(())
@@ -996,6 +1058,14 @@ fn make_op_recvmsg_fixed(hdr: *mut libc::msghdr) -> io_uring::squeue::Entry {
     io_uring::opcode::RecvMsg::new(LISTEN_PASS_FIXED_FILE, hdr)
         .build()
         .user_data(USER_DATA_PASSED_FD)
+}
+
+#[must_use]
+fn make_op_files_update(fd: i32) -> io_uring::squeue::Entry {
+    io_uring::opcode::FilesUpdate::new(&fd as *const i32, 1)
+        .offset(20) // TODO
+        .build()
+        .user_data(USER_DATA_OP_FILES_UPDATE)
 }
 
 fn load_certs<P: AsRef<std::path::Path>>(
@@ -1159,6 +1229,9 @@ fn op_completion(
                 op => panic!("bad op in Handshaking: {op:?}"),
             }
         }
+        State::Registering(_) => {
+            println!("HABETS register finished");
+        }
     }
 
     if let Err(e) = handle_connection(data, archive, opt.async_cancel2, ops) {
@@ -1276,12 +1349,44 @@ fn mainloop(
                         unsafe { libc::CMSG_FIRSTHDR(passfd_msghdr as *const libc::msghdr) };
                     while !cmsg.is_null() {
                         println!("Control message!");
-                        cmsg =
-                            unsafe { libc::CMSG_NXTHDR(passfd_msghdr as *mut libc::msghdr, cmsg) };
+                        let level = unsafe { (*cmsg).cmsg_level };
+                        let typ = unsafe { (*cmsg).cmsg_type };
+                        if (level, typ) != (libc::SOL_SOCKET, libc::SCM_RIGHTS) {
+                            cmsg = unsafe {
+                                libc::CMSG_NXTHDR(passfd_msghdr as *mut libc::msghdr, cmsg)
+                            };
+                            continue;
+                        }
+                        println!("Control message: file descriptor!");
+                        let data = unsafe {
+                            let data_ptr = libc::CMSG_DATA(cmsg) as *const u8;
+                            let cmsg_len = (*cmsg).cmsg_len as usize;
+                            let header_size = std::mem::size_of::<libc::cmsghdr>();
+                            let data_len = if cmsg_len > header_size {
+                                cmsg_len - header_size
+                            } else {
+                                0
+                            };
+                            if data_len == 0 {
+                                &[][..]
+                            } else {
+                                std::slice::from_raw_parts(data_ptr, data_len)
+                            }
+                        };
+                        assert_eq!(data.len(), std::mem::size_of::<libc::c_int>());
+                        let fd = libc::c_int::from_ne_bytes(data.try_into().unwrap());
+                        println!("Is fd: {fd}");
+                        let fixed = io_uring::types::Fixed(20); // TODO: these must be reserved
+                        // somehow.
+                        let id = pooltracker.alloc().unwrap();
+                        debug!("Allocated {id} result {result}");
+                        let new_conn = connections.get(id);
+                        let tls = rustls::ServerConnection::new(config.clone())?;
+                        // TODO: pass in clienthello data.
+                        new_conn.init_fd(fd, fixed, Vec::new(), tls, &mut ops);
+                        break;
                     }
-                    ops.push(make_op_recvmsg_fixed(
-                        passfd_msghdr as *mut libc::msghdr,
-                    ));
+                    ops.push(make_op_recvmsg_fixed(passfd_msghdr as *mut libc::msghdr));
                 }
                 _ => {
                     let mut data = decode_user_data(user_data, result, connections);
