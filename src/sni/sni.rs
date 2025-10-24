@@ -11,7 +11,7 @@ struct Opt {
     sock: std::path::PathBuf,
 }
 
-/// Reads enough bytes from `stream` to cover the entire TLS ClientHello handshake
+/// Read enough bytes from `stream` to cover the entire TLS ClientHello handshake
 /// (which may span multiple records). Returns the handshake (type+len+body).
 ///
 /// TLS record format:
@@ -21,25 +21,33 @@ struct Opt {
 /// Handshake header:
 ///   - msg_type(1)=1(ClientHello)
 ///   - length(3) = body_len
-async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
+///
+/// Return all bytes read, and clienthello bytes.
+async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<(Vec<u8>, Vec<u8>)> {
     use tokio::io::AsyncReadExt;
-    let mut hs = Vec::new();
+    const REC_HDR_LEN: usize = 5;
+    let mut hello = Vec::with_capacity(1024);
+    let mut bytes = Vec::with_capacity(1024);
 
     // We need at least first record to see handshake header (type + 3-byte len).
     // Loop records until we have full ClientHello bytes (4 + body_len).
     let mut needed: Option<usize> = None;
 
-    while needed.map(|n| hs.len() >= n).unwrap_or(false) == false {
-        let mut rec_hdr = [0u8; 5];
+    while needed.map(|n| hello.len() >= n).unwrap_or_default() == false {
+        // Read record header.
+        let mut rec_hdr = [0u8; REC_HDR_LEN];
         stream
             .read_exact(&mut rec_hdr)
             .await
             .context("read TLS record header")?;
+        bytes.extend(rec_hdr);
 
+        // Parse header.
         let content_type = rec_hdr[0];
         let _legacy_ver = u16::from_be_bytes([rec_hdr[1], rec_hdr[2]]);
         let rec_len = u16::from_be_bytes([rec_hdr[3], rec_hdr[4]]) as usize;
 
+        // Confirm it's Handshake.
         if content_type != 22 {
             return Err(anyhow!(
                 "unexpected TLS content_type {}, want 22 (handshake)",
@@ -50,6 +58,7 @@ async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<Vec<
             return Err(anyhow!("zero-length TLS record"));
         }
 
+        // Read whole record.
         let mut rec_payload = vec![0u8; rec_len];
         stream
             .read_exact(&mut rec_payload)
@@ -57,58 +66,57 @@ async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<Vec<
             .context("read TLS record payload")?;
 
         // Append to handshake buffer (could contain partial or full ClientHello).
-        hs.extend(&rec_payload);
+        hello.extend(&rec_payload);
+        bytes.extend(&rec_payload);
 
         // If we haven't established how many bytes we need, try now.
         if needed.is_none() {
-            if hs.len() < 4 {
+            if hello.len() < 4 {
                 // Not enough to read handshake header yet; continue.
                 continue;
             }
-            let msg_type = hs[0];
+            let msg_type = hello[0];
             if msg_type != 1 {
                 return Err(anyhow!(
                     "first handshake msg is type {}, expected 1 (ClientHello)",
                     msg_type
                 ));
             }
-            let body_len = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | (hs[3] as usize);
+            let body_len = ((hello[1] as usize) << 16) | ((hello[2] as usize) << 8) | (hello[3] as usize);
             needed = Some(4 + body_len);
         }
     }
 
     // Truncate to exactly the ClientHello (in case next record started).
+    // TODO: that's impossible, right?
     let n = needed.unwrap();
-    if hs.len() > n {
-        hs.truncate(n);
+    if hello.len() > n {
+        hello.truncate(n);
     }
-
-    Ok(hs.to_vec())
+    Ok((bytes, hello))
 }
 
-/// Sends `fd` to a receiver bound at `uds_path` via SCM_RIGHTS on a Unix datagram.
-///
-/// Notes:
-/// - The receiver gets a *new* fd number in its process.
-/// - We send a 1-byte payload because some kernels reject empty datagrams with ancillary data.
-fn pass_fd_over_uds(fd: std::os::unix::io::RawFd, sock: &UnixDatagram, hello: &[u8]) -> Result<()> {
+/// Sends `fd` and handshake data using SCM_RIGHTS on a Unix datagram.
+fn pass_fd_over_uds(fd: std::os::unix::io::RawFd, sock: &UnixDatagram, bytes: &[u8]) -> Result<()> {
     use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 
-    let iov = [std::io::IoSlice::new(hello)]; // minimal payload
+    let iov = [std::io::IoSlice::new(bytes)];
     let cmsg = [ControlMessage::ScmRights(&[fd])];
 
-    // Safety: using raw fd for sendmsg via nix on our StdUnixDatagram.
+    // TODO: send async.
     let raw = sock.as_raw_fd();
     let sent =
         sendmsg::<()>(raw, &iov, &cmsg, MsgFlags::empty(), None).context("sendmsg SCM_RIGHTS")?;
-    if sent != 1 {
-        return Err(anyhow!("sendmsg: expected to send 1 byte, sent {}", sent));
+    if sent != bytes.len() {
+        return Err(anyhow!("sendmsg: expected to send {} bytes, sent {sent}", bytes.len()));
     }
     Ok(())
 }
 
 /// Extract SNI host_name from a TLS ClientHello (handshake header + body).
 /// Returns Ok(Some(host)) if found, Ok(None) if no SNI extension exists.
+///
+/// Entirely jippitycoded.
 fn extract_sni(clienthello: &[u8]) -> Result<Option<String>> {
     // Handshake header: type(1)=1, len(3)
     if clienthello.len() < 4 {
@@ -218,7 +226,7 @@ fn extract_sni(clienthello: &[u8]) -> Result<Option<String>> {
 
 async fn handle_conn(stream: &mut tokio::net::TcpStream, uds_path: &std::path::Path) -> Result<()> {
     // Read and validate a full TLS ClientHello.
-    let clienthello = read_tls_clienthello(stream).await?;
+    let (bytes, clienthello)= read_tls_clienthello(stream).await?;
     println!("ClientHello len={} bytes", clienthello.len());
     let Some(sni) = extract_sni(&clienthello)? else {
         println!("Failed to extract SNI");
@@ -229,7 +237,7 @@ async fn handle_conn(stream: &mut tokio::net::TcpStream, uds_path: &std::path::P
     let sock = tokio::net::UnixDatagram::unbound().context("create UnixDatagram")?;
     sock.connect(uds_path)
         .with_context(|| format!("connect to {}", uds_path.display()))?;
-    pass_fd_over_uds(stream.as_raw_fd(), &sock, &clienthello)?;
+    pass_fd_over_uds(stream.as_raw_fd(), &sock, &bytes)?;
 
     // Optionally, keep the TCP open for the receiver a short grace period
     // if needed; here we just drop immediately.
