@@ -1250,7 +1250,6 @@ fn op_completion(
 fn mainloop(
     mut ring: io_uring::IoUring,
     timeout: Pin<&io_uring::types::Timespec>,
-    passfd: std::os::unix::net::UnixDatagram,
     passfd_msghdr: &mut libc::msghdr,
     connections: &mut Connections,
     opt: &Opt,
@@ -1860,12 +1859,12 @@ fn main() -> Result<()> {
                         }
                         ring.submit()?; // Or sq.sync?
                         drop(listener);
+                        drop(passfd);
                         info!("Running thread {n}");
                         let mut connections = Connections::new();
                         mainloop(
                             ring,
                             timeout,
-                            passfd,
                             &mut passfd_msghdr,
                             &mut connections,
                             opt,
@@ -1877,6 +1876,7 @@ fn main() -> Result<()> {
             );
         }
         drop(listener);
+        drop(passfd);
         for handle in handles {
             handle.join().expect("foo")?;
         }
