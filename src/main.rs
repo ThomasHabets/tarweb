@@ -1705,6 +1705,7 @@ fn main() -> Result<()> {
                     })?,
             );
         }
+        drop(listener);
         for handle in handles {
             handle.join().expect("foo")?;
         }
