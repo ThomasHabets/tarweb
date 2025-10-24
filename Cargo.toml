@@ -23,7 +23,7 @@ ktls = "6"
 libc = "0.2"
 # memmap2 should be at least 0.9.9 to be 128bit safe.
 memmap2 = "0.9.9"
-nix = { version = "0.29", features = ["feature"]}
+nix = { version = "0.29", features = ["feature", "uio", "socket"] }
 rayon = "1"
 rtsan-standalone = "0.1"
 rustls = { version = "0.23", features = ["prefer-post-quantum"] }
@@ -33,6 +33,7 @@ stderrlog = "0.6"
 tar = "0.4"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread"] }
 zeroize = { version = "1", features = ["simd"] }
 
 [features]
@@ -41,3 +42,7 @@ zeroize = { version = "1", features = ["simd"] }
 
 [profile.release]
 debug = true
+
+[[bin]]
+name = "sni_router"
+path = "src/sni/sni.rs"

@@ -18,6 +18,8 @@
 //
 // ## Other TODOs
 // * Ranged get
+// * The code has no real structure. It's an experiment and I've banged on it
+//   until it worked. Fix that.
 //
 // On my laptop, the best performance is:
 // * --threads=2
@@ -26,10 +28,11 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::{Context, Error, Result};
+use anyhow::{Context, Error, Result, anyhow};
 use arrayvec::ArrayVec;
 use clap::Parser;
 use rtsan_standalone::nonblocking;
@@ -55,6 +58,7 @@ const FULL_SPEED: bool = false;
 // The index for new accepted connections are automatically picked by the
 // kernel, except for our listening socket which is number 0.
 const LISTEN_FIXED_FILE: FixedFile = io_uring::types::Fixed(0);
+const RESERVED_FIXED_SLOTS: usize = 1;
 
 // The maximum number of concurrent connections. This is only set to 100 because
 // ulimit tends to be much lower than that.
@@ -79,6 +83,9 @@ const USER_DATA_LISTENER: u64 = u64::MAX;
 // housekeeping.
 const USER_DATA_TIMEOUT: u64 = USER_DATA_LISTENER - 1;
 
+// Special user data "handle" to indicate passed fd.
+const USER_DATA_PASSED_FD: u64 = USER_DATA_LISTENER - 2;
+
 // This is the op type part of the user data "handle".
 // If more ops are added, add them to make_ops_cancel for !modern path.
 const USER_DATA_OP_MASK: u64 = 0xff_0000_0000;
@@ -87,9 +94,11 @@ const USER_DATA_OP_CLOSE: u64 = 0x2_0000_0000;
 const USER_DATA_OP_READ: u64 = 0x3_0000_0000;
 const USER_DATA_OP_CANCEL: u64 = 0x4_0000_0000;
 const USER_DATA_OP_SETSOCKOPT: u64 = 0x8_0000_0000;
+const USER_DATA_OP_FILES_UPDATE: u64 = 0x10_0000_0000;
+const USER_DATA_OP_CLOSE_RAW: u64 = 0x20_0000_0000;
 // TODO: NOP is an ugly hack to trigger Reading to look for a request. It should
 // just trigger it some other way.
-const USER_DATA_OP_NOP: u64 = 0x10_0000_0000;
+const USER_DATA_OP_NOP: u64 = 0x40_0000_0000;
 
 // Max milliseconds that a connection is allowed to be idle, before we close it.
 const MAX_IDLE: u128 = 5000;
@@ -136,11 +145,19 @@ impl HandshakeData {
     // We have received handshake data from the remote end.
     // send it on to rustls for processing.
     fn received(&mut self, data: &[u8]) -> Result<rustls::IoState, rustls::Error> {
-        debug!("Got some handshaky data: {data:?}");
+        debug!("Got some handshaky data len {}: {data:?}", data.len());
         let mut reader = std::io::Cursor::new(data);
         self.tls.read_tls(&mut reader).unwrap();
         self.tls.process_new_packets()
     }
+}
+
+#[derive(Debug)]
+struct RegisteringData {
+    fd: FixedFile,
+    raw_fd: i32,
+    clienthello: Vec<u8>,
+    tls: rustls::ServerConnection,
 }
 
 // State of a connection.
@@ -149,6 +166,14 @@ impl HandshakeData {
 enum State {
     // This connection is currently not in use.
     Idle,
+
+    // Registering FD as a fixed file.
+    //
+    // This is used when passed a file descriptor over a unix socket. It'll be a
+    // real one, so in this state we are waiting for FilesUpdate to register it
+    // as a FixedFile. After that we'll close the original (real) file
+    // descriptor.
+    Registering(RegisteringData),
 
     // rustls handshaking happening.
     //
@@ -251,6 +276,32 @@ impl Connection {
         self.last_action = std::time::Instant::now();
     }
 
+    /// Init a new connection from fd.
+    ///
+    /// We reuse `Connection` objects between connections, which is why this is
+    /// not just part of `new()`.
+    fn init_fd(
+        &mut self,
+        raw_fd: i32,
+        fd: FixedFile,
+        bytes: Vec<u8>,
+        tls: rustls::ServerConnection,
+        ops: &mut SQueue,
+    ) {
+        debug_assert!(matches![self.state, State::Idle]);
+        self.state = State::Registering(RegisteringData {
+            fd,
+            raw_fd,
+            clienthello: bytes,
+            tls,
+        });
+        let State::Registering(ref reg) = self.state else {
+            unreachable!()
+        };
+        self.last_action = std::time::Instant::now();
+        self.make_op_files_update(&reg.raw_fd, reg.fd, ops);
+    }
+
     /// Put the Connection object back in Idle state.
     fn deinit(&mut self) {
         assert_eq!(self.outstanding, 0);
@@ -279,6 +330,11 @@ impl Connection {
     /// Register that an operation has completed.
     fn io_completed(&mut self) {
         self.last_action = std::time::Instant::now();
+        assert!(
+            self.outstanding > 0,
+            "IO underflow for connection {}",
+            self.id
+        );
         self.outstanding -= 1;
     }
 
@@ -291,9 +347,11 @@ impl Connection {
             State::Reading(fd) => Some(fd),
             State::WritingHeaders(fd, _, _) => Some(fd),
             State::WritingData(fd, _, _) => Some(fd),
+            State::Registering(RegisteringData { fd, .. }) => Some(fd),
             State::Closing => None,
         }
     }
+
     #[must_use]
     fn closing(&self) -> bool {
         matches![self.state, State::Closing]
@@ -415,6 +473,16 @@ impl Connection {
         );
     }
 
+    fn make_op_files_update(&mut self, raw_fd: *const i32, fd: FixedFile, ops: &mut SQueue) {
+        ops.push(
+            io_uring::opcode::FilesUpdate::new(raw_fd, 1)
+                .offset(fd.0 as i32)
+                .build()
+                .user_data((self.id as u64) | USER_DATA_OP_FILES_UPDATE),
+        );
+        self.outstanding += 1;
+    }
+
     fn enable_ktls(&mut self, fd: FixedFile, ops: &mut SQueue, new_state: State) -> Result<()> {
         // Set SOL_TCP/TCP_ULP to "tls", a prereq for enalbing kTLS.
         self.setsockopt_ulp(fd, ops);
@@ -503,6 +571,40 @@ impl Connection {
         );
     }
 
+    /// Initialize the connection with some bytes already having been read from
+    /// the client.
+    ///
+    /// This is used if connections come over a unix socket, where we are passed
+    /// the data and initial TLS bytes (importantly the ClientHello).
+    fn pre_read(
+        &mut self,
+        fixed: FixedFile,
+        tls: rustls::ServerConnection,
+        data: &[u8],
+        ops: &mut SQueue,
+    ) -> Result<()> {
+        let mut d = HandshakeData { fixed, tls };
+        trace!("Giving {} bytes to rustls", data.len());
+        let io = d.received(data)?;
+        let bytes_to_write = io.tls_bytes_to_write();
+        trace!(
+            "Given those {} bytes, rustls needs to send {bytes_to_write} bytes over the wire",
+            data.len()
+        );
+        if bytes_to_write > 0 {
+            let write_buf = [0u8; MAX_WRITE_BUF];
+            let mut cur = std::io::Cursor::new(write_buf);
+            let written = d.tls.write_tls(&mut cur)?;
+            self.write_buf = cur.into_inner();
+            self.state = State::Handshaking(d);
+            self.write(written, ops);
+        } else {
+            self.state = State::Handshaking(d);
+            self.read(ops);
+        }
+        Ok(())
+    }
+
     // Queue up a read.
     fn read(&mut self, ops: &mut SQueue) {
         let read_buf = &mut self.read_buf[self.read_buf_pos..];
@@ -510,7 +612,7 @@ impl Connection {
             State::Reading(fd) => *fd,
             State::Handshaking(data) => data.fixed,
             State::EnablingKtls(fd) => *fd,
-            _ => panic!("read in wrong state"),
+            s => panic!("read in wrong state {s:?}"),
         };
         // Try RecvMulti/RecvMsgMulti/RecvMultiBundle?
         self.outstanding += 1;
@@ -577,6 +679,54 @@ impl PoolTracker {
     fn dealloc(&mut self, n: usize) {
         self.free.push(n);
     }
+    #[must_use]
+    fn free(&self) -> usize {
+        self.free.len()
+    }
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        self.free() == 0
+    }
+}
+
+/// Given a `msghdr`, extract both the file descriptor and the payload data.
+///
+/// The payload data contains the clienthello (and possibly more bytes, but we
+/// just send them on to rustls).
+fn receive_passed_connection(
+    passfd_msghdr: &libc::msghdr,
+    nbytes: usize,
+) -> Result<(libc::c_int, Vec<u8>)> {
+    assert_eq!(passfd_msghdr.msg_iovlen, 1);
+    let iov = passfd_msghdr.msg_iov;
+    let clienthello: &[u8] =
+        unsafe { std::slice::from_raw_parts((*iov).iov_base as *const u8, nbytes) };
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(passfd_msghdr as *const libc::msghdr) };
+    while !cmsg.is_null() {
+        // trace!("Control message!");
+        let level = unsafe { (*cmsg).cmsg_level };
+        let typ = unsafe { (*cmsg).cmsg_type };
+        if (level, typ) != (libc::SOL_SOCKET, libc::SCM_RIGHTS) {
+            cmsg = unsafe { libc::CMSG_NXTHDR(passfd_msghdr as *const libc::msghdr, cmsg) };
+            continue;
+        }
+        // trace!("Control message: file descriptor!");
+        let data = unsafe {
+            let data_ptr = libc::CMSG_DATA(cmsg) as *const u8;
+            let cmsg_len = (*cmsg).cmsg_len as usize;
+            let header_size = std::mem::size_of::<libc::cmsghdr>();
+            let data_len = cmsg_len.saturating_sub(header_size);
+            if data_len == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(data_ptr, data_len)
+            }
+        };
+        assert_eq!(data.len(), std::mem::size_of::<libc::c_int>());
+        let fd = libc::c_int::from_ne_bytes(data.try_into().unwrap());
+        return Ok((fd, clienthello.to_vec()));
+    }
+    Err(anyhow!("Failed to extract file descriptor from passfd"))
 }
 
 #[must_use]
@@ -584,6 +734,13 @@ fn make_op_close(fd: FixedFile, con_id: usize) -> io_uring::squeue::Entry {
     io_uring::opcode::Close::new(fd)
         .build()
         .user_data((con_id as u64) | USER_DATA_OP_CLOSE)
+}
+
+#[must_use]
+fn make_op_close_raw(fd: i32, con_id: usize) -> io_uring::squeue::Entry {
+    io_uring::opcode::Close::new(io_uring::types::Fd(fd))
+        .build()
+        .user_data((con_id as u64) | USER_DATA_OP_CLOSE_RAW)
 }
 
 #[must_use]
@@ -636,8 +793,10 @@ enum UserDataOp {
     Write,
     Read,
     Close,
+    CloseRaw,
     Cancel,
     SetSockOpt,
+    FilesUpdate,
     Nop,
 }
 
@@ -766,6 +925,8 @@ fn decode_user_data(user_data: u64, result: i32, cons: &mut Connections) -> Hook
         USER_DATA_OP_CLOSE => UserDataOp::Close,
         USER_DATA_OP_CANCEL => UserDataOp::Cancel,
         USER_DATA_OP_SETSOCKOPT => UserDataOp::SetSockOpt,
+        USER_DATA_OP_FILES_UPDATE => UserDataOp::FilesUpdate,
+        USER_DATA_OP_CLOSE_RAW => UserDataOp::CloseRaw,
         USER_DATA_OP_NOP => UserDataOp::Nop,
         _ => panic!("Invalid op {user_data:x} result {result}"),
     };
@@ -934,6 +1095,10 @@ fn handle_connection(
             assert_eq!(hook.result, 0);
             panic!("Nothing here, right?)");
         }
+        UserDataOp::FilesUpdate => {
+            assert!(hook.result >= 0, "FilesUpdate returned {}", hook.result);
+            trace!("FilesUpdate done returning {}", hook.result);
+        }
         UserDataOp::Cancel => {
             if hook.result != 0 {
                 debug!(
@@ -942,6 +1107,9 @@ fn handle_connection(
                     std::io::Error::from_raw_os_error(hook.result.abs())
                 );
             }
+        }
+        UserDataOp::CloseRaw => {
+            assert_eq!(hook.result, 0);
         }
     }
     Ok(())
@@ -972,6 +1140,14 @@ fn make_op_timeout(ts: Pin<&io_uring::types::Timespec>) -> io_uring::squeue::Ent
         .build()
         .user_data(USER_DATA_TIMEOUT)
 }
+
+#[must_use]
+fn make_op_recvmsg_fixed(hdr: *mut libc::msghdr) -> io_uring::squeue::Entry {
+    io_uring::opcode::RecvMsg::new(LISTEN_FIXED_FILE, hdr)
+        .build()
+        .user_data(USER_DATA_PASSED_FD)
+}
+
 fn load_certs<P: AsRef<std::path::Path>>(
     filename: P,
 ) -> std::io::Result<Vec<CertificateDer<'static>>> {
@@ -999,7 +1175,7 @@ fn op_completion(
     debug!("Op completed: {data:?}");
     data.con.io_completed();
 
-    trace!("Read buf pos: {}", data.con.read_buf_pos);
+    //trace!("Read buf pos: {}", data.con.read_buf_pos);
     match &mut data.con.state {
         State::Idle => panic!("Can't happen: op {data:?} on Idle connection"),
         State::Closing => {}
@@ -1130,8 +1306,41 @@ fn op_completion(
                     data.con.enable_ktls(fd, ops, State::EnablingKtls(fd))?;
                     return Ok(());
                 }
+                UserDataOp::CloseRaw => {
+                    assert_eq!(
+                        data.result, 0,
+                        "close() passed real fd failed with code {}",
+                        data.result
+                    );
+                    trace!("CloseRaw completed");
+                }
                 op => panic!("bad op in Handshaking: {op:?}"),
             }
+        }
+        State::Registering(_) => {
+            let State::Registering(RegisteringData {
+                raw_fd,
+                fd,
+                tls,
+                clienthello,
+                ..
+            }) = std::mem::replace(&mut data.con.state, State::Idle)
+            else {
+                unreachable!();
+            };
+            trace!("Fixed file FilesUpdate registration finished");
+            assert_eq!(data.op, UserDataOp::FilesUpdate);
+            assert_eq!(
+                data.result,
+                1,
+                "FilesUpdate failed returning {}, which is system error {}",
+                data.result,
+                std::io::Error::from_raw_os_error(data.result.abs())
+            );
+            ops.push(make_op_close_raw(raw_fd, data.con.id));
+            data.con.outstanding += 1;
+            data.con.pre_read(fd, tls, &clienthello, ops)?;
+            trace!("Now in state {:?}", data.con.state);
         }
     }
 
@@ -1154,6 +1363,7 @@ fn op_completion(
 fn mainloop(
     mut ring: io_uring::IoUring,
     timeout: Pin<&io_uring::types::Timespec>,
+    passfd_msghdr: &mut libc::msghdr,
     connections: &mut Connections,
     opt: &Opt,
     archive: &Archive,
@@ -1215,7 +1425,7 @@ fn mainloop(
                 USER_DATA_LISTENER => {
                     if opt.accept_multi {
                         assert!(io_uring::cqueue::more(cqe.flags()));
-                    } else {
+                    } else if pooltracker.free() > 1 {
                         ops.push(make_op_accept(opt.accept_multi));
                     }
                     if result < 0 {
@@ -1228,7 +1438,7 @@ fn mainloop(
                     let fixed = io_uring::types::Fixed(result as u32);
                     // set_nodelay(result);
                     let id = pooltracker.alloc().unwrap();
-                    debug!("Allocated {id} result {result}");
+                    debug!("Allocated connection {id} when accept()={result}");
                     let new_conn = connections.get(id);
                     let tls = rustls::ServerConnection::new(config.clone())?;
                     new_conn.init(fixed, tls);
@@ -1245,15 +1455,64 @@ fn mainloop(
                     trace!("Timeout: Syscalls: {syscalls}");
                     syscalls = 0;
                 }
+                USER_DATA_PASSED_FD => {
+                    trace!("Incoming passfd message with code {result}");
+                    if pooltracker.free() > 1 {
+                        // Issue a new receive.
+                        ops.push(make_op_recvmsg_fixed(passfd_msghdr as *mut libc::msghdr));
+                    }
+                    if result == 0 {
+                        warn!("Received empty passed fd");
+                    } else if result > 0 {
+                        match receive_passed_connection(passfd_msghdr, result as usize) {
+                            Ok((fd, clienthello)) => {
+                                trace!(
+                                    "Passfd extracted: fd={fd} clienthello {} bytes",
+                                    clienthello.len()
+                                );
+                                let id = pooltracker.alloc().unwrap();
+                                let fixed =
+                                    io_uring::types::Fixed((RESERVED_FIXED_SLOTS + id) as u32);
+                                debug!("Allocated {id} with passfd");
+                                let new_conn = connections.get(id);
+                                new_conn.init_fd(
+                                    fd,
+                                    fixed,
+                                    clienthello.to_vec(),
+                                    rustls::ServerConnection::new(config.clone())?,
+                                    &mut ops,
+                                );
+                            }
+                            Err(e) => error!("Receiving passed connection: {e}"),
+                        }
+                    } else {
+                        error!(
+                            "recvmsg() error on passed fd, error {}",
+                            std::io::Error::from_raw_os_error(result.abs())
+                        );
+                    }
+                }
                 _ => {
                     let mut data = decode_user_data(user_data, result, connections);
                     let span = tracing::info_span!("conn", id = data.con.id);
                     let _guard = span.enter();
+                    let was_full = pooltracker.is_empty();
                     if let Err(e) =
                         op_completion(&mut data, &mut ops, opt, &mut pooltracker, archive)
                     {
                         warn!("Op error: {e:?}");
                         data.con.close(opt.async_cancel2, &mut ops);
+                    }
+                    if was_full && !pooltracker.is_empty() {
+                        if opt.listen.is_some() {
+                            // TODO: no good way to prevent overflow with multi
+                            // accept.
+                            if !opt.accept_multi {
+                                ops.push(make_op_accept(opt.accept_multi));
+                            }
+                        } else {
+                            ops.push(make_op_recvmsg_fixed(passfd_msghdr as *mut libc::msghdr));
+                        }
                     }
                 }
             }
@@ -1332,8 +1591,12 @@ struct Opt {
     #[arg(long, default_value_t = false, value_parser = parse_bool, help = "Enable AcceptMulti.")]
     accept_multi: std::primitive::bool,
 
-    #[arg(long, short, default_value = "[::]:8080", help = "Listen address.")]
-    listen: String,
+    #[arg(long, short, help = "Listen address.")]
+    listen: Option<String>,
+
+    /// Get passed file descriptors on a unix socket.
+    #[arg(long)]
+    passfd: Option<std::path::PathBuf>,
 
     #[arg(long, default_value = "", help = "Strip prefix before looking in tar")]
     prefix: String,
@@ -1518,8 +1781,6 @@ struct ArchiveEntry {
 }
 
 fn is_setsockopt_supported() -> Result<bool> {
-    use std::os::fd::AsRawFd;
-
     // Set up a TCP connection.
     let listener = std::net::TcpListener::bind("[::1]:0")?;
     let addr = listener.local_addr()?;
@@ -1560,7 +1821,6 @@ fn is_setsockopt_supported() -> Result<bool> {
 }
 
 fn is_ktls_loaded() -> Result<bool> {
-    use std::os::fd::AsRawFd;
     // Step 1: Bind a local listener to a free port
     let listener = std::net::TcpListener::bind("[::1]:0")?;
     let addr = listener.local_addr()?;
@@ -1601,7 +1861,7 @@ fn is_ktls_loaded() -> Result<bool> {
 fn main() -> Result<()> {
     let opt = Opt::parse();
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(&opt.verbose))
+        .with_env_filter(format!("tarweb={}", opt.verbose))
         .with_writer(std::io::stderr)
         .init();
     trace!("AsyncCancel2: {}", opt.async_cancel2);
@@ -1632,19 +1892,39 @@ fn main() -> Result<()> {
             .with_context(|| format!("Memory mapping file {:?}.", opt.tarfile.display()))?
     };
 
-    let listener = std::net::TcpListener::bind(&opt.listen)
-        .with_context(|| format!("Binding to {}", opt.listen))?;
-    // The Rust API doesn't allow it, but setting TCP_NODELAY on a listening socket seems to set
-    // that option on all incoming connections, which is what we want.
-    {
-        use std::os::fd::AsRawFd;
-        set_nodelay(listener.as_raw_fd())?;
+    if opt.listen.is_some() && opt.passfd.is_some() {
+        return Err(anyhow!(
+            "Can't use both -listen and --passfd at the same time."
+        ));
     }
+
+    let listener = opt
+        .listen
+        .as_ref()
+        .map(|l| {
+            let listen =
+                std::net::TcpListener::bind(l).with_context(|| format!("Binding to {l}"))?;
+            // The Rust API doesn't allow it, but setting TCP_NODELAY on a listening socket seems to set
+            // that option on all incoming connections, which is what we want.
+            set_nodelay(listen.as_raw_fd())?;
+            Ok::<_, Error>(listen)
+        })
+        .transpose()?;
+
+    let passer = opt
+        .passfd
+        .as_ref()
+        .map(|pass| {
+            let _ = std::fs::remove_file(pass);
+            std::os::unix::net::UnixDatagram::bind(pass).context("binding passfd")
+        })
+        .transpose()?;
 
     std::thread::scope(|s| -> Result<()> {
         let mut handles = Vec::new();
         for n in 0..opt.threads {
-            let listener = listener.try_clone()?;
+            let listener = listener.as_ref().map(|l| l.try_clone()).transpose()?;
+            let passer = passer.as_ref().map(|p| p.try_clone()).transpose()?;
             let opt = &opt;
             let archive = &archive;
             handles.push(
@@ -1673,10 +1953,43 @@ fn main() -> Result<()> {
                         // Needs a wrapping struct that is not Unpin, apparently.
                         let timeout = opt.periodic_wakeup.into();
                         let timeout = Pin::new(&timeout);
-                        let init_ops = [make_op_accept(opt.accept_multi), make_op_timeout(timeout)];
-                        use std::os::fd::AsRawFd;
+
+                        let mut cmsgspace = vec![0u8; 128];
+                        trace!("Configured cmsg space: {}", cmsgspace.len());
+                        let mut iov_space = [0u8; 2048];
+                        let mut iov = libc::iovec {
+                            iov_len: iov_space.len(),
+                            iov_base: iov_space.as_mut_ptr() as *mut libc::c_void,
+                        };
+                        let mut passfd_msghdr = libc::msghdr {
+                            msg_name: std::ptr::null_mut(),
+                            msg_namelen: 0,
+                            msg_iov: &mut iov as *mut libc::iovec,
+                            msg_iovlen: 1,
+                            msg_control: cmsgspace.as_mut_ptr() as *mut libc::c_void,
+                            msg_controllen: cmsgspace.len(),
+                            msg_flags: 0,
+                        };
+                        let init_ops = {
+                            let mut ops = Vec::new();
+                            if listener.is_some() {
+                                ops.push(make_op_accept(opt.accept_multi));
+                            }
+                            ops.push(make_op_timeout(timeout));
+                            if passer.is_some() {
+                                ops.push(make_op_recvmsg_fixed(
+                                    &mut passfd_msghdr as *mut libc::msghdr,
+                                ));
+                            }
+                            ops
+                        };
                         let mut registered = vec![-1i32; MAX_CONNECTIONS];
-                        registered[0] = listener.as_raw_fd();
+                        if let Some(ref l) = listener {
+                            registered[LISTEN_FIXED_FILE.0 as usize] = l.as_raw_fd();
+                        }
+                        if let Some(ref p) = passer {
+                            registered[LISTEN_FIXED_FILE.0 as usize] = p.as_raw_fd();
+                        }
                         ring.submitter().register_files(&registered)?;
                         unsafe {
                             for op in init_ops {
@@ -1687,15 +2000,24 @@ fn main() -> Result<()> {
                         }
                         ring.submit()?; // Or sq.sync?
                         drop(listener);
+                        drop(passer);
                         info!("Running thread {n}");
                         let mut connections = Connections::new();
-                        mainloop(ring, timeout, &mut connections, opt, archive)?;
+                        mainloop(
+                            ring,
+                            timeout,
+                            &mut passfd_msghdr,
+                            &mut connections,
+                            opt,
+                            archive,
+                        )?;
                         info!("Exiting thread {n}");
                         Ok(())
                     })?,
             );
         }
         drop(listener);
+        drop(passer);
         for handle in handles {
             handle.join().expect("foo")?;
         }
