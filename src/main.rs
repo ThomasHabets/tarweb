@@ -1271,7 +1271,14 @@ fn mainloop(
                     syscalls = 0;
                 }
                 USER_DATA_PASSED_FD => {
-                    println!("PASSFD {result}");
+                    println!("PASSFD {result} {}", passfd_msghdr.msg_iovlen);
+                    let mut cmsg =
+                        unsafe { libc::CMSG_FIRSTHDR(passfd_msghdr as *const libc::msghdr) };
+                    while !cmsg.is_null() {
+                        println!("Control message!");
+                        cmsg =
+                            unsafe { libc::CMSG_NXTHDR(passfd_msghdr as *mut libc::msghdr, cmsg) };
+                    }
                     ops.push(make_op_recvmsg(
                         passfd.as_raw_fd(),
                         passfd_msghdr as *mut libc::msghdr,
@@ -1714,7 +1721,9 @@ fn main() -> Result<()> {
                         let timeout = opt.periodic_wakeup.into();
                         let timeout = Pin::new(&timeout);
 
-                        let mut cmsgspace = nix::cmsg_space!([std::os::fd::RawFd; 1]);
+                        //let mut cmsgspace = nix::cmsg_space!([std::os::fd::RawFd; 1]);
+                        let mut cmsgspace = vec![0u8; 128];
+                        println!("Msg space: {}", cmsgspace.len());
                         let mut iov_space = [0u8; 1024];
                         let mut iov = libc::iovec {
                             iov_len: iov_space.len(),
