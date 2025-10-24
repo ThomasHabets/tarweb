@@ -1696,6 +1696,7 @@ fn main() -> Result<()> {
                             }
                         }
                         ring.submit()?; // Or sq.sync?
+                        drop(listener);
                         info!("Running thread {n}");
                         let mut connections = Connections::new();
                         mainloop(ring, timeout, &mut connections, opt, archive)?;
