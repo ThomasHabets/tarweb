@@ -1279,8 +1279,7 @@ fn mainloop(
                         cmsg =
                             unsafe { libc::CMSG_NXTHDR(passfd_msghdr as *mut libc::msghdr, cmsg) };
                     }
-                    ops.push(make_op_recvmsg(
-                        passfd.as_raw_fd(),
+                    ops.push(make_op_recvmsg_fixed(
                         passfd_msghdr as *mut libc::msghdr,
                     ));
                 }
@@ -1741,15 +1740,11 @@ fn main() -> Result<()> {
                         let init_ops = [
                             make_op_accept(opt.accept_multi),
                             make_op_timeout(timeout),
-                            //make_op_recvmsg(passfd, unsafe {&mut passfd_msghdr as *mut libc::msghdr}),
-                            make_op_recvmsg(
-                                passfd.as_raw_fd(),
-                                &mut passfd_msghdr as *mut libc::msghdr,
-                            ),
+                            make_op_recvmsg_fixed(&mut passfd_msghdr as *mut libc::msghdr),
                         ];
                         let mut registered = vec![-1i32; MAX_CONNECTIONS];
                         registered[0] = listener.as_raw_fd();
-                        //registered[LISTEN_PASS_FIXED_FILE.0 as usize] = passfd.as_raw_fd();
+                        registered[LISTEN_PASS_FIXED_FILE.0 as usize] = passfd.as_raw_fd();
                         ring.submitter().register_files(&registered)?;
                         unsafe {
                             for op in init_ops {
