@@ -58,12 +58,6 @@ const FULL_SPEED: bool = false;
 const LISTEN_FIXED_FILE: FixedFile = io_uring::types::Fixed(0);
 const RESERVED_FIXED_SLOTS: usize = 1;
 
-// The maximum number of concurrent connections. This is only set to 100 because
-// ulimit tends to be much lower than that.
-//
-// TODO: turn this into a flag.
-const MAX_CONNECTIONS: usize = 100;
-
 // 10MiB stack size per thread.
 //
 // There's only one thread per core, so not really anything to optimize.
@@ -627,7 +621,7 @@ impl Connection {
 }
 
 struct Connections {
-    // Always size MAX_CONNECTIONS.
+    // Allocated at start to be exactly the max number of connections.
     //
     // I'd like for this to be an array, but it can't be constructed directly on
     // the heap. https://github.com/rust-lang/rust/issues/53827
@@ -639,9 +633,9 @@ struct Connections {
 
 impl Connections {
     #[must_use]
-    fn new() -> Self {
+    fn new(n: usize) -> Self {
         Self {
-            cons: (0..MAX_CONNECTIONS).map(Connection::new).collect(),
+            cons: (0..n).map(Connection::new).collect(),
         }
     }
     #[must_use]
@@ -657,9 +651,9 @@ struct PoolTracker {
 
 impl PoolTracker {
     #[must_use]
-    fn new() -> Self {
+    fn new(n: usize) -> Self {
         Self {
-            free: (0..MAX_CONNECTIONS).rev().collect(),
+            free: (0..n).rev().collect(),
         }
     }
     #[must_use]
@@ -1359,7 +1353,7 @@ fn mainloop(
     archive: &Archive,
 ) -> Result<()> {
     info!("Thread main");
-    let mut pooltracker = PoolTracker::new();
+    let mut pooltracker = PoolTracker::new(opt.max_connections);
     let mut ops: SQueue = ArrayVec::new();
     let mut last_submit = std::time::Instant::now();
     let mut syscalls = 0;
@@ -1560,6 +1554,10 @@ struct Opt {
     /// Enable etags (requires indexing at startup).
     #[arg(long)]
     etags: bool,
+
+    /// Max concurrent connections.
+    #[arg(long, default_value_t = 100)]
+    max_connections: usize,
 
     #[arg(long, help = "Enable CPU affinity 1:1 for threads")]
     cpu_affinity: bool,
@@ -1832,7 +1830,7 @@ fn main() -> Result<()> {
                             }
                             ops
                         };
-                        let mut registered = vec![-1i32; MAX_CONNECTIONS];
+                        let mut registered = vec![-1i32; opt.max_connections];
                         if let Some(ref l) = listener {
                             registered[LISTEN_FIXED_FILE.0 as usize] = l.as_raw_fd();
                         }
@@ -1851,7 +1849,7 @@ fn main() -> Result<()> {
                         drop(listener);
                         drop(passer);
                         info!("Running thread {n}");
-                        let mut connections = Connections::new();
+                        let mut connections = Connections::new(opt.max_connections);
                         mainloop(
                             ring,
                             timeout,
