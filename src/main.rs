@@ -441,22 +441,11 @@ impl Connection {
         }
     }
 
-    /// Get the FixedFile fd from places that *must* be able to get it.
-    #[must_use]
-    fn must_get_fd(&self) -> FixedFile {
-        (match &self.state {
-            State::Reading(fd) => *fd,
-            State::Handshaking(data) => data.fixed,
-            State::EnablingKtls(fd) => *fd,
-            s => panic!("get fd in wrong state {s:?}"),
-        }) as _
-    }
-
     fn write(&mut self, n: usize, ops: &mut SQueue) {
         let data = &self.write_buf[..n];
         self.outstanding += 1;
         ops.push(
-            io_uring::opcode::Write::new(self.must_get_fd(), data.as_ptr(), data.len() as _)
+            io_uring::opcode::Write::new(self.fd().unwrap(), data.as_ptr(), data.len() as _)
                 .build()
                 .user_data((self.id as u64) | USER_DATA_OP_WRITE),
         );
