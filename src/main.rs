@@ -1377,7 +1377,7 @@ fn mainloop(
                     let fixed = io_uring::types::Fixed(result as u32);
                     // set_nodelay(result);
                     let id = pooltracker.alloc().unwrap();
-                    debug!("Allocated {id} result {result}");
+                    debug!("Allocated connection {id} when accept()={result}");
                     let new_conn = connections.get(id);
                     let tls = rustls::ServerConnection::new(config.clone())?;
                     new_conn.init(fixed, tls);
@@ -1884,7 +1884,7 @@ fn main() -> Result<()> {
                         //let mut cmsgspace = nix::cmsg_space!([std::os::fd::RawFd; 1]);
                         let mut cmsgspace = vec![0u8; 128];
                         trace!("Msg space: {}", cmsgspace.len());
-                        let mut iov_space = [0u8; 1024];
+                        let mut iov_space = [0u8; 2048];
                         let mut iov = libc::iovec {
                             iov_len: iov_space.len(),
                             iov_base: iov_space.as_mut_ptr() as *mut libc::c_void,
