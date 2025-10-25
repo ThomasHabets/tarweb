@@ -132,7 +132,7 @@ impl HandshakeData {
     // We have received handshake data from the remote end.
     // send it on to rustls for processing.
     fn received(&mut self, data: &[u8]) -> Result<rustls::IoState, rustls::Error> {
-        debug!("Got some handshaky data len {}: {data:?}", data.len());
+        debug!("Got {} bytes of handshake data", data.len());
         let mut reader = std::io::Cursor::new(data);
         self.tls.read_tls(&mut reader).unwrap();
         self.tls.process_new_packets()
@@ -807,12 +807,10 @@ impl std::fmt::Debug for Hook<'_> {
         };
         write!(
             f,
-            "Op={op:?} result={result}{strerror} fixed={fd} raw={raw:x} Con={id} ({state:?})",
+            "Op={op:?} result={result}{strerror} fixed={fd} raw={raw:x}",
             raw = self.raw,
             op = self.op,
             result = self.result,
-            id = self.con.id,
-            state = self.con.state,
             fd = self
                 .con
                 .fd()
