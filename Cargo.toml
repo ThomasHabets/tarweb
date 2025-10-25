@@ -21,7 +21,6 @@ io-uring = "0.7"
 # Need at least 6.0.2 for public CryptoInfo.as_ptr().
 ktls = "6"
 libc = "0.2"
-log = "0.4"
 # memmap2 should be at least 0.9.9 to be 128bit safe.
 memmap2 = "0.9.9"
 nix = { version = "0.29", features = ["feature"]}
@@ -32,6 +31,8 @@ rustls-pemfile = "2"
 sha3 = "0.10"
 stderrlog = "0.6"
 tar = "0.4"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 zeroize = { version = "1", features = ["simd"] }
 
 [features]

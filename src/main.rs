@@ -32,8 +32,8 @@ use std::sync::Arc;
 use anyhow::{Context, Error, Result};
 use arrayvec::ArrayVec;
 use clap::Parser;
-use log::{debug, error, info, trace, warn};
 use rtsan_standalone::nonblocking;
+use tracing::{debug, error, info, trace, warn};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -877,12 +877,6 @@ fn handle_connection(
     modern: bool,
     ops: &mut SQueue,
 ) -> Result<()> {
-    {
-        if hook.con.fd().is_none() {
-            debug!("got an operation on a nonexisting fd (happens during close)");
-            return Ok(());
-        };
-    }
     let is_nop = matches![hook.op, UserDataOp::Nop];
     match hook.op {
         UserDataOp::SetSockOpt => {
@@ -1141,14 +1135,17 @@ fn op_completion(
         }
     }
 
-    if let Err(e) = handle_connection(data, archive, opt.async_cancel2, ops) {
+    if data.con.fd().is_none() {
+        debug!("Operation completed on a nonexisting fd (happens during close): {data:?}");
+        return Ok(());
+    } else if let Err(e) = handle_connection(data, archive, opt.async_cancel2, ops) {
         info!("Error handling connection: {e:?}");
         data.con.close(opt.async_cancel2, ops);
     }
     if data.con.closing() && data.con.outstanding == 0 {
         data.con.deinit();
         pooltracker.dealloc(data.con.id);
-        debug!("Deallocated {}", data.con.id);
+        debug!("Deallocated");
     }
     Ok(())
 }
@@ -1250,6 +1247,8 @@ fn mainloop(
                 }
                 _ => {
                     let mut data = decode_user_data(user_data, result, connections);
+                    let span = tracing::info_span!("conn", id = data.con.id);
+                    let _guard = span.enter();
                     if let Err(e) =
                         op_completion(&mut data, &mut ops, opt, &mut pooltracker, archive)
                     {
@@ -1601,19 +1600,10 @@ fn is_ktls_loaded() -> Result<bool> {
 
 fn main() -> Result<()> {
     let opt = Opt::parse();
-    use std::str::FromStr;
-    stderrlog::new()
-        .module(module_path!())
-        .module("rtweb")
-        .quiet(false)
-        .verbosity(
-            log::LevelFilter::from_str(&opt.verbose)
-                .map_err(|_| Error::msg(format!("Invalid verbosity string {:?}", opt.verbose)))?
-                as usize
-                - 1,
-        )
-        .timestamp(stderrlog::Timestamp::Millisecond)
-        .init()?;
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(&opt.verbose))
+        .with_writer(std::io::stderr)
+        .init();
     trace!("AsyncCancel2: {}", opt.async_cancel2);
     trace!("Ring size: {}", opt.ring_size);
     trace!("Single issuer: {}", opt.single_issuer);
