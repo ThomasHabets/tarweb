@@ -288,8 +288,11 @@ impl Connection {
             clienthello: bytes,
             tls,
         });
+        let State::Registering(ref reg) = self.state else {
+            unreachable!()
+        };
         self.last_action = std::time::Instant::now();
-        self.make_op_files_update(ops);
+        self.make_op_files_update(&reg.raw_fd, reg.fd, ops);
     }
 
     /// Put the Connection object back in Idle state.
@@ -463,12 +466,9 @@ impl Connection {
         );
     }
 
-    fn make_op_files_update(&mut self, ops: &mut SQueue) {
-        let State::Registering(RegisteringData { raw_fd, fd, .. }) = self.state else {
-            panic!();
-        };
+    fn make_op_files_update(&mut self, raw_fd: *const i32, fd: FixedFile, ops: &mut SQueue) {
         ops.push(
-            io_uring::opcode::FilesUpdate::new(&raw_fd as *const i32, 1)
+            io_uring::opcode::FilesUpdate::new(raw_fd, 1)
                 .offset(fd.0 as i32)
                 .build()
                 .user_data((self.id as u64) | USER_DATA_OP_FILES_UPDATE),
