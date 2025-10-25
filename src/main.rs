@@ -44,10 +44,6 @@ use archive::Archive;
 
 type FixedFile = io_uring::types::Fixed;
 
-// Enable etags for caching. Slows down startup, since we need to hash all
-// files.
-pub const ENABLE_ETAGS: bool = true;
-
 // Cache max age.
 const CACHE_AGE_SECS: u64 = 300;
 
@@ -1561,6 +1557,10 @@ struct Opt {
     )]
     hugepages: Option<u8>,
 
+    /// Enable etags (requires indexing at startup).
+    #[arg(long)]
+    etags: bool,
+
     #[arg(long, help = "Enable CPU affinity 1:1 for threads")]
     cpu_affinity: bool,
 
@@ -1733,15 +1733,11 @@ fn main() -> Result<()> {
         ));
     }
 
-    let archive = if let Some(hugepages) = opt.hugepages {
-        Archive::hugepages(&opt.tarfile, &opt.prefix, hugepages).with_context(|| {
-            format!(
-                "Mapping file {:?} with {hugepages} hugepages bits.",
-                opt.tarfile.display()
-            )
-        })?
-    } else {
-        Archive::new(&opt.tarfile, &opt.prefix)
+    let archive = {
+        Archive::builder()
+            .etags(opt.etags)
+            .hugepages(opt.hugepages)
+            .build(&opt.tarfile, &opt.prefix)
             .with_context(|| format!("Memory mapping file {:?}.", opt.tarfile.display()))?
     };
 

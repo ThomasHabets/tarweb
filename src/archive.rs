@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::io::Read;
 
-use crate::ENABLE_ETAGS;
 use anyhow::{Context, Result};
 use tracing::{info, trace};
 
@@ -19,24 +18,48 @@ pub struct Archive {
     content: HashMap<String, ArchiveEntry>,
 }
 
+/// Builder for Archive.
+pub struct ArchiveBuilder {
+    hugepages: Option<u8>,
+    etags: bool,
+}
+
+impl ArchiveBuilder {
+    pub fn build<P: AsRef<std::path::Path>>(&self, filename: P, prefix: &str) -> Result<Archive> {
+        if let Some(bits) = self.hugepages {
+            Archive::hugepages(filename.as_ref(), prefix, self.etags, bits)
+        } else {
+            Archive::new(filename.as_ref(), prefix, self.etags)
+        }
+    }
+    pub fn etags(&mut self, v: bool) -> &mut Self {
+        self.etags = v;
+        self
+    }
+    pub fn hugepages(&mut self, v: Option<u8>) -> &mut Self {
+        self.hugepages = v;
+        self
+    }
+}
+
 impl Archive {
-    /// Map and index an archive.
-    pub fn new<P: AsRef<std::path::Path>>(filename: P, prefix: &str) -> Result<Self> {
+    pub fn builder() -> ArchiveBuilder {
+        ArchiveBuilder {
+            hugepages: None,
+            etags: false,
+        }
+    }
+
+    fn new(filename: &std::path::Path, prefix: &str, etags: bool) -> Result<Self> {
         let file = std::fs::File::open(filename)?;
         let map = unsafe { memmap2::Mmap::map(&file)? };
         // Can't hurt to at least ask to be hugepages or mergable.
         map.advise(memmap2::Advice::HugePage)?;
-        Self::new_inner(map, file, prefix)
+        Self::new_inner(map, file, prefix, etags)
     }
 
     /// Map and index an archive with hugepages.
-    ///
-    /// TODO: use builder pattern.
-    pub fn hugepages<P: AsRef<std::path::Path>>(
-        filename: P,
-        prefix: &str,
-        bits: u8,
-    ) -> Result<Self> {
+    fn hugepages(filename: &std::path::Path, prefix: &str, etags: bool, bits: u8) -> Result<Self> {
         use std::io::Seek;
 
         let mut file = std::fs::File::open(filename)?;
@@ -53,11 +76,16 @@ impl Archive {
         // Rewind the file.
         file.read_exact(&mut m.as_mut()[..len.try_into()?])?;
         file.seek(std::io::SeekFrom::Start(0))?;
-        Self::new_inner(m.make_read_only()?, file, prefix)
+        Self::new_inner(m.make_read_only()?, file, prefix, etags)
     }
 
     /// Shared constructor code.
-    fn new_inner(mmap: memmap2::Mmap, file: std::fs::File, prefix: &str) -> Result<Self> {
+    fn new_inner(
+        mmap: memmap2::Mmap,
+        file: std::fs::File,
+        prefix: &str,
+        etags: bool,
+    ) -> Result<Self> {
         mmap.advise(memmap2::Advice::Mergeable)?;
         let mut archive = tar::Archive::new(&file);
         let mut content = HashMap::new();
@@ -90,7 +118,7 @@ impl Archive {
                 },
             );
         }
-        if ENABLE_ETAGS {
+        if etags {
             info!("Hashing etags…");
             use rayon::iter::IntoParallelRefMutIterator;
             use rayon::iter::ParallelIterator;
