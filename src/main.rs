@@ -96,7 +96,7 @@ const USER_DATA_OP_FILES_UPDATE: u64 = 0x10_0000_0000;
 const USER_DATA_OP_CLOSE_RAW: u64 = 0x20_0000_0000;
 // TODO: NOP is an ugly hack to trigger Reading to look for a request. It should
 // just trigger it some other way.
-const USER_DATA_OP_NOP: u64 = 0x10_0000_0000;
+const USER_DATA_OP_NOP: u64 = 0x40_0000_0000;
 
 // Max milliseconds that a connection is allowed to be idle, before we close it.
 const MAX_IDLE: u128 = 5000;
@@ -568,7 +568,7 @@ impl Connection {
     fn pre_read(
         &mut self,
         fixed: FixedFile,
-        mut tls: rustls::ServerConnection,
+        tls: rustls::ServerConnection,
         data: &[u8],
         ops: &mut SQueue,
     ) -> Result<()> {
@@ -675,10 +675,10 @@ fn make_op_close(fd: FixedFile, con_id: usize) -> io_uring::squeue::Entry {
 }
 
 #[must_use]
-fn make_op_close_raw(fd: i32) -> io_uring::squeue::Entry {
+fn make_op_close_raw(fd: i32, con_id: usize) -> io_uring::squeue::Entry {
     io_uring::opcode::Close::new(io_uring::types::Fd(fd))
         .build()
-        .user_data(USER_DATA_OP_CLOSE_RAW)
+        .user_data((con_id as u64) | USER_DATA_OP_CLOSE_RAW)
 }
 
 #[must_use]
@@ -1089,13 +1089,6 @@ fn make_op_timeout(ts: Pin<&io_uring::types::Timespec>) -> io_uring::squeue::Ent
 }
 
 #[must_use]
-fn make_op_recvmsg(fd: i32, hdr: *mut libc::msghdr) -> io_uring::squeue::Entry {
-    io_uring::opcode::RecvMsg::new(io_uring::types::Fd(fd), hdr)
-        .build()
-        .user_data(USER_DATA_PASSED_FD)
-}
-
-#[must_use]
 fn make_op_recvmsg_fixed(hdr: *mut libc::msghdr) -> io_uring::squeue::Entry {
     io_uring::opcode::RecvMsg::new(LISTEN_PASS_FIXED_FILE, hdr)
         .build()
@@ -1266,7 +1259,7 @@ fn op_completion(
                 op => panic!("bad op in Handshaking: {op:?}"),
             }
         }
-        State::Registering(reg) => {
+        State::Registering(_) => {
             let State::Registering(RegisteringData {
                 raw_fd,
                 fd,
@@ -1279,7 +1272,7 @@ fn op_completion(
             };
             trace!("HABETS register finished");
             assert_eq!(data.op, UserDataOp::FilesUpdate);
-            ops.push(make_op_close_raw(raw_fd));
+            ops.push(make_op_close_raw(raw_fd, data.con.id));
             data.con.outstanding += 1;
             data.con.pre_read(fd, tls, &clienthello, ops)?;
             trace!("Now in state {:?}", data.con.state);
