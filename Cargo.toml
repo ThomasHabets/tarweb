@@ -46,3 +46,7 @@ debug = true
 [[bin]]
 name = "sni_router"
 path = "src/sni/sni.rs"
+
+[lib]
+name = "tarweb"
+path = "src/lib.rs"

@@ -14,6 +14,8 @@ use clap::Parser;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixDatagram;
 
+use tarweb::sock;
+
 // How much capacity to prepare for ClientHello and stuff.
 const BUF_CAPACITY: usize = 2048;
 
@@ -264,6 +266,7 @@ async fn main() -> Result<()> {
     println!("SNI");
     let opt = Opt::parse();
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", 4433)).await?;
+    sock::set_nodelay(listener.as_raw_fd())?;
     loop {
         let (mut stream, peer) = listener.accept().await?;
         println!("accepted {}", peer);
