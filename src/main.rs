@@ -406,6 +406,8 @@ impl Connection {
         ops.push(op);
     }
 
+    /// This function is called when a write completes. If the full write isn't
+    /// finished, write more data. Else transition state.
     #[must_use]
     fn write_done(&mut self, ops: &mut SQueue, archive: &Archive, wrote: usize) -> bool {
         match &self.state {
@@ -439,13 +441,14 @@ impl Connection {
         }
     }
 
+    /// Get the FixedFile fd from places that *must* be able to get it.
     #[must_use]
     fn must_get_fd(&self) -> FixedFile {
         (match &self.state {
             State::Reading(fd) => *fd,
             State::Handshaking(data) => data.fixed,
             State::EnablingKtls(fd) => *fd,
-            _ => panic!("get fd in wrong state"),
+            s => panic!("get fd in wrong state {s:?}"),
         }) as _
     }
 
@@ -1031,7 +1034,7 @@ fn handle_connection(
                     hook.con.close(modern, ops);
                     return Ok(());
                 }
-                // TODO: create an error type so that we have bubble up the
+                // TODO: create an error type so that we can bubble up the
                 // severity. This, for example, is triggered by the client
                 // disconnecting in the middle of a request, which should be
                 // debug level logging.
@@ -1063,8 +1066,6 @@ fn handle_connection(
                     std::io::Error::from_raw_os_error(hook.result.abs())
                 )));
             }
-            // TODO: ensure write is complete. Else re-issue the write.
-
             if hook.con.write_done(ops, archive, hook.result as usize) {
                 // Process any further requests, or re-issue a read.
                 maybe_answer_req(hook, ops, archive)?;
