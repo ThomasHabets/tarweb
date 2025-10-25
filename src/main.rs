@@ -206,6 +206,21 @@ enum State {
     Closing,
 }
 
+impl State {
+    fn name(&self) -> &str {
+        match self {
+            State::Idle => "idle",
+            State::Registering(_) => "registering",
+            State::Closing => "closing",
+            State::WritingData(_, _, _) => "writingdata",
+            State::Reading(_) => "reading",
+            State::WritingHeaders(_, _, _) => "writingheaders",
+            State::Handshaking(_) => "handshaking",
+            State::EnablingKtls(_) => "enablingKTLS",
+        }
+    }
+}
+
 // Connection slot. There is a fixed number of them for the lifetime of the
 // process.
 struct Connection {
@@ -1139,7 +1154,6 @@ fn op_completion(
     archive: &Archive,
 ) -> Result<()> {
     debug!("Op completed: {hook:?}");
-    hook.con.io_completed();
 
     //trace!("Read buf pos: {}", data.con.read_buf_pos);
     match &mut hook.con.state {
@@ -1312,7 +1326,6 @@ fn op_completion(
 
     if hook.con.fd().is_none() {
         debug!("Operation completed on a nonexisting fd (happens during close): {hook:?}");
-        return Ok(());
     } else if let Err(e) = handle_connection(hook, archive, opt.async_cancel2, ops) {
         info!("Error handling connection: {e:?}");
         hook.con.close(opt.async_cancel2, ops);
@@ -1459,15 +1472,21 @@ fn mainloop(
                     }
                 }
                 _ => {
-                    let mut data = decode_user_data(user_data, result, connections);
-                    let span = tracing::info_span!("conn", id = data.con.id);
+                    let mut hook = decode_user_data(user_data, result, connections);
+                    hook.con.io_completed();
+                    let span = tracing::info_span!(
+                        "conn",
+                        id = hook.con.id,
+                        outstanding = hook.con.outstanding,
+                        state = hook.con.state.name()
+                    );
                     let _guard = span.enter();
                     let was_full = pooltracker.is_empty();
                     if let Err(e) =
-                        op_completion(&mut data, &mut ops, opt, &mut pooltracker, archive)
+                        op_completion(&mut hook, &mut ops, opt, &mut pooltracker, archive)
                     {
                         warn!("Op error: {e:?}");
-                        data.con.close(opt.async_cancel2, &mut ops);
+                        hook.con.close(opt.async_cancel2, &mut ops);
                     }
                     if was_full && !pooltracker.is_empty() {
                         if opt.listen.is_some() {
