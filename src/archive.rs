@@ -74,7 +74,7 @@ impl Archive {
             content.insert(
                 name.to_string(),
                 ArchiveEntry {
-                    plain: ArchiveEntry2 {
+                    plain: ArchiveRange {
                         pos: e.raw_file_position() as usize,
                         len: e.size() as usize,
                     },
@@ -155,7 +155,7 @@ impl Archive {
 
 /// Just the byte range inside the mapped area.
 #[derive(Clone, Debug)]
-pub struct ArchiveEntry2 {
+pub struct ArchiveRange {
     pub pos: usize,
     pub len: usize,
 }
@@ -163,25 +163,25 @@ pub struct ArchiveEntry2 {
 /// All metadata about a particular file, including alternative encodings.
 #[derive(Clone)]
 pub struct ArchiveEntry {
-    plain: ArchiveEntry2,
-    gzip: Option<ArchiveEntry2>,
-    brotli: Option<ArchiveEntry2>,
-    zstd: Option<ArchiveEntry2>,
+    plain: ArchiveRange,
+    gzip: Option<ArchiveRange>,
+    brotli: Option<ArchiveRange>,
+    zstd: Option<ArchiveRange>,
     modified: Option<std::time::SystemTime>,
     etag: Option<String>,
 }
 
 impl ArchiveEntry {
-    pub fn plain(&self) -> &ArchiveEntry2 {
+    pub fn plain(&self) -> &ArchiveRange {
         &self.plain
     }
-    pub fn brotli(&self) -> Option<&ArchiveEntry2> {
+    pub fn brotli(&self) -> Option<&ArchiveRange> {
         self.brotli.as_ref()
     }
-    pub fn gzip(&self) -> Option<&ArchiveEntry2> {
+    pub fn gzip(&self) -> Option<&ArchiveRange> {
         self.gzip.as_ref()
     }
-    pub fn zstd(&self) -> Option<&ArchiveEntry2> {
+    pub fn zstd(&self) -> Option<&ArchiveRange> {
         self.zstd.as_ref()
     }
     pub fn modified(&self) -> Option<&std::time::SystemTime> {
