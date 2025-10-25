@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixDatagram;
+use tracing::{debug, info, warn};
 
 use tarweb::sock;
 
@@ -21,6 +22,14 @@ const BUF_CAPACITY: usize = 2048;
 
 #[derive(clap::Parser)]
 struct Opt {
+    #[arg(
+        long,
+        short,
+        help = "Verbosity level. Can be error, warn info, debug, or trace.",
+        default_value = "info"
+    )]
+    verbose: String,
+
     #[arg(long)]
     sock: std::path::PathBuf,
 }
@@ -244,12 +253,16 @@ fn extract_sni(clienthello: &[u8]) -> Result<Option<String>> {
 async fn handle_conn(stream: &mut tokio::net::TcpStream, uds_path: &std::path::Path) -> Result<()> {
     // Read and validate a full TLS ClientHello.
     let (bytes, clienthello) = read_tls_clienthello(stream).await?;
-    println!("ClientHello len={} bytes", clienthello.len());
+    debug!(
+        "fd={} ClientHello len={} bytes",
+        stream.as_raw_fd(),
+        clienthello.len()
+    );
     let Some(sni) = extract_sni(&clienthello)? else {
-        println!("Failed to extract SNI");
+        warn!("Failed to extract SNI");
         return Ok(());
     };
-    println!("SNI: {sni:?}");
+    debug!("fd={} SNI: {sni:?}", stream.as_raw_fd());
 
     let sock = tokio::net::UnixDatagram::unbound().context("create UnixDatagram")?;
     sock.connect(uds_path)
@@ -263,19 +276,25 @@ async fn handle_conn(stream: &mut tokio::net::TcpStream, uds_path: &std::path::P
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("SNI");
     let opt = Opt::parse();
+    tracing_subscriber::fmt()
+        //.with_env_filter(format!("sni_router={}", opt.verbose))
+        .with_env_filter(opt.verbose)
+        .with_writer(std::io::stderr)
+        .init();
+    info!("SNI Router");
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", 4433)).await?;
     sock::set_nodelay(listener.as_raw_fd())?;
     loop {
         let (mut stream, peer) = listener.accept().await?;
-        println!("accepted {}", peer);
+        debug!("fd={} Accepted {}", stream.as_raw_fd(), peer);
 
         let uds_path = opt.sock.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_conn(&mut stream, &uds_path).await {
-                eprintln!("{}: error: {:#}", peer, e);
+                warn!("fd={} Handling connection: {:#}", stream.as_raw_fd(), e);
             }
+            debug!("fd={} Done", stream.as_raw_fd());
         });
     }
 }

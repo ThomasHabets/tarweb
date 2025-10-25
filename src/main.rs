@@ -20,6 +20,9 @@
 // * Ranged get
 // * The code has no real structure. It's an experiment and I've banged on it
 //   until it worked. Fix that.
+// * We can use passfd and accept() at the same time if we manually set
+//   .file_index() on accept(), reserving the slot. That way we can actually
+//   unify connection ID with FixedFile value.
 //
 // On my laptop, the best performance is:
 // * --threads=2
@@ -1092,6 +1095,10 @@ fn make_op_accept(multi: bool) -> io_uring::squeue::Entry {
             .user_data(USER_DATA_LISTENER)
     } else {
         // TODO: add multiple accept ops is flight?
+        //
+        // TODO: store the remote address somewhere. This requires us to
+        // pre-allocate a connection, since we need a stable buffer to store it
+        // in.
         io_uring::opcode::Accept::new(
             LISTEN_FIXED_FILE,
             std::ptr::null_mut(),
