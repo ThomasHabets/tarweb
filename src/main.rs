@@ -1150,18 +1150,18 @@ fn load_private_key<P: AsRef<std::path::Path>>(
 }
 
 fn op_completion(
-    data: &mut Hook,
+    hook: &mut Hook,
     ops: &mut SQueue,
     opt: &Opt,
     pooltracker: &mut PoolTracker,
     archive: &Archive,
 ) -> Result<()> {
-    debug!("Op completed: {data:?}");
-    data.con.io_completed();
+    debug!("Op completed: {hook:?}");
+    hook.con.io_completed();
 
     //trace!("Read buf pos: {}", data.con.read_buf_pos);
-    match &mut data.con.state {
-        State::Idle => panic!("Can't happen: op {data:?} on Idle connection"),
+    match &mut hook.con.state {
+        State::Idle => panic!("Can't happen: op {hook:?} on Idle connection"),
         State::Closing => {}
 
         // Post-handshake states handled below.
@@ -1172,44 +1172,44 @@ fn op_completion(
         // Handshake states.
         State::EnablingKtls(fd) => {
             assert!(
-                matches![data.op, UserDataOp::SetSockOpt],
+                matches![hook.op, UserDataOp::SetSockOpt],
                 "Expected SetSockOpt, got {:?}",
-                data.op
+                hook.op
             );
-            if data.result != 0 {
+            if hook.result != 0 {
                 return Err(Error::msg(format!(
                     "setsockopt(): {}",
-                    std::io::Error::from_raw_os_error(data.result.abs())
+                    std::io::Error::from_raw_os_error(hook.result.abs())
                 )));
             }
             let fd = *fd;
-            if data.con.outstanding == 0 {
-                if data.con.read_buf_pos == 0 {
-                    data.con.read(ops);
+            if hook.con.outstanding == 0 {
+                if hook.con.read_buf_pos == 0 {
+                    hook.con.read(ops);
                 } else {
-                    data.con.issue_nop(ops);
+                    hook.con.issue_nop(ops);
                 }
-                data.con.state = State::Reading(fd);
+                hook.con.state = State::Reading(fd);
             } else {
-                debug!("EnablingKtls: still waiting for {}", data.con.outstanding);
+                debug!("EnablingKtls: still waiting for {}", hook.con.outstanding);
             }
             return Ok(());
         }
 
         State::Handshaking(d) => {
-            match &data.op {
+            match &hook.op {
                 UserDataOp::Read => {
-                    if data.result == 0 {
-                        data.con.close(opt.async_cancel2, ops);
+                    if hook.result == 0 {
+                        hook.con.close(opt.async_cancel2, ops);
                         return Ok(());
                     }
-                    if data.result < 0 {
-                        warn!("Read error: {}", data.result);
-                        data.con.close(opt.async_cancel2, ops);
+                    if hook.result < 0 {
+                        warn!("Read error: {}", hook.result);
+                        hook.con.close(opt.async_cancel2, ops);
                         return Ok(());
                     }
 
-                    let io = d.received(&data.con.read_buf[..data.result as usize])?;
+                    let io = d.received(&hook.con.read_buf[..hook.result as usize])?;
                     let still_handshaking = d.tls.is_handshaking();
                     let fd = d.fixed;
                     debug!("rustls op: {io:?}");
@@ -1240,12 +1240,12 @@ fn op_completion(
                     // `d` implicitly dropped here.
 
                     if bytes_written > 0 {
-                        data.con.write_buf = write_cursor.into_inner();
+                        hook.con.write_buf = write_cursor.into_inner();
                         debug!("Handshaking: still handshaking: {}", d.tls.is_handshaking());
-                        data.con.write(bytes_written, ops);
+                        hook.con.write(bytes_written, ops);
                     }
                     if bytes_read > 0 {
-                        data.con.read_sync(&read_buf[..bytes_read], ops)?;
+                        hook.con.read_sync(&read_buf[..bytes_read], ops)?;
                     }
 
                     if bytes_to_write == 0 && !still_handshaking {
@@ -1254,11 +1254,11 @@ fn op_completion(
                         assert_eq!(bytes_to_read, bytes_read);
                         // Nothing to write, handshake is done. Let's go to enable
                         // kTLS.
-                        data.con.enable_ktls(fd, ops, State::EnablingKtls(fd))?;
+                        hook.con.enable_ktls(fd, ops, State::EnablingKtls(fd))?;
                     } else if bytes_to_write == 0 {
                         // Read completed, nothing to write. Must mean we need to
                         // read more.
-                        data.con.read(ops);
+                        hook.con.read(ops);
                     }
                     return Ok(());
                 }
@@ -1269,9 +1269,9 @@ fn op_completion(
                     let n = d.tls.write_tls(&mut c)?;
                     if n > 0 {
                         // TODO: fix needless copy.
-                        data.con.write_buf = c.into_inner();
+                        hook.con.write_buf = c.into_inner();
                         debug!("Handshaking: Need to write {n} more");
-                        data.con.write(n, ops);
+                        hook.con.write(n, ops);
                         return Ok(());
                     }
 
@@ -1282,19 +1282,19 @@ fn op_completion(
                     );
                     if d.tls.is_handshaking() {
                         // Not done. Read more.
-                        data.con.read(ops);
+                        hook.con.read(ops);
                         return Ok(());
                     }
 
                     let fd = d.fixed;
-                    data.con.enable_ktls(fd, ops, State::EnablingKtls(fd))?;
+                    hook.con.enable_ktls(fd, ops, State::EnablingKtls(fd))?;
                     return Ok(());
                 }
                 UserDataOp::CloseRaw => {
                     assert_eq!(
-                        data.result, 0,
+                        hook.result, 0,
                         "close() passed real fd failed with code {}",
-                        data.result
+                        hook.result
                     );
                     trace!("CloseRaw completed");
                 }
@@ -1308,36 +1308,36 @@ fn op_completion(
                 tls,
                 clienthello,
                 ..
-            }) = std::mem::replace(&mut data.con.state, State::Idle)
+            }) = std::mem::replace(&mut hook.con.state, State::Idle)
             else {
                 unreachable!();
             };
             trace!("Fixed file FilesUpdate registration finished");
-            assert_eq!(data.op, UserDataOp::FilesUpdate);
+            assert_eq!(hook.op, UserDataOp::FilesUpdate);
             assert_eq!(
-                data.result,
+                hook.result,
                 1,
                 "FilesUpdate failed returning {}, which is system error {}",
-                data.result,
-                std::io::Error::from_raw_os_error(data.result.abs())
+                hook.result,
+                std::io::Error::from_raw_os_error(hook.result.abs())
             );
-            ops.push(make_op_close_raw(raw_fd, data.con.id));
-            data.con.outstanding += 1;
-            data.con.pre_read(fd, tls, &clienthello, ops)?;
-            trace!("Now in state {:?}", data.con.state);
+            ops.push(make_op_close_raw(raw_fd, hook.con.id));
+            hook.con.outstanding += 1;
+            hook.con.pre_read(fd, tls, &clienthello, ops)?;
+            trace!("Now in state {:?}", hook.con.state);
         }
     }
 
-    if data.con.fd().is_none() {
-        debug!("Operation completed on a nonexisting fd (happens during close): {data:?}");
+    if hook.con.fd().is_none() {
+        debug!("Operation completed on a nonexisting fd (happens during close): {hook:?}");
         return Ok(());
-    } else if let Err(e) = handle_connection(data, archive, opt.async_cancel2, ops) {
+    } else if let Err(e) = handle_connection(hook, archive, opt.async_cancel2, ops) {
         info!("Error handling connection: {e:?}");
-        data.con.close(opt.async_cancel2, ops);
+        hook.con.close(opt.async_cancel2, ops);
     }
-    if data.con.closing() && data.con.outstanding == 0 {
-        data.con.deinit();
-        pooltracker.dealloc(data.con.id);
+    if hook.con.closing() && hook.con.outstanding == 0 {
+        hook.con.deinit();
+        pooltracker.dealloc(hook.con.id);
         debug!("Deallocated");
     }
     Ok(())
