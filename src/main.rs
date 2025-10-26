@@ -1869,7 +1869,8 @@ fn main() -> Result<()> {
             }
             let sock = std::os::unix::net::UnixDatagram::bind(pass)
                 .context(format!("binding passfd {pass:?}"))?;
-            nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::PassCred, &true)?;
+            nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::PassCred, &true)
+                .context("setsockopt(PassCred)")?;
             Ok::<_, Error>(sock)
         })
         .transpose()?;
