@@ -6,6 +6,9 @@
 //!
 //! The idea here is to actually make different routing decisions based on SNI,
 //! and depending on the match, either pass the FD, or do TCP level proxying.
+//!
+//! TODO:
+//! * Add max connection idle time.
 use std::os::unix::io::AsRawFd;
 
 use anyhow::anyhow;
@@ -120,12 +123,9 @@ async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<(Vec
 }
 
 /// Sends `fd` and handshake data using SCM_RIGHTS on a Unix datagram.
-///
-/// Ideally we'd want to do this async, but as is it needs to be called in a
-/// `tokio::task::spawn_blocking`.
-fn pass_fd_over_uds(
+async fn pass_fd_over_uds(
     fd: std::os::unix::io::RawFd,
-    sock: &UnixDatagram,
+    sock: UnixDatagram,
     bytes: Vec<u8>,
 ) -> Result<()> {
     use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
@@ -133,10 +133,19 @@ fn pass_fd_over_uds(
     let iov = [std::io::IoSlice::new(&bytes)];
     let cmsg = [ControlMessage::ScmRights(&[fd])];
 
-    // TODO: send async.
-    let raw = sock.as_raw_fd();
-    let sent =
-        sendmsg::<()>(raw, &iov, &cmsg, MsgFlags::empty(), None).context("sendmsg SCM_RIGHTS")?;
+    // Async wait until it *should* be fine to write.
+    sock.writable().await?;
+
+    // Send sync, but per above *should* be fine to write. Also with
+    // `MSG_DONTWAIT` it shouldn't block.
+    let sent = sendmsg::<()>(
+        sock.as_raw_fd(),
+        &iov,
+        &cmsg,
+        MsgFlags::MSG_NOSIGNAL | MsgFlags::MSG_DONTWAIT,
+        None,
+    )
+    .context("sendmsg SCM_RIGHTS")?;
     if sent != bytes.len() {
         return Err(anyhow!(
             "sendmsg: expected to send {} bytes, sent {sent}",
@@ -287,8 +296,7 @@ async fn handle_conn_backend(
             let sock = tokio::net::UnixDatagram::unbound().context("create UnixDatagram")?;
             sock.connect(path)
                 .with_context(|| format!("connect to {:?}", path.display()))?;
-            tokio::task::spawn_blocking(move || pass_fd_over_uds(stream.as_raw_fd(), &sock, bytes))
-                .await?
+            pass_fd_over_uds(stream.as_raw_fd(), sock, bytes).await
         }
         Backend::Proxy(addr) => {
             use std::net::ToSocketAddrs;
