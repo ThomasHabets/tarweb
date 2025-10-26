@@ -31,6 +31,7 @@
 
 use std::io::Read;
 use std::os::fd::AsRawFd;
+use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -145,7 +146,8 @@ impl HandshakeData {
 #[derive(Debug)]
 struct RegisteringData {
     fd: FixedFile,
-    raw_fd: i32,
+    // TODO: manage this as an OwnedFd to make it impossible to leak.
+    raw_fd: libc::c_int,
     clienthello: Vec<u8>,
     tls: rustls::ServerConnection,
 }
@@ -287,13 +289,15 @@ impl Connection {
     /// not just part of `new()`.
     fn init_fd(
         &mut self,
-        raw_fd: i32,
+        raw_fd: OwnedFd,
         fd: FixedFile,
         bytes: Vec<u8>,
         tls: rustls::ServerConnection,
         ops: &mut SQueue,
     ) {
+        use std::os::fd::IntoRawFd;
         debug_assert!(matches![self.state, State::Idle]);
+        let raw_fd = raw_fd.into_raw_fd();
         self.state = State::Registering(RegisteringData {
             fd,
             raw_fd,
@@ -304,6 +308,8 @@ impl Connection {
             unreachable!()
         };
         self.last_action = std::time::Instant::now();
+        // DANGER: this function takes a pointer to the raw FD, so it'd better
+        // live long enough for the io-uring op to complete!
         self.make_op_files_update(&reg.raw_fd, reg.fd, ops);
     }
 
@@ -470,7 +476,12 @@ impl Connection {
         );
     }
 
-    fn make_op_files_update(&mut self, raw_fd: *const i32, fd: FixedFile, ops: &mut SQueue) {
+    fn make_op_files_update(
+        &mut self,
+        raw_fd: *const libc::c_int,
+        fd: FixedFile,
+        ops: &mut SQueue,
+    ) {
         ops.push(
             io_uring::opcode::FilesUpdate::new(raw_fd, 1)
                 .offset(fd.0 as i32)
@@ -693,7 +704,7 @@ impl PoolTracker {
 /// If there is more than one set of credentials, or there are none, then
 /// returns None. There's no reason there should be multiple copies, and if
 /// there is then we trust none of them.
-fn find_cmsg(msghdr: &libc::msghdr) -> (Option<libc::ucred>, Vec<libc::c_int>) {
+fn find_cmsg(msghdr: &libc::msghdr) -> (Option<libc::ucred>, Vec<OwnedFd>) {
     let mut rights = Vec::new();
     let mut has_creds = false;
     let mut credentials = None;
@@ -742,7 +753,8 @@ fn find_cmsg(msghdr: &libc::msghdr) -> (Option<libc::ucred>, Vec<libc::c_int>) {
 
             (libc::SOL_SOCKET, libc::SCM_RIGHTS) => {
                 assert_eq!(data.len(), std::mem::size_of::<libc::c_int>());
-                rights.push(libc::c_int::from_ne_bytes(data.try_into().unwrap()));
+                let raw_fd = libc::c_int::from_ne_bytes(data.try_into().unwrap());
+                rights.push(unsafe { OwnedFd::from_raw_fd(raw_fd) });
             }
             (level, typ) => {
                 warn!("Found unknnown cmsg header {level} {typ}. Ignoring.");
@@ -763,7 +775,7 @@ fn find_cmsg(msghdr: &libc::msghdr) -> (Option<libc::ucred>, Vec<libc::c_int>) {
 fn receive_passed_connection(
     passfd_msghdr: &libc::msghdr,
     nbytes: usize,
-) -> Result<(libc::c_int, Vec<u8>)> {
+) -> Result<(OwnedFd, Vec<u8>)> {
     assert_eq!(passfd_msghdr.msg_iovlen, 1);
     let iov = passfd_msghdr.msg_iov;
     let clienthello: &[u8] =
@@ -782,49 +794,28 @@ fn receive_passed_connection(
     // Get file descriptor.
     if fds.is_empty() {
         return Err(anyhow!(
-            "Failed to extract file descriptor from passfd. Possible fd leak"
+            "Failed to extract file descriptor in passfd from creds={creds:?}. Possible fd leak"
         ));
     }
 
     // Sanity check for receiving multiple file descriptors.
     if fds.len() > 1 {
-        for fd in fds {
-            let rc = unsafe { libc::close(fd) };
-            if rc != 0 {
-                error!(
-                    "Failed to close file descriptor {fd}: {}",
-                    std::io::Error::from_raw_os_error(rc.abs())
-                );
-            }
-        }
         return Err(anyhow!(
-            "Received more than one fd via recvmsg. Dropping all"
+            "Received more than one ({}) fds via recvmsg from creds={creds:?}. Dropping all",
+            fds.len()
         ));
     }
-    let fd = fds[0];
-    drop(fds);
-
-    let closer = || {
-        let rc = unsafe { libc::close(fd) };
-        if rc != 0 {
-            error!(
-                "Failed to close file descriptor {fd}: {}",
-                std::io::Error::from_raw_os_error(rc.abs())
-            );
-        }
-    };
+    let fd = fds.into_iter().next().unwrap();
 
     if passfd_msghdr.msg_flags & libc::MSG_TRUNC != 0 {
-        closer();
         return Err(anyhow!(
-            "Passfd data was truncated. Must have been more than {} bytes",
+            "Passfd data from creds={creds:?} was truncated. Must have been more than {} bytes",
             clienthello.len()
         ));
     }
     if passfd_msghdr.msg_flags & libc::MSG_CTRUNC != 0 {
-        closer();
         return Err(anyhow!(
-            "Passfd control data was truncated. Must have been more than {} bytes",
+            "Passfd control data from creds={creds:?} was truncated. Must have been more than {} bytes",
             passfd_msghdr.msg_controllen
         ));
     }
@@ -839,7 +830,7 @@ fn make_op_close(fd: FixedFile, con_id: usize) -> io_uring::squeue::Entry {
 }
 
 #[must_use]
-fn make_op_close_raw(fd: i32, con_id: usize) -> io_uring::squeue::Entry {
+fn make_op_close_raw(fd: libc::c_int, con_id: usize) -> io_uring::squeue::Entry {
     io_uring::opcode::Close::new(io_uring::types::Fd(fd))
         .build()
         .user_data((con_id as u64) | USER_DATA_OP_CLOSE_RAW)
@@ -1546,7 +1537,7 @@ fn mainloop(
                         match receive_passed_connection(passfd_msghdr, result as usize) {
                             Ok((fd, clienthello)) => {
                                 trace!(
-                                    "Passfd extracted: fd={fd} clienthello {} bytes",
+                                    "Passfd extracted: fd={fd:?} clienthello {} bytes",
                                     clienthello.len()
                                 );
                                 let id = pooltracker.alloc().unwrap();
