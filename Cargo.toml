@@ -38,7 +38,7 @@ zeroize = { version = "1", features = ["simd"] }
 regex = "1.12.2"
 
 [dev-dependencies]
-tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "process", "sync"] }
+tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "process", "sync", "time"] }
 tempfile = "3.23.0"
 
 [features]

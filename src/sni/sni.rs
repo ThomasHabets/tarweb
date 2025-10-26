@@ -384,6 +384,13 @@ async fn handle_conn_backend(
     }
 }
 
+fn is_full_match(re: &regex::Regex, text: &str) -> bool {
+    match re.find(text) {
+        Some(m) => m.start() == 0 && m.end() == text.len(),
+        None => false,
+    }
+}
+
 async fn handle_conn(id: usize, mut stream: tokio::net::TcpStream, config: &Config) -> Result<()> {
     // Read and validate a full TLS ClientHello.
     let (bytes, clienthello) = read_tls_clienthello(&mut stream).await?;
@@ -395,7 +402,7 @@ async fn handle_conn(id: usize, mut stream: tokio::net::TcpStream, config: &Conf
     debug!("id={id} SNI: {sni:?}");
 
     for rule in config.rules.iter() {
-        if rule.re.is_match(&sni) {
+        if is_full_match(&rule.re, &sni) {
             trace!("id={id} SNI {sni} matched rule {rule:?}");
             return handle_conn_backend(id, stream, bytes, &rule.backend).await;
         }
@@ -465,7 +472,7 @@ mod tests {
                 .init();
         }
         for curl_opt in ["--tlsv1", "--tlsv1.1", "--tls1.2", "--tls1.3"] {
-            for sni in ["foo", "bar", "something-else", "socket"] {
+            for sni in ["foo", "bar", "bar2", "socket"] {
                 info!("TESTING: sni={sni} opt={curl_opt}");
 
                 let tmp_dir = tempfile::TempDir::new()?;
@@ -522,7 +529,7 @@ mod tests {
                         .arg("--connect-to")
                         .arg(format!("socket:443:[::1]:{listener_port}"))
                         .arg("--connect-to")
-                        .arg(format!("something-else:443:[::1]:{listener_port}"))
+                        .arg(format!("bar2:443:[::1]:{listener_port}"))
                         .arg(format!("https://{sni}/"))
                         .spawn()?
                         .wait()
@@ -530,7 +537,7 @@ mod tests {
                     drop(done_tx1);
                     drop(done_tx2);
                     drop(done_tx3);
-                    Ok(())
+                    Ok::<(), anyhow::Error>(())
                 };
                 let backend_bar = async {
                     if sni == "bar" {
@@ -545,7 +552,7 @@ mod tests {
                     }
                 };
                 let backend_baz = async {
-                    if sni == "something-else" {
+                    if sni == "bar2" {
                         info!("COVERED: default");
                         hit_something.store(true, Ordering::Relaxed);
                         tokio::select! {
@@ -573,7 +580,14 @@ mod tests {
                     // Connected to nothing.
                     hit_something.store(true, Ordering::Relaxed);
                 }
-                tokio::try_join!(client, backend_bar, backend_baz, backend_sock)?;
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+                    tokio::try_join!(client, backend_bar, backend_baz, backend_sock,)
+                })
+                .await??;
+                assert!(
+                    hit_something.load(Ordering::Relaxed),
+                    "SNI {sni:?} and opts {curl_opt:?} did not do anything"
+                );
             }
         }
         Ok(())
