@@ -686,28 +686,21 @@ impl PoolTracker {
     }
 }
 
-/// Given a `msghdr`, extract both the file descriptor and the payload data.
+/// Find the relevant `SOL_SOCKET` control messages.
 ///
-/// The payload data contains the clienthello (and possibly more bytes, but we
-/// just send them on to rustls).
-fn receive_passed_connection(
-    passfd_msghdr: &libc::msghdr,
-    nbytes: usize,
-) -> Result<(libc::c_int, Vec<u8>)> {
-    assert_eq!(passfd_msghdr.msg_iovlen, 1);
-    let iov = passfd_msghdr.msg_iov;
-    let clienthello: &[u8] =
-        unsafe { std::slice::from_raw_parts((*iov).iov_base as *const u8, nbytes) };
-    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(passfd_msghdr as *const libc::msghdr) };
+/// Returns credentials (pid,uid,gid) and file descriptors.
+///
+/// If there is more than one set of credentials, or there are none, then
+/// returns None. There's no reason there should be multiple copies, and if
+/// there is then we trust none of them.
+fn find_cmsg(msghdr: &libc::msghdr) -> (Option<libc::ucred>, Vec<libc::c_int>) {
+    let mut rights = Vec::new();
+    let mut has_creds = false;
+    let mut credentials = None;
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msghdr as *const libc::msghdr) };
     while !cmsg.is_null() {
-        // trace!("Control message!");
         let level = unsafe { (*cmsg).cmsg_level };
         let typ = unsafe { (*cmsg).cmsg_type };
-        if (level, typ) != (libc::SOL_SOCKET, libc::SCM_RIGHTS) {
-            cmsg = unsafe { libc::CMSG_NXTHDR(passfd_msghdr as *const libc::msghdr, cmsg) };
-            continue;
-        }
-        // trace!("Control message: file descriptor!");
         let data = unsafe {
             let data_ptr = libc::CMSG_DATA(cmsg) as *const u8;
             let cmsg_len = (*cmsg).cmsg_len as usize;
@@ -719,11 +712,96 @@ fn receive_passed_connection(
                 std::slice::from_raw_parts(data_ptr, data_len)
             }
         };
-        assert_eq!(data.len(), std::mem::size_of::<libc::c_int>());
-        let fd = libc::c_int::from_ne_bytes(data.try_into().unwrap());
-        return Ok((fd, clienthello.to_vec()));
+        match (level, typ) {
+            (libc::SOL_SOCKET, libc::SCM_CREDENTIALS) => {
+                assert_eq!(data.len(), std::mem::size_of::<libc::ucred>());
+                let mut creds = std::mem::MaybeUninit::<libc::ucred>::uninit();
+                let creds = unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        creds.as_mut_ptr() as *mut u8,
+                        std::mem::size_of::<libc::ucred>(),
+                    );
+                    creds.assume_init()
+                };
+                if !has_creds {
+                    has_creds = true;
+                    credentials = Some(creds);
+                } else {
+                    if let Some(c) = credentials {
+                        error!(
+                            "Received passcred message with multiple sets of credentials: {c:?}"
+                        );
+                    }
+                    error!(
+                        "Received passcred message with multiple sets of credentials: {creds:?}"
+                    );
+                    credentials = None;
+                }
+            }
+
+            (libc::SOL_SOCKET, libc::SCM_RIGHTS) => {
+                assert_eq!(data.len(), std::mem::size_of::<libc::c_int>());
+                rights.push(libc::c_int::from_ne_bytes(data.try_into().unwrap()));
+            }
+            (level, typ) => {
+                warn!("Found unknnown cmsg header {level} {typ}. Ignoring.");
+            }
+        }
+        cmsg = unsafe { libc::CMSG_NXTHDR(msghdr as *const libc::msghdr, cmsg) };
     }
-    Err(anyhow!("Failed to extract file descriptor from passfd"))
+    (credentials, rights)
+}
+
+/// Given a `msghdr`, extract both the file descriptor and the payload data.
+///
+/// The payload data contains the clienthello (and possibly more bytes, but we
+/// just send them on to rustls).
+///
+/// DANGER: if we fail to extract the file descriptor, but it's there, then we
+/// leak it.
+fn receive_passed_connection(
+    passfd_msghdr: &libc::msghdr,
+    nbytes: usize,
+) -> Result<(libc::c_int, Vec<u8>)> {
+    assert_eq!(passfd_msghdr.msg_iovlen, 1);
+    let iov = passfd_msghdr.msg_iov;
+    let clienthello: &[u8] =
+        unsafe { std::slice::from_raw_parts((*iov).iov_base as *const u8, nbytes) };
+
+    let (creds, fds) = find_cmsg(passfd_msghdr);
+
+    // Check for passed credentials.
+    if let Some(creds) = creds {
+        debug!(
+            "Peer creds: pid={} uid={} gid={}",
+            creds.pid, creds.uid, creds.gid
+        );
+    }
+
+    // Get file descriptor.
+    if fds.is_empty() {
+        return Err(anyhow!(
+            "Failed to extract file descriptor from passfd. Possible fd leak"
+        ));
+    }
+
+    // Sanity check for receiving multiple file descriptors.
+    if fds.len() > 1 {
+        for fd in fds {
+            let rc = unsafe { libc::close(fd) };
+            if rc != 0 {
+                error!(
+                    "Failed to close file descriptor {fd}: {}",
+                    std::io::Error::from_raw_os_error(rc.abs())
+                );
+            }
+        }
+        return Err(anyhow!(
+            "Received more than one fd via recvmsg. Dropping all"
+        ));
+    }
+    Ok((fds[0], clienthello.to_vec()))
 }
 
 #[must_use]
@@ -1759,7 +1837,9 @@ fn main() -> Result<()> {
         .as_ref()
         .map(|pass| {
             let _ = std::fs::remove_file(pass);
-            std::os::unix::net::UnixDatagram::bind(pass).context("binding passfd")
+            let sock = std::os::unix::net::UnixDatagram::bind(pass).context("binding passfd")?;
+            nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::PassCred, &true)?;
+            Ok::<_, Error>(sock)
         })
         .transpose()?;
 

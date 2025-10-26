@@ -7,8 +7,16 @@
 //! The idea here is to actually make different routing decisions based on SNI,
 //! and depending on the match, either pass the FD, or do TCP level proxying.
 //!
-//! TODO:
+//! ## Notable
+//!
+//! * Under extremely heavy fd passing, `net.unix.max_dgram_qlen` could possibly
+//!   become a factor.
+//!
+//! ## TODO
+//!
 //! * Add max connection idle time.
+//! * Think more about how to best degrade if `sendmsg()` passing the FD fails
+//!   with `EMSGSIZE`. Queue? Drop?
 use std::os::unix::io::AsRawFd;
 
 use anyhow::anyhow;
@@ -296,6 +304,20 @@ async fn handle_conn_backend(
             let sock = tokio::net::UnixDatagram::unbound().context("create UnixDatagram")?;
             sock.connect(path)
                 .with_context(|| format!("connect to {:?}", path.display()))?;
+            // This doesn't work, because we're using DGRAM. Maybe it works with
+            // SEQPACKET?
+            if false {
+                let ucred = nix::sys::socket::getsockopt(
+                    &sock,
+                    nix::sys::socket::sockopt::PeerCredentials,
+                )?;
+                debug!(
+                    "id={id} peer pid={} uid={} gid={}",
+                    ucred.pid(),
+                    ucred.uid(),
+                    ucred.gid()
+                );
+            }
             pass_fd_over_uds(stream.as_raw_fd(), sock, bytes).await
         }
         Backend::Proxy(addr) => {
