@@ -1,7 +1,7 @@
 //! TCP terminating server that snoops on TLS SNI, and then passes the FD on to
 //! another server, like tarweb.
 //!
-//! This file is like 80% AI coded, but seems to work despite that. Improving it
+//! This file is like 75% AI coded, but seems to work despite that. Improving it
 //! is on the backlog because it does seem to work.
 //!
 //! The idea here is to actually make different routing decisions based on SNI,
@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixDatagram;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use tarweb::sock;
 
@@ -250,28 +250,112 @@ fn extract_sni(clienthello: &[u8]) -> Result<Option<String>> {
     Ok(None)
 }
 
-async fn handle_conn(stream: &mut tokio::net::TcpStream, uds_path: &std::path::Path) -> Result<()> {
+#[derive(Debug)]
+enum Backend {
+    Null,
+    Pass(std::path::PathBuf),
+    Proxy(String),
+}
+
+#[derive(Debug)]
+struct Rule {
+    re: regex::Regex,
+    backend: Backend,
+}
+
+async fn handle_conn_backend(
+    id: usize,
+    stream: &mut tokio::net::TcpStream,
+    bytes: &[u8],
+    backend: &Backend,
+) -> Result<()> {
+    match backend {
+        Backend::Null => {
+            trace!("id={id} Null backend. Closing");
+            Ok(())
+        }
+        Backend::Pass(path) => {
+            let sock = tokio::net::UnixDatagram::unbound().context("create UnixDatagram")?;
+            sock.connect(path)
+                .with_context(|| format!("connect to {:?}", path.display()))?;
+            pass_fd_over_uds(stream.as_raw_fd(), &sock, bytes)
+        }
+        Backend::Proxy(addr) => {
+            use std::net::ToSocketAddrs;
+            use tokio::io::AsyncWriteExt;
+
+            let addrs = addr.to_socket_addrs()?;
+            let mut conn = None;
+            for addr in addrs {
+                match tokio::net::TcpStream::connect(addr).await {
+                    Ok(ok) => {
+                        trace!("id={id} Connected to backend {addr}");
+                        conn = Some(ok);
+                        break;
+                    }
+                    Err(e) => {
+                        debug!("id={id} Failed to connect to backend {addr:?}: {e}");
+                    }
+                }
+            }
+            let Some(mut conn) = conn else {
+                return Err(anyhow!("failed to connect to all backends"));
+            };
+            let (mut up_r, mut up_w) = conn.split();
+            let (mut down_r, mut down_w) = stream.split();
+            let upstream = async {
+                up_w.write_all(bytes).await?;
+                tokio::io::copy(&mut down_r, &mut up_w).await?;
+                up_w.shutdown().await?;
+                trace!("id={id} Upstream write completed");
+                Ok::<_, anyhow::Error>(())
+            };
+            let downstream = async {
+                tokio::io::copy(&mut up_r, &mut down_w).await?;
+                down_w.shutdown().await?;
+                trace!("id={id} Downstream write completed");
+                Ok::<_, anyhow::Error>(())
+            };
+            tokio::try_join!(upstream, downstream)?;
+            Ok(())
+        }
+    }
+}
+
+async fn handle_conn(
+    id: usize,
+    stream: &mut tokio::net::TcpStream,
+    uds_path: &std::path::Path,
+) -> Result<()> {
+    // Config.
+    let rules = [
+        Rule {
+            re: regex::Regex::new("foo")?,
+            backend: Backend::Null,
+        },
+        Rule {
+            re: regex::Regex::new("bar")?,
+            backend: Backend::Proxy("localhost:8080".to_string()),
+        },
+    ];
+    let default_backend = Backend::Pass(uds_path.to_path_buf());
+
     // Read and validate a full TLS ClientHello.
     let (bytes, clienthello) = read_tls_clienthello(stream).await?;
-    debug!(
-        "fd={} ClientHello len={} bytes",
-        stream.as_raw_fd(),
-        clienthello.len()
-    );
+    debug!("id={id} ClientHello len={} bytes", clienthello.len());
     let Some(sni) = extract_sni(&clienthello)? else {
         warn!("Failed to extract SNI");
         return Ok(());
     };
-    debug!("fd={} SNI: {sni:?}", stream.as_raw_fd());
+    debug!("id={id} SNI: {sni:?}");
 
-    let sock = tokio::net::UnixDatagram::unbound().context("create UnixDatagram")?;
-    sock.connect(uds_path)
-        .with_context(|| format!("connect to {}", uds_path.display()))?;
-    pass_fd_over_uds(stream.as_raw_fd(), &sock, &bytes)?;
-
-    // Optionally, keep the TCP open for the receiver a short grace period
-    // if needed; here we just drop immediately.
-    Ok(())
+    for rule in rules.iter() {
+        if rule.re.is_match(&sni) {
+            trace!("id={id} SNI {sni} matched rule {rule:?}");
+            handle_conn_backend(id, stream, &bytes, &rule.backend).await?;
+        }
+    }
+    handle_conn_backend(id, stream, &bytes, &default_backend).await
 }
 
 #[tokio::main]
@@ -285,16 +369,18 @@ async fn main() -> Result<()> {
     info!("SNI Router");
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", 4433)).await?;
     sock::set_nodelay(listener.as_raw_fd())?;
+    let mut id = 0;
     loop {
         let (mut stream, peer) = listener.accept().await?;
-        debug!("fd={} Accepted {}", stream.as_raw_fd(), peer);
+        debug!("id={id} fd={} Accepted {}", stream.as_raw_fd(), peer);
 
         let uds_path = opt.sock.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(&mut stream, &uds_path).await {
-                warn!("fd={} Handling connection: {:#}", stream.as_raw_fd(), e);
+            if let Err(e) = handle_conn(id, &mut stream, &uds_path).await {
+                warn!("id={id} Handling connection: {e:#}");
             }
-            debug!("fd={} Done", stream.as_raw_fd());
+            debug!("id={id} Done");
         });
+        id += 1;
     }
 }

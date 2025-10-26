@@ -35,6 +35,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread"] }
 zeroize = { version = "1", features = ["simd"] }
+regex = "1.12.2"
 
 [features]
 # Not supported on riscv64
