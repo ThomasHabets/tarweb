@@ -1854,6 +1854,7 @@ fn main() -> Result<()> {
         .passfd
         .as_ref()
         .map(|pass| {
+            // TODO: check that it's a sock.
             let _ = std::fs::remove_file(pass);
             let sock = std::os::unix::net::UnixDatagram::bind(pass).context("binding passfd")?;
             nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::PassCred, &true)?;

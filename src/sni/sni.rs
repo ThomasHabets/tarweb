@@ -22,6 +22,7 @@
 //! * Backup backends. E.g. if unix socket fails, maybe route to a "sorry
 //!   server".
 use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
@@ -295,6 +296,12 @@ struct Rule {
     backend: Backend,
 }
 
+#[derive(Debug)]
+struct Config {
+    rules: Vec<Rule>,
+    default_backend: Backend,
+}
+
 /// A backend has been selected. Deal with the stream and its backend as
 /// appropriate.
 async fn handle_conn_backend(
@@ -370,26 +377,7 @@ async fn handle_conn_backend(
     }
 }
 
-async fn handle_conn(
-    id: usize,
-    mut stream: tokio::net::TcpStream,
-    uds_path: &std::path::Path,
-) -> Result<()> {
-    // Config.
-    //
-    // TODO: change this to be a protobuf.
-    let rules = [
-        Rule {
-            re: regex::Regex::new("foo")?,
-            backend: Backend::Null,
-        },
-        Rule {
-            re: regex::Regex::new("bar")?,
-            backend: Backend::Proxy("localhost:8080".to_string()),
-        },
-    ];
-    let default_backend = Backend::Pass(uds_path.to_path_buf());
-
+async fn handle_conn(id: usize, mut stream: tokio::net::TcpStream, config: &Config) -> Result<()> {
     // Read and validate a full TLS ClientHello.
     let (bytes, clienthello) = read_tls_clienthello(&mut stream).await?;
     debug!("id={id} ClientHello len={} bytes", clienthello.len());
@@ -399,13 +387,30 @@ async fn handle_conn(
     };
     debug!("id={id} SNI: {sni:?}");
 
-    for rule in rules.iter() {
+    for rule in config.rules.iter() {
         if rule.re.is_match(&sni) {
             trace!("id={id} SNI {sni} matched rule {rule:?}");
             return handle_conn_backend(id, stream, bytes, &rule.backend).await;
         }
     }
-    handle_conn_backend(id, stream, bytes, &default_backend).await
+    handle_conn_backend(id, stream, bytes, &config.default_backend).await
+}
+
+async fn mainloop(config: Arc<Config>, listener: tokio::net::TcpListener) -> Result<()> {
+    let mut id = 0;
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        debug!("id={id} fd={} Accepted {}", stream.as_raw_fd(), peer);
+
+        let config = config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_conn(id, stream, &config).await {
+                warn!("id={id} Handling connection: {e:#}");
+            }
+            debug!("id={id} Done");
+        });
+        id += 1;
+    }
 }
 
 #[tokio::main]
@@ -421,18 +426,147 @@ async fn main() -> Result<()> {
         .await
         .context(format!("listening to {}", opt.listen))?;
     sock::set_nodelay(listener.as_raw_fd())?;
-    let mut id = 0;
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        debug!("id={id} fd={} Accepted {}", stream.as_raw_fd(), peer);
+    // Config.
+    let config = Config {
+        rules: vec![
+            Rule {
+                re: regex::Regex::new("foo")?,
+                backend: Backend::Null,
+            },
+            Rule {
+                re: regex::Regex::new("bar")?,
+                backend: Backend::Proxy("localhost:8080".to_string()),
+            },
+        ],
+        default_backend: Backend::Pass(opt.sock.clone()),
+    };
+    mainloop(Arc::new(config), listener).await
+}
 
-        let uds_path = opt.sock.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_conn(id, stream, &uds_path).await {
-                warn!("id={id} Handling connection: {e:#}");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn default_client() -> Result<()> {
+        if false {
+            tracing_subscriber::fmt()
+                .with_env_filter("trace")
+                .with_writer(std::io::stderr)
+                .init();
+        }
+        for curl_opt in ["--tlsv1", "--tlsv1.1", "--tls1.2", "--tls1.3"] {
+            for sni in ["foo", "bar", "something-else", "socket"] {
+                info!("TESTING: sni={sni} opt={curl_opt}");
+
+                let tmp_dir = tempfile::TempDir::new()?;
+                let hit_something = std::sync::atomic::AtomicBool::new(false);
+                let listener =
+                    tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
+                let listener_port = listener.local_addr()?.port();
+
+                // Backends.
+                let backend_bar =
+                    tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
+                let backend_bar_port = backend_bar.local_addr()?.port();
+                let backend_baz =
+                    tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
+                let backend_baz_port = backend_baz.local_addr()?.port();
+
+                let sockfile = tmp_dir.path().join("tarweb-testing.sock");
+                let backend_sock = tokio::net::UnixDatagram::bind(&sockfile)?;
+
+                // Test config.
+                #[allow(clippy::regex_creation_in_loops)]
+                let config = Config {
+                    rules: vec![
+                        Rule {
+                            re: regex::Regex::new("foo")?,
+                            backend: Backend::Null,
+                        },
+                        Rule {
+                            re: regex::Regex::new("socket")?,
+                            backend: Backend::Pass(sockfile.clone()),
+                        },
+                        Rule {
+                            re: regex::Regex::new("bar")?,
+                            backend: Backend::Proxy(format!("[::1]:{backend_bar_port}")),
+                        },
+                    ],
+                    default_backend: Backend::Proxy(format!("[::1]:{backend_baz_port}")),
+                };
+                let _main =
+                    tokio::task::spawn(async move { mainloop(Arc::new(config), listener).await });
+
+                let (done_tx1, mut done_rx_bar) = tokio::sync::mpsc::channel::<()>(1);
+                let (done_tx2, mut done_rx_baz) = tokio::sync::mpsc::channel::<()>(1);
+                let (done_tx3, mut done_rx_sock) = tokio::sync::mpsc::channel::<()>(1);
+                let client = async {
+                    // Expect failure because our backend immediately disconnects.
+                    let _status = tokio::process::Command::new("curl")
+                        .arg("--connect-to")
+                        .arg(format!("foo:443:[::1]:{listener_port}"))
+                        .arg("--connect-to")
+                        .arg(format!("bar:443:[::1]:{listener_port}"))
+                        .arg("--connect-to")
+                        .arg(format!("socket:443:[::1]:{listener_port}"))
+                        .arg("--connect-to")
+                        .arg(format!("something-else:443:[::1]:{listener_port}"))
+                        .arg(format!("https://{sni}/"))
+                        .spawn()?
+                        .wait()
+                        .await?;
+                    drop(done_tx1);
+                    drop(done_tx2);
+                    drop(done_tx3);
+                    Ok(())
+                };
+                let backend_bar = async {
+                    if sni == "bar" {
+                        info!("COVERED: bar");
+                        hit_something.store(true, Ordering::Relaxed);
+                        tokio::select! {
+                            _ = backend_bar.accept() => Ok(()),
+                            _ = done_rx_bar.recv() => Err(anyhow!("nobody connected to backend")),
+                        }
+                    } else {
+                        Ok(())
+                    }
+                };
+                let backend_baz = async {
+                    if sni == "something-else" {
+                        info!("COVERED: default");
+                        hit_something.store(true, Ordering::Relaxed);
+                        tokio::select! {
+                            _ = backend_baz.accept() => Ok(()),
+                            _ = done_rx_baz.recv() => Err(anyhow!("nobody connected to backend")),
+                        }
+                    } else {
+                        Ok(())
+                    }
+                };
+                let backend_sock = async {
+                    if sni == "socket" {
+                        info!("COVERED: socket");
+                        hit_something.store(true, Ordering::Relaxed);
+                        let mut buf = [0u8; 2048];
+                        tokio::select! {
+                            _ = backend_sock.recv(&mut buf) => Ok(()),
+                            _ = done_rx_sock.recv() => Err(anyhow!("nobody connected to backend")),
+                        }
+                    } else {
+                        Ok(())
+                    }
+                };
+                if sni == "foo" {
+                    // Connected to nothing.
+                    hit_something.store(true, Ordering::Relaxed);
+                }
+                tokio::try_join!(client, backend_bar, backend_baz, backend_sock)?;
             }
-            debug!("id={id} Done");
-        });
-        id += 1;
+        }
+        Ok(())
     }
 }
