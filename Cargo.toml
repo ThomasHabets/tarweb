@@ -2,6 +2,12 @@
 name = "tarweb"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+authors = ["Thomas Habets <thomas@habets.se>"]
+readme = "README.md"
+repository = "https://github.com/ThomasHabets/tarweb"
+description = "io-uring based static file web server, with SNI router"
+keywords = ["webserver"]
 
 [dependencies]
 anyhow = "1"

@@ -5,6 +5,8 @@ io-uring & ktls based webserver serving files from a tar file.
 * No memory allocations
 * No syscalls (`io_uring`)
 
+https://github.com/ThomasHabets/tarweb
+
 ## Prerequisites
 
 You need at least kernel 6.7, with `IO_URING` and `TLS` enabled. 6.7 introduced
