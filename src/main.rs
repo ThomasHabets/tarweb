@@ -801,7 +801,34 @@ fn receive_passed_connection(
             "Received more than one fd via recvmsg. Dropping all"
         ));
     }
-    Ok((fds[0], clienthello.to_vec()))
+    let fd = fds[0];
+    drop(fds);
+
+    let closer = || {
+        let rc = unsafe { libc::close(fd) };
+        if rc != 0 {
+            error!(
+                "Failed to close file descriptor {fd}: {}",
+                std::io::Error::from_raw_os_error(rc.abs())
+            );
+        }
+    };
+
+    if passfd_msghdr.msg_flags & libc::MSG_TRUNC != 0 {
+        closer();
+        return Err(anyhow!(
+            "Passfd data was truncated. Must have been more than {} bytes",
+            clienthello.len()
+        ));
+    }
+    if passfd_msghdr.msg_flags & libc::MSG_CTRUNC != 0 {
+        closer();
+        return Err(anyhow!(
+            "Passfd control data was truncated. Must have been more than {} bytes",
+            passfd_msghdr.msg_controllen
+        ));
+    }
+    Ok((fd, clienthello.to_vec()))
 }
 
 #[must_use]
