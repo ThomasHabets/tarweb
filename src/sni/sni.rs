@@ -120,10 +120,17 @@ async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<(Vec
 }
 
 /// Sends `fd` and handshake data using SCM_RIGHTS on a Unix datagram.
-fn pass_fd_over_uds(fd: std::os::unix::io::RawFd, sock: &UnixDatagram, bytes: &[u8]) -> Result<()> {
+///
+/// Ideally we'd want to do this async, but as is it needs to be called in a
+/// `tokio::task::spawn_blocking`.
+fn pass_fd_over_uds(
+    fd: std::os::unix::io::RawFd,
+    sock: &UnixDatagram,
+    bytes: Vec<u8>,
+) -> Result<()> {
     use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 
-    let iov = [std::io::IoSlice::new(bytes)];
+    let iov = [std::io::IoSlice::new(&bytes)];
     let cmsg = [ControlMessage::ScmRights(&[fd])];
 
     // TODO: send async.
@@ -263,10 +270,12 @@ struct Rule {
     backend: Backend,
 }
 
+/// A backend has been selected. Deal with the stream and its backend as
+/// appropriate.
 async fn handle_conn_backend(
     id: usize,
-    stream: &mut tokio::net::TcpStream,
-    bytes: &[u8],
+    mut stream: tokio::net::TcpStream,
+    bytes: Vec<u8>,
     backend: &Backend,
 ) -> Result<()> {
     match backend {
@@ -278,7 +287,8 @@ async fn handle_conn_backend(
             let sock = tokio::net::UnixDatagram::unbound().context("create UnixDatagram")?;
             sock.connect(path)
                 .with_context(|| format!("connect to {:?}", path.display()))?;
-            pass_fd_over_uds(stream.as_raw_fd(), &sock, bytes)
+            tokio::task::spawn_blocking(move || pass_fd_over_uds(stream.as_raw_fd(), &sock, bytes))
+                .await?
         }
         Backend::Proxy(addr) => {
             use std::net::ToSocketAddrs;
@@ -304,7 +314,7 @@ async fn handle_conn_backend(
             let (mut up_r, mut up_w) = conn.split();
             let (mut down_r, mut down_w) = stream.split();
             let upstream = async {
-                up_w.write_all(bytes).await?;
+                up_w.write_all(&bytes).await?;
                 tokio::io::copy(&mut down_r, &mut up_w).await?;
                 up_w.shutdown().await?;
                 trace!("id={id} Upstream write completed");
@@ -324,7 +334,7 @@ async fn handle_conn_backend(
 
 async fn handle_conn(
     id: usize,
-    stream: &mut tokio::net::TcpStream,
+    mut stream: tokio::net::TcpStream,
     uds_path: &std::path::Path,
 ) -> Result<()> {
     // Config.
@@ -341,7 +351,7 @@ async fn handle_conn(
     let default_backend = Backend::Pass(uds_path.to_path_buf());
 
     // Read and validate a full TLS ClientHello.
-    let (bytes, clienthello) = read_tls_clienthello(stream).await?;
+    let (bytes, clienthello) = read_tls_clienthello(&mut stream).await?;
     debug!("id={id} ClientHello len={} bytes", clienthello.len());
     let Some(sni) = extract_sni(&clienthello)? else {
         warn!("Failed to extract SNI");
@@ -352,10 +362,10 @@ async fn handle_conn(
     for rule in rules.iter() {
         if rule.re.is_match(&sni) {
             trace!("id={id} SNI {sni} matched rule {rule:?}");
-            handle_conn_backend(id, stream, &bytes, &rule.backend).await?;
+            return handle_conn_backend(id, stream, bytes, &rule.backend).await;
         }
     }
-    handle_conn_backend(id, stream, &bytes, &default_backend).await
+    handle_conn_backend(id, stream, bytes, &default_backend).await
 }
 
 #[tokio::main]
@@ -371,12 +381,12 @@ async fn main() -> Result<()> {
     sock::set_nodelay(listener.as_raw_fd())?;
     let mut id = 0;
     loop {
-        let (mut stream, peer) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
         debug!("id={id} fd={} Accepted {}", stream.as_raw_fd(), peer);
 
         let uds_path = opt.sock.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(id, &mut stream, &uds_path).await {
+            if let Err(e) = handle_conn(id, stream, &uds_path).await {
                 warn!("id={id} Handling connection: {e:#}");
             }
             debug!("id={id} Done");
