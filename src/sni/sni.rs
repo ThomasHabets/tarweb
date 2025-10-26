@@ -17,6 +17,10 @@
 //! * Add max connection idle time.
 //! * Think more about how to best degrade if `sendmsg()` passing the FD fails
 //!   with `EMSGSIZE`. Queue? Drop?
+//! * Maybe leave the unix socket connected, and only try to reconnect on error?
+//! * Add a bunch of tests.
+//! * Backup backends. E.g. if unix socket fails, maybe route to a "sorry
+//!   server".
 use std::os::unix::io::AsRawFd;
 
 use anyhow::anyhow;
@@ -40,6 +44,10 @@ struct Opt {
         default_value = "info"
     )]
     verbose: String,
+
+    /// Address to listen to.
+    #[arg(long, short, default_value = "[::]:443")]
+    listen: std::net::SocketAddr,
 
     #[arg(long)]
     sock: std::path::PathBuf,
@@ -368,6 +376,8 @@ async fn handle_conn(
     uds_path: &std::path::Path,
 ) -> Result<()> {
     // Config.
+    //
+    // TODO: change this to be a protobuf.
     let rules = [
         Rule {
             re: regex::Regex::new("foo")?,
@@ -407,7 +417,9 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     info!("SNI Router");
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", 4433)).await?;
+    let listener = tokio::net::TcpListener::bind(&opt.listen)
+        .await
+        .context(format!("listening to {}", opt.listen))?;
     sock::set_nodelay(listener.as_raw_fd())?;
     let mut id = 0;
     loop {
