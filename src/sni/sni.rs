@@ -1,9 +1,6 @@
 //! TCP terminating server that snoops on TLS SNI, and then passes the FD on to
 //! another server, like tarweb.
 //!
-//! This file is like 75% AI coded, but seems to work despite that. Improving it
-//! is on the backlog because it does seem to work.
-//!
 //! The idea here is to actually make different routing decisions based on SNI,
 //! and depending on the match, either pass the FD, or do TCP level proxying.
 //!
@@ -66,6 +63,9 @@ struct Opt {
 ///   - length(3) = body_len
 ///
 /// Return all bytes read, and clienthello bytes.
+///
+/// This function is mostly AI coded. Seems to work, and reviewing it it seems
+/// safe.
 async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<(Vec<u8>, Vec<u8>)> {
     const REC_HDR_LEN: usize = 5;
     let mut hello = Vec::with_capacity(BUF_CAPACITY);
@@ -175,7 +175,8 @@ async fn pass_fd_over_uds(
 /// Extract SNI host_name from a TLS ClientHello (handshake header + body).
 /// Returns Ok(Some(host)) if found, Ok(None) if no SNI extension exists.
 ///
-/// Entirely jippitycoded.
+/// This function is mostly jipptycoded. Seems to work, and reviewing it it seems
+/// safe.
 fn extract_sni(clienthello: &[u8]) -> Result<Option<String>> {
     // Handshake header: type(1)=1, len(3)
     if clienthello.len() < 4 {
@@ -285,8 +286,14 @@ fn extract_sni(clienthello: &[u8]) -> Result<Option<String>> {
 
 #[derive(Debug)]
 enum Backend {
+    // Just close the connection.
     Null,
+
+    // Connect to a unix socket and pass in bytes read so far, and the file
+    // descriptor to continue.
     Pass(std::path::PathBuf),
+
+    // Proxy string. DNS resolved on every new connection.
     Proxy(String),
 }
 
