@@ -1854,8 +1854,19 @@ fn main() -> Result<()> {
         .passfd
         .as_ref()
         .map(|pass| {
-            // TODO: check that it's a sock.
-            let _ = std::fs::remove_file(pass);
+            // Remove existing socket if and only if it's a socket.
+            //
+            // If it exists but is not a socket, then it could be a symlink. In
+            // that case sure, go ahead. It won't work unless the symlink is
+            // dangling, but traversing symlinks to delete the destination
+            // sounds dangerous. The user is on their own if they want to do
+            // that.
+            if let Ok(meta) = std::fs::symlink_metadata(pass) {
+                use std::os::unix::fs::FileTypeExt; // for is_socket()
+                if meta.file_type().is_socket() {
+                    let _ = std::fs::remove_file(pass);
+                }
+            }
             let sock = std::os::unix::net::UnixDatagram::bind(pass).context("binding passfd")?;
             nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::PassCred, &true)?;
             Ok::<_, Error>(sock)
