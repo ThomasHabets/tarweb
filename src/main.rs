@@ -1867,7 +1867,8 @@ fn main() -> Result<()> {
                     let _ = std::fs::remove_file(pass);
                 }
             }
-            let sock = std::os::unix::net::UnixDatagram::bind(pass).context("binding passfd")?;
+            let sock = std::os::unix::net::UnixDatagram::bind(pass)
+                .context(format!("binding passfd {pass:?}"))?;
             nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::PassCred, &true)?;
             Ok::<_, Error>(sock)
         })
