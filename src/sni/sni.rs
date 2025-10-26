@@ -506,6 +506,8 @@ mod tests {
                 let client = async {
                     // Expect failure because our backend immediately disconnects.
                     let _status = tokio::process::Command::new("curl")
+                        .arg("-S")
+                        .arg("--no-progress-meter")
                         .arg("--connect-to")
                         .arg(format!("foo:443:[::1]:{listener_port}"))
                         .arg("--connect-to")
