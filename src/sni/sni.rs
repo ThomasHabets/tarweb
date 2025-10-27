@@ -139,14 +139,15 @@ async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<(Vec
     Ok((bytes, hello))
 }
 
-/// Sends `fd` and handshake data using SCM_RIGHTS on a Unix datagram.
+/// Sends file descriptor and handshake data using SCM_RIGHTS on a Unix datagram.
 async fn pass_fd_over_uds(
-    fd: std::os::unix::io::RawFd,
+    stream: tokio::net::TcpStream,
     sock: UnixDatagram,
     bytes: Vec<u8>,
 ) -> Result<()> {
     use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 
+    let fd = stream.as_raw_fd();
     let iov = [std::io::IoSlice::new(&bytes)];
     let cmsg = [ControlMessage::ScmRights(&[fd])];
 
@@ -340,7 +341,7 @@ async fn handle_conn_backend(
                     ucred.gid()
                 );
             }
-            pass_fd_over_uds(stream.as_raw_fd(), sock, bytes).await
+            pass_fd_over_uds(stream, sock, bytes).await
         }
         Backend::Proxy(addr) => {
             use std::net::ToSocketAddrs;
