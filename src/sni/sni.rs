@@ -605,16 +605,28 @@ async fn main() -> Result<()> {
         },
     };
     if let (Some(cf), Some(kf)) = (opt.cert_file, opt.key_file) {
-        config.rules.push(Rule {
-            re: regex::Regex::new("baz")?,
-            backend: Backend::Pass {
-                path: opt.sock.clone(),
-                tls: Some(TlsConfig {
-                    cert_file: cf.clone(),
-                    key_file: kf.clone(),
-                }),
+        config.rules.extend([
+            Rule {
+                re: regex::Regex::new("baz")?,
+                backend: Backend::Pass {
+                    path: opt.sock.clone(),
+                    tls: Some(TlsConfig {
+                        cert_file: cf.clone(),
+                        key_file: kf.clone(),
+                    }),
+                },
             },
-        });
+            Rule {
+                re: regex::Regex::new("tls-proxy")?,
+                backend: Backend::Proxy {
+                    addr: "localhost:8080".to_string(),
+                    tls: Some(TlsConfig {
+                        cert_file: cf.clone(),
+                        key_file: kf.clone(),
+                    }),
+                },
+            },
+        ]);
     }
     mainloop(Arc::new(config), listener).await
 }
