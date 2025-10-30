@@ -129,7 +129,7 @@ impl Archive {
             });
         }
         let c2 = content.clone();
-        for (k, v) in c2.iter() {
+        for (k, v) in &c2 {
             if k.ends_with(".br") {
                 let k = &k[..(k.len() - 3)];
                 if let Some(r) = content.get_mut(k) {
@@ -149,10 +149,10 @@ impl Archive {
                 }
             }
         }
-        Ok(Self { content, mmap })
+        Ok(Self { mmap, content })
     }
 
-    /// Get the ArchiveEntry for a given filename.
+    /// Get the `ArchiveEntry` for a given filename.
     #[must_use]
     pub fn entry(&self, filename: &str) -> Option<&ArchiveEntry> {
         use std::borrow::Cow;

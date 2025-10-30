@@ -59,16 +59,16 @@ struct Opt {
     sock: std::path::PathBuf,
 }
 
-/// Read enough bytes from `stream` to cover the entire TLS ClientHello handshake
+/// Read enough bytes from `stream` to cover the entire TLS `ClientHello` handshake
 /// (which may span multiple records). Returns the handshake (type+len+body).
 ///
 /// TLS record format:
-///   - 5B header: content_type(1)=22, legacy_version(2), length(2)
+///   - 5B header: `content_type(1)=22`, `legacy_version(2)`, length(2)
 ///   - payload: one or more handshake messages
 ///
 /// Handshake header:
-///   - msg_type(1)=1(ClientHello)
-///   - length(3) = body_len
+///   - `msg_type(1)=1(ClientHello)`
+///   - length(3) = `body_len`
 ///
 /// Return all bytes read, and clienthello bytes.
 ///
@@ -83,7 +83,7 @@ async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<(Vec
     // Loop records until we have full ClientHello bytes (4 + body_len).
     let mut needed: Option<usize> = None;
 
-    while !needed.map(|n| hello.len() >= n).unwrap_or_default() {
+    while needed.is_none_or(|n| hello.len() < n) {
         // Read record header.
         let mut rec_hdr = [0u8; REC_HDR_LEN];
         stream
@@ -100,8 +100,7 @@ async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<(Vec
         // Confirm it's Handshake.
         if content_type != 22 {
             return Err(anyhow!(
-                "unexpected TLS content_type {}, want 22 (handshake)",
-                content_type
+                "unexpected TLS content_type {content_type}, want 22 (handshake)"
             ));
         }
         if rec_len == 0 {
@@ -128,8 +127,7 @@ async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<(Vec
             let msg_type = hello[0];
             if msg_type != 1 {
                 return Err(anyhow!(
-                    "first handshake msg is type {}, expected 1 (ClientHello)",
-                    msg_type
+                    "first handshake msg is type {msg_type}, expected 1 (ClientHello)"
                 ));
             }
             let body_len =
@@ -147,7 +145,7 @@ async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<(Vec
     Ok((bytes, hello))
 }
 
-/// Sends file descriptor and handshake data using SCM_RIGHTS on a Unix datagram.
+/// Sends file descriptor and handshake data using `SCM_RIGHTS` on a Unix datagram.
 async fn pass_fd_over_uds(
     stream: tokio::net::TcpStream,
     sock: UnixDatagram,
@@ -181,7 +179,7 @@ async fn pass_fd_over_uds(
     Ok(())
 }
 
-/// Extract SNI host_name from a TLS ClientHello (handshake header + body).
+/// Extract SNI `host_name` from a TLS `ClientHello` (handshake header + body).
 /// Returns Ok(Some(host)) if found, Ok(None) if no SNI extension exists.
 ///
 /// This function is mostly jipptycoded. Seems to work, and reviewing it it seems
@@ -395,7 +393,7 @@ async fn tls_handshake(
                     stream.as_raw_fd(),
                     libc::SOL_TCP,
                     libc::TCP_ULP,
-                    ulp_name.as_ptr() as _,
+                    ulp_name.as_ptr().cast(),
                     ulp_name.len() as _,
                 )
             };
@@ -546,7 +544,7 @@ async fn handle_conn(id: usize, mut stream: tokio::net::TcpStream, config: &Conf
     };
     debug!("id={id} SNI: {sni:?}");
 
-    for rule in config.rules.iter() {
+    for rule in &config.rules {
         if is_full_match(&rule.re, &sni) {
             trace!("id={id} SNI {sni} matched rule {rule:?}");
             return handle_conn_backend(id, stream, bytes, &rule.backend).await;

@@ -308,7 +308,7 @@ impl Connection {
         self.last_action = std::time::Instant::now();
         // DANGER: this function takes a pointer to the raw FD, so it'd better
         // live long enough for the io-uring op to complete!
-        self.make_op_files_update(&reg.raw_fd, reg.fd, ops);
+        self.make_op_files_update(&raw const reg.raw_fd, reg.fd, ops);
     }
 
     /// Put the Connection object back in Idle state.
@@ -465,7 +465,7 @@ impl Connection {
                 fd,
                 libc::SOL_TCP as u32,
                 libc::TCP_ULP as u32,
-                TLS_STR.as_ptr() as _,
+                TLS_STR.as_ptr().cast(),
                 3,
             )
             .build()
@@ -540,7 +540,7 @@ impl Connection {
             fd,
             libc::SOL_TLS as u32,
             dir,
-            ci.as_ptr() as _,
+            ci.as_ptr().cast(),
             ci.size() as u32,
         )
         .build();
@@ -581,7 +581,7 @@ impl Connection {
     /// the client.
     ///
     /// This is used if connections come over a unix socket, where we are passed
-    /// the data and initial TLS bytes (importantly the ClientHello).
+    /// the data and initial TLS bytes (importantly the `ClientHello`).
     fn pre_read(
         &mut self,
         fixed: FixedFile,
@@ -706,12 +706,12 @@ fn find_cmsg(msghdr: &libc::msghdr) -> (Option<libc::ucred>, Vec<OwnedFd>) {
     let mut rights = Vec::new();
     let mut has_creds = false;
     let mut credentials = None;
-    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msghdr as *const libc::msghdr) };
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(std::ptr::from_ref::<libc::msghdr>(msghdr)) };
     while !cmsg.is_null() {
         let level = unsafe { (*cmsg).cmsg_level };
         let typ = unsafe { (*cmsg).cmsg_type };
         let data = unsafe {
-            let data_ptr = libc::CMSG_DATA(cmsg) as *const u8;
+            let data_ptr = libc::CMSG_DATA(cmsg).cast_const();
             let cmsg_len = (*cmsg).cmsg_len as usize;
             let header_size = std::mem::size_of::<libc::cmsghdr>();
             let data_len = cmsg_len.saturating_sub(header_size);
@@ -728,15 +728,12 @@ fn find_cmsg(msghdr: &libc::msghdr) -> (Option<libc::ucred>, Vec<OwnedFd>) {
                 let creds = unsafe {
                     std::ptr::copy_nonoverlapping(
                         data.as_ptr(),
-                        creds.as_mut_ptr() as *mut u8,
+                        creds.as_mut_ptr().cast::<u8>(),
                         std::mem::size_of::<libc::ucred>(),
                     );
                     creds.assume_init()
                 };
-                if !has_creds {
-                    has_creds = true;
-                    credentials = Some(creds);
-                } else {
+                if has_creds {
                     if let Some(c) = credentials {
                         error!(
                             "Received passcred message with multiple sets of credentials: {c:?}"
@@ -746,6 +743,9 @@ fn find_cmsg(msghdr: &libc::msghdr) -> (Option<libc::ucred>, Vec<OwnedFd>) {
                         "Received passcred message with multiple sets of credentials: {creds:?}"
                     );
                     credentials = None;
+                } else {
+                    has_creds = true;
+                    credentials = Some(creds);
                 }
             }
 
@@ -758,7 +758,7 @@ fn find_cmsg(msghdr: &libc::msghdr) -> (Option<libc::ucred>, Vec<OwnedFd>) {
                 warn!("Found unknnown cmsg header {level} {typ}. Ignoring.");
             }
         }
-        cmsg = unsafe { libc::CMSG_NXTHDR(msghdr as *const libc::msghdr, cmsg) };
+        cmsg = unsafe { libc::CMSG_NXTHDR(std::ptr::from_ref::<libc::msghdr>(msghdr), cmsg) };
     }
     (credentials, rights)
 }
@@ -892,7 +892,7 @@ impl std::fmt::Debug for Hook<'_> {
                 std::io::Error::from_raw_os_error(self.result.abs())
             )
         } else {
-            "".into()
+            String::new()
         };
         write!(
             f,
@@ -1041,7 +1041,7 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
             (entry.plain(), "")
         };
         // TODO: pre-calculate many of these headers.
-        let mtime = entry.modified().map_or("".to_string(), |mtime| {
+        let mtime = entry.modified().map_or(String::new(), |mtime| {
             format!("Last-Modified: {}\r\n", httpdate::fmt_http_date(*mtime))
         });
         let caching = if CACHE_AGE_SECS > 0 {
@@ -1094,7 +1094,7 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
             0,
             0,
         );
-    };
+    }
     hook.con.read_buf.copy_within(len.., 0);
     hook.con.read_buf_pos -= len;
     Ok(())
@@ -1135,12 +1135,11 @@ fn handle_connection(
                     // Normal EOF.
                     hook.con.close(modern, ops);
                     return Ok(());
-                } else {
-                    return Err(Error::msg(format!(
-                        "client disconnected with partial request: {:?}",
-                        &hook.con.read_buf[..hook.con.read_buf_pos]
-                    )));
                 }
+                return Err(Error::msg(format!(
+                    "client disconnected with partial request: {:?}",
+                    &hook.con.read_buf[..hook.con.read_buf_pos]
+                )));
             }
             hook.con.read_buf_pos += hook.result as usize;
             maybe_answer_req(hook, ops, archive)?;
@@ -1206,7 +1205,7 @@ fn make_op_accept(multi: bool) -> io_uring::squeue::Entry {
 
 #[must_use]
 fn make_op_timeout(ts: Pin<&io_uring::types::Timespec>) -> io_uring::squeue::Entry {
-    io_uring::opcode::Timeout::new(&*ts)
+    io_uring::opcode::Timeout::new(&raw const *ts)
         .build()
         .user_data(USER_DATA_TIMEOUT)
 }
@@ -1510,7 +1509,9 @@ fn mainloop(
                     trace!("Incoming passfd message with code {result}");
                     if pooltracker.free() > 1 {
                         // Issue a new receive.
-                        ops.push(make_op_recvmsg_fixed(passfd_msghdr as *mut libc::msghdr));
+                        ops.push(make_op_recvmsg_fixed(std::ptr::from_mut::<libc::msghdr>(
+                            passfd_msghdr,
+                        )));
                     }
                     if result == 0 {
                         warn!("Received empty passed fd");
@@ -1529,7 +1530,7 @@ fn mainloop(
                                 new_conn.init_fd(
                                     fd,
                                     fixed,
-                                    clienthello.to_vec(),
+                                    clienthello.clone(),
                                     rustls::ServerConnection::new(config.clone())?,
                                     &mut ops,
                                 );
@@ -1568,7 +1569,9 @@ fn mainloop(
                                 ops.push(make_op_accept(opt.accept_multi));
                             }
                         } else {
-                            ops.push(make_op_recvmsg_fixed(passfd_msghdr as *mut libc::msghdr));
+                            ops.push(make_op_recvmsg_fixed(std::ptr::from_mut::<libc::msghdr>(
+                                passfd_msghdr,
+                            )));
                         }
                     }
                 }
@@ -1691,9 +1694,9 @@ fn parse_duration(time_str: &str) -> Result<std::time::Duration, String> {
             .parse::<u64>()
             .map_err(|_| "Invalid milliseconds")?;
         Ok(std::time::Duration::from_millis(ms))
-    } else if time_str.ends_with("s") {
+    } else if time_str.ends_with('s') {
         let secs = time_str
-            .trim_end_matches("s")
+            .trim_end_matches('s')
             .parse::<f64>()
             .map_err(|_| "Invalid seconds")?;
         let secs_whole = secs.trunc() as u64;
@@ -1723,7 +1726,7 @@ fn is_setsockopt_supported() -> Result<bool> {
         io_uring::types::Fd(stream.as_raw_fd()),
         libc::SOL_TCP as u32,
         libc::TCP_ULP as u32,
-        TLS_STR.as_ptr() as *const libc::c_void,
+        TLS_STR.as_ptr().cast::<libc::c_void>(),
         3,
     )
     .build();
@@ -1767,7 +1770,7 @@ fn is_ktls_loaded() -> Result<bool> {
             fd,
             libc::SOL_TCP,
             libc::TCP_ULP,
-            ulp_name.as_ptr() as *const libc::c_void,
+            ulp_name.as_ptr().cast::<libc::c_void>(),
             ulp_name.len() as libc::socklen_t,
         )
     };
@@ -1859,8 +1862,14 @@ fn main() -> Result<()> {
     std::thread::scope(|s| -> Result<()> {
         let mut handles = Vec::new();
         for n in 0..opt.threads {
-            let listener = listener.as_ref().map(|l| l.try_clone()).transpose()?;
-            let passer = passer.as_ref().map(|p| p.try_clone()).transpose()?;
+            let listener = listener
+                .as_ref()
+                .map(std::net::TcpListener::try_clone)
+                .transpose()?;
+            let passer = passer
+                .as_ref()
+                .map(std::os::unix::net::UnixDatagram::try_clone)
+                .transpose()?;
             let opt = &opt;
             let archive = &archive;
             handles.push(
@@ -1895,14 +1904,14 @@ fn main() -> Result<()> {
                         let mut iov_space = [0u8; 2048];
                         let mut iov = libc::iovec {
                             iov_len: iov_space.len(),
-                            iov_base: iov_space.as_mut_ptr() as *mut libc::c_void,
+                            iov_base: iov_space.as_mut_ptr().cast::<libc::c_void>(),
                         };
                         let mut passfd_msghdr = libc::msghdr {
                             msg_name: std::ptr::null_mut(),
                             msg_namelen: 0,
-                            msg_iov: &mut iov as *mut libc::iovec,
+                            msg_iov: &raw mut iov,
                             msg_iovlen: 1,
-                            msg_control: cmsgspace.as_mut_ptr() as *mut libc::c_void,
+                            msg_control: cmsgspace.as_mut_ptr().cast::<libc::c_void>(),
                             msg_controllen: cmsgspace.len(),
                             msg_flags: 0,
                         };
@@ -1913,9 +1922,7 @@ fn main() -> Result<()> {
                             }
                             ops.push(make_op_timeout(timeout));
                             if passer.is_some() {
-                                ops.push(make_op_recvmsg_fixed(
-                                    &mut passfd_msghdr as *mut libc::msghdr,
-                                ));
+                                ops.push(make_op_recvmsg_fixed(&raw mut passfd_msghdr));
                             }
                             ops
                         };
