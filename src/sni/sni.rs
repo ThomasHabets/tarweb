@@ -18,6 +18,7 @@
 //! * Add a bunch of tests.
 //! * Backup backends. E.g. if unix socket fails, maybe route to a "sorry
 //!   server".
+#![allow(clippy::similar_names)]
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
@@ -618,6 +619,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::too_many_lines)]
     use super::*;
     use std::net::SocketAddr;
     use std::sync::atomic::Ordering;
