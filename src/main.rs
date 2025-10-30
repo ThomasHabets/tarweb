@@ -148,7 +148,7 @@ struct RegisteringData {
     // TODO: manage this as an OwnedFd to make it impossible to leak.
     raw_fd: libc::c_int,
     clienthello: Vec<u8>,
-    tls: rustls::ServerConnection,
+    tls: Option<rustls::ServerConnection>,
 }
 
 // State of a connection.
@@ -306,7 +306,7 @@ impl Connection {
             fd,
             raw_fd,
             clienthello: bytes,
-            tls: tls.unwrap(),
+            tls,
         });
         let State::Registering(ref reg) = self.state else {
             unreachable!()
@@ -598,27 +598,32 @@ impl Connection {
     fn pre_read(
         &mut self,
         fixed: FixedFile,
-        tls: rustls::ServerConnection,
+        tls: Option<rustls::ServerConnection>,
         data: &[u8],
         ops: &mut SQueue,
     ) -> Result<()> {
-        let mut d = HandshakeData { fixed, tls };
-        trace!("Giving {} bytes to rustls", data.len());
-        let io = d.received(data)?;
-        let bytes_to_write = io.tls_bytes_to_write();
-        trace!(
-            "Given those {} bytes, rustls needs to send {bytes_to_write} bytes over the wire",
-            data.len()
-        );
-        if bytes_to_write > 0 {
-            let write_buf = [0u8; MAX_WRITE_BUF];
-            let mut cur = std::io::Cursor::new(write_buf);
-            let written = d.tls.write_tls(&mut cur)?;
-            self.write_buf = cur.into_inner();
-            self.state = State::Handshaking(d);
-            self.write(written, ops);
+        if let Some(tls) = tls {
+            let mut d = HandshakeData { fixed, tls };
+            trace!("Giving {} bytes to rustls", data.len());
+            let io = d.received(data)?;
+            let bytes_to_write = io.tls_bytes_to_write();
+            trace!(
+                "Given those {} bytes, rustls needs to send {bytes_to_write} bytes over the wire",
+                data.len()
+            );
+            if bytes_to_write > 0 {
+                let write_buf = [0u8; MAX_WRITE_BUF];
+                let mut cur = std::io::Cursor::new(write_buf);
+                let written = d.tls.write_tls(&mut cur)?;
+                self.write_buf = cur.into_inner();
+                self.state = State::Handshaking(d);
+                self.write(written, ops);
+            } else {
+                self.state = State::Handshaking(d);
+                self.read(ops);
+            }
         } else {
-            self.state = State::Handshaking(d);
+            self.state = State::Reading(fixed);
             self.read(ops);
         }
         Ok(())
@@ -1547,30 +1552,33 @@ fn mainloop(
                         )));
                     }
                     match result.cmp(&0) {
-                        std::cmp::Ordering::Equal => warn!("Received empty passed fd"),
-                        std::cmp::Ordering::Greater => match receive_passed_connection(
-                            passfd_msghdr,
-                            result.try_into().unwrap(),
-                        ) {
-                            Ok((fd, clienthello)) => {
-                                trace!(
-                                    "Passfd extracted: fd={fd:?} clienthello {} bytes",
-                                    clienthello.len()
-                                );
-                                let id = pooltracker.alloc().unwrap();
-                                let fixed = io_uring::types::Fixed(
-                                    (RESERVED_FIXED_SLOTS + id).try_into().unwrap(),
-                                );
-                                debug!("Allocated {id} with passfd");
-                                let new_conn = connections.get(id);
-                                let tls = tls_config
-                                    .as_ref()
-                                    .map(|c| rustls::ServerConnection::new(c.clone()))
-                                    .transpose()?;
-                                new_conn.init_fd(fd, fixed, clienthello.clone(), tls, &mut ops);
+                        // If Equal, that should certainly be because SNI router
+                        // terminated the handshake.
+                        std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
+                            match receive_passed_connection(
+                                passfd_msghdr,
+                                result.try_into().unwrap(),
+                            ) {
+                                Ok((fd, clienthello)) => {
+                                    trace!(
+                                        "Passfd extracted: fd={fd:?} clienthello {} bytes",
+                                        clienthello.len()
+                                    );
+                                    let id = pooltracker.alloc().unwrap();
+                                    let fixed = io_uring::types::Fixed(
+                                        (RESERVED_FIXED_SLOTS + id).try_into().unwrap(),
+                                    );
+                                    debug!("Allocated {id} with passfd");
+                                    let new_conn = connections.get(id);
+                                    let tls = tls_config
+                                        .as_ref()
+                                        .map(|c| rustls::ServerConnection::new(c.clone()))
+                                        .transpose()?;
+                                    new_conn.init_fd(fd, fixed, clienthello.clone(), tls, &mut ops);
+                                }
+                                Err(e) => error!("Receiving passed connection: {e}"),
                             }
-                            Err(e) => error!("Receiving passed connection: {e}"),
-                        },
+                        }
                         std::cmp::Ordering::Less => error!(
                             "recvmsg() error on passed fd, error {}",
                             std::io::Error::from_raw_os_error(result.abs())
