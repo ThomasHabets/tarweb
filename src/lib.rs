@@ -1,3 +1,4 @@
+use anyhow::{Result, anyhow};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 pub mod sock;
@@ -21,10 +22,8 @@ pub fn load_certs<P: AsRef<std::path::Path>>(
 /// # Errors
 ///
 /// Probably file not readable or parsable.
-pub fn load_private_key<P: AsRef<std::path::Path>>(
-    filename: P,
-) -> std::io::Result<PrivateKeyDer<'static>> {
+pub fn load_private_key<P: AsRef<std::path::Path>>(filename: P) -> Result<PrivateKeyDer<'static>> {
     let keyfile = std::fs::File::open(filename)?;
     let mut reader = std::io::BufReader::new(keyfile);
-    rustls_pemfile::private_key(&mut reader).map(|key| key.unwrap())
+    rustls_pemfile::private_key(&mut reader)?.ok_or(anyhow!("no private key in file"))
 }

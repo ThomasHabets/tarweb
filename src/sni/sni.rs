@@ -228,12 +228,12 @@ fn extract_sni(clienthello: &[u8]) -> Result<Option<String>> {
     if body.len() < i + 1 {
         bail!("missing compression_methods length");
     }
-    let cm_len = body[i] as usize;
+    let cmethod_len = body[i] as usize;
     i += 1;
-    if body.len() < i + cm_len {
+    if body.len() < i + cmethod_len {
         bail!("invalid compression_methods vector");
     }
-    i += cm_len;
+    i += cmethod_len;
 
     // optional extensions: len(2) + vector
     if i == body.len() {
@@ -394,7 +394,7 @@ async fn tls_handshake(
                     libc::SOL_TCP,
                     libc::TCP_ULP,
                     ulp_name.as_ptr().cast(),
-                    ulp_name.len() as _,
+                    ulp_name.len().try_into()?,
                 )
             };
             if rc < 0 {
@@ -416,7 +416,7 @@ async fn tls_handshake(
                         libc::SOL_TLS,
                         name,
                         s.as_ptr(),
-                        s.size() as u32,
+                        s.size().try_into()?,
                     )
                 };
                 if rc < 0 {

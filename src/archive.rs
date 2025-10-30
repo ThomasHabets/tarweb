@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::io::Read;
 
 use anyhow::{Context, Result};
+use rayon::iter::IntoParallelRefMutIterator;
+use rayon::iter::ParallelIterator;
 use tracing::{info, trace};
 
 #[must_use]
@@ -68,7 +70,7 @@ impl Archive {
         let page_size = 1 << bits;
         let maplen = (len + (page_size - 1)) & !(page_size - 1);
         let mut m = memmap2::MmapOptions::new()
-            .len(maplen as usize)
+            .len(maplen.try_into()?)
             .huge(Some(bits))
             .map_anon()
             .with_context(|| format!("Failed allocating 1<<{bits}={} bytes", 1 << bits))?;
@@ -87,13 +89,12 @@ impl Archive {
         etags: bool,
     ) -> Result<Self> {
         mmap.advise(memmap2::Advice::Mergeable)?;
-        let mut archive = tar::Archive::new(&file);
+        let mut archive = tar::Archive::new(file);
         let mut content = HashMap::new();
         info!("Indexing…");
         for e in archive.entries()? {
             let e = e?;
-            if let tar::EntryType::Regular = e.header().entry_type() {
-            } else {
+            if !matches![e.header().entry_type(), tar::EntryType::Regular] {
                 continue;
             }
             let name = e.path()?;
@@ -103,8 +104,8 @@ impl Archive {
                 name.to_string(),
                 ArchiveEntry {
                     plain: ArchiveRange {
-                        pos: e.raw_file_position() as usize,
-                        len: e.size() as usize,
+                        pos: e.raw_file_position().try_into()?,
+                        len: e.size().try_into()?,
                     },
                     brotli: None,
                     gzip: None,
@@ -120,8 +121,6 @@ impl Archive {
         }
         if etags {
             info!("Hashing etags…");
-            use rayon::iter::IntoParallelRefMutIterator;
-            use rayon::iter::ParallelIterator;
             content.par_iter_mut().for_each(|(_k, v)| {
                 v.etag = Some(calculate_etag(
                     &mmap[v.plain.pos..(v.plain.pos + v.plain.len)],
@@ -130,23 +129,19 @@ impl Archive {
         }
         let c2 = content.clone();
         for (k, v) in &c2 {
-            if k.ends_with(".br") {
-                let k = &k[..(k.len() - 3)];
-                if let Some(r) = content.get_mut(k) {
-                    r.brotli = Some(v.plain.clone());
-                }
-            }
-            if k.ends_with(".zstd") {
-                let k = &k[..(k.len() - 5)];
-                if let Some(r) = content.get_mut(k) {
-                    r.zstd = Some(v.plain.clone());
-                }
-            }
-            if k.ends_with(".gz") {
-                let k = &k[..(k.len() - 3)];
-                if let Some(r) = content.get_mut(k) {
-                    r.gzip = Some(v.plain.clone());
-                }
+            let Some(ext) = std::path::Path::new(k).extension() else {
+                continue;
+            };
+            let base = &k[..(k.len() - ext.len() - 1)];
+            let Some(r) = content.get_mut(base) else {
+                continue;
+            };
+            let v = Some(v.plain.clone());
+            match ext.to_str().unwrap_or_default() {
+                "br" => r.brotli = v,
+                "zstd" => r.zstd = v,
+                "gz" => r.gzip = v,
+                _ => {}
             }
         }
         Ok(Self { mmap, content })

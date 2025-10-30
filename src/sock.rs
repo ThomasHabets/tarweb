@@ -5,7 +5,7 @@
 /// # Errors
 ///
 /// System setsockopt errors.
-pub fn set_nodelay(fd: libc::c_int) -> std::io::Result<()> {
+pub fn set_nodelay(fd: libc::c_int) -> anyhow::Result<()> {
     let flag: libc::c_int = 1; // Enable TCP_NODELAY (disable Nagle)
     let ret = unsafe {
         libc::setsockopt(
@@ -13,12 +13,12 @@ pub fn set_nodelay(fd: libc::c_int) -> std::io::Result<()> {
             libc::IPPROTO_TCP, // Protocol
             libc::TCP_NODELAY, // Option
             (&raw const flag).cast::<libc::c_void>(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())?,
         )
     };
 
     if ret == -1 {
-        return Err(std::io::Error::last_os_error());
+        return Err(std::io::Error::last_os_error().into());
     }
 
     Ok(())

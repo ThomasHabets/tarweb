@@ -28,6 +28,7 @@
 // * --threads=2
 // * --accept-multi=false (otherwise all goes to first thread)
 // * --cpu-affinity=false (not sure why, but CPU affinity hurts a lot)
+#![allow(clippy::similar_names)]
 
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -66,7 +67,7 @@ const RESERVED_FIXED_SLOTS: usize = 1;
 // 10MiB stack size per thread.
 //
 // There's only one thread per core, so not really anything to optimize.
-const THREAD_STACK_SIZE: usize = 10 * 1048576;
+const THREAD_STACK_SIZE: usize = 10 * 1_048_576;
 
 // Every io_uring op has a "handle" of sorts. We use it to stuff the connection
 // ID, and the operation.
@@ -263,7 +264,7 @@ impl Connection {
             write_buf: [0; MAX_WRITE_BUF],
             read_buf_pos: 0,
             outstanding: 0,
-            header_buf: Default::default(),
+            header_buf: HeaderBuf::default(),
             last_action: std::time::Instant::now(),
             _pin: std::marker::PhantomPinned,
             tls_rx: None,
@@ -313,9 +314,9 @@ impl Connection {
 
     /// Put the Connection object back in Idle state.
     fn deinit(&mut self) {
+        use zeroize::Zeroize;
         assert_eq!(self.outstanding, 0);
         self.state = State::Idle;
-        use zeroize::Zeroize;
         self.read_buf.zeroize();
         self.read_buf_pos = 0;
         self.header_buf.zeroize();
@@ -348,6 +349,7 @@ impl Connection {
     }
 
     /// If the Connection is active, return the file handle.
+    #[allow(clippy::match_same_arms)]
     fn fd(&self) -> Option<FixedFile> {
         match self.state {
             State::Idle => None,
@@ -383,10 +385,13 @@ impl Connection {
         // Surely at least writev()
         // If writev, make sure to handle the over-consumption in write_done()
         self.outstanding += 1;
-        let op =
-            io_uring::opcode::Write::new(fd, self.header_buf.as_ptr(), self.header_buf.len() as _)
-                .build()
-                .user_data((self.id as u64) | USER_DATA_OP_WRITE);
+        let op = io_uring::opcode::Write::new(
+            fd,
+            self.header_buf.as_ptr(),
+            self.header_buf.len().try_into().unwrap(),
+        )
+        .build()
+        .user_data((self.id as u64) | USER_DATA_OP_WRITE);
         ops.push(op);
         self.state = State::WritingHeaders(fd, pos, len);
     }
@@ -407,7 +412,7 @@ impl Connection {
         let msg = archive.get_slice(pos, len);
         self.state = State::WritingData(fd, pos, len);
         self.outstanding += 1;
-        let op = io_uring::opcode::Write::new(fd, msg.as_ptr(), msg.len() as _)
+        let op = io_uring::opcode::Write::new(fd, msg.as_ptr(), msg.len().try_into().unwrap())
             .build()
             .user_data((self.id as u64) | USER_DATA_OP_WRITE);
         ops.push(op);
@@ -452,9 +457,13 @@ impl Connection {
         let data = &self.write_buf[..n];
         self.outstanding += 1;
         ops.push(
-            io_uring::opcode::Write::new(self.fd().unwrap(), data.as_ptr(), data.len() as _)
-                .build()
-                .user_data((self.id as u64) | USER_DATA_OP_WRITE),
+            io_uring::opcode::Write::new(
+                self.fd().unwrap(),
+                data.as_ptr(),
+                data.len().try_into().unwrap(),
+            )
+            .build()
+            .user_data((self.id as u64) | USER_DATA_OP_WRITE),
         );
     }
 
@@ -482,7 +491,7 @@ impl Connection {
     ) {
         ops.push(
             io_uring::opcode::FilesUpdate::new(raw_fd, 1)
-                .offset(fd.0 as i32)
+                .offset(fd.0.try_into().unwrap())
                 .build()
                 .user_data((self.id as u64) | USER_DATA_OP_FILES_UPDATE),
         );
@@ -541,7 +550,7 @@ impl Connection {
             libc::SOL_TLS as u32,
             dir,
             ci.as_ptr().cast(),
-            ci.size() as u32,
+            ci.size().try_into().unwrap(),
         )
         .build();
         let op = if link {
@@ -554,7 +563,7 @@ impl Connection {
 
     // Perform fake synchronous read. This will never be a syscall, because
     // rustls promises it already has the data.
-    fn read_sync(&mut self, buf: &[u8], ops: &mut SQueue) -> Result<()> {
+    fn read_sync(&mut self, buf: &[u8], ops: &mut SQueue) {
         self.read_buf[self.read_buf_pos..(self.read_buf_pos + buf.len())].copy_from_slice(buf);
         self.read_buf_pos += buf.len();
         if false {
@@ -565,7 +574,6 @@ impl Connection {
                     .user_data((self.id as u64) | USER_DATA_OP_NOP),
             );
         }
-        Ok(())
     }
 
     fn issue_nop(&mut self, ops: &mut SQueue) {
@@ -612,6 +620,7 @@ impl Connection {
     }
 
     // Queue up a read.
+    #[allow(clippy::match_same_arms)]
     fn read(&mut self, ops: &mut SQueue) {
         let read_buf = &mut self.read_buf[self.read_buf_pos..];
         let fd = match &self.state {
@@ -628,9 +637,13 @@ impl Connection {
             read_buf.len()
         );
         ops.push(
-            io_uring::opcode::Read::new(fd, read_buf.as_mut_ptr(), read_buf.len() as _)
-                .build()
-                .user_data((self.id as u64) | USER_DATA_OP_READ),
+            io_uring::opcode::Read::new(
+                fd,
+                read_buf.as_mut_ptr(),
+                read_buf.len().try_into().unwrap(),
+            )
+            .build()
+            .user_data((self.id as u64) | USER_DATA_OP_READ),
         );
     }
 
@@ -1141,7 +1154,8 @@ fn handle_connection(
                     &hook.con.read_buf[..hook.con.read_buf_pos]
                 )));
             }
-            hook.con.read_buf_pos += hook.result as usize;
+            let n: usize = hook.result.try_into().unwrap();
+            hook.con.read_buf_pos += n;
             maybe_answer_req(hook, ops, archive)?;
         }
         UserDataOp::Write => {
@@ -1151,7 +1165,10 @@ fn handle_connection(
                     std::io::Error::from_raw_os_error(hook.result.abs())
                 )));
             }
-            if hook.con.write_done(ops, archive, hook.result as usize) {
+            if hook
+                .con
+                .write_done(ops, archive, hook.result.try_into().unwrap())
+            {
                 // Process any further requests, or re-issue a read.
                 maybe_answer_req(hook, ops, archive)?;
             }
@@ -1217,6 +1234,8 @@ fn make_op_recvmsg_fixed(hdr: *mut libc::msghdr) -> io_uring::squeue::Entry {
         .user_data(USER_DATA_PASSED_FD)
 }
 
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::match_same_arms)]
 fn op_completion(
     hook: &mut Hook,
     ops: &mut SQueue,
@@ -1276,7 +1295,7 @@ fn op_completion(
                         return Ok(());
                     }
 
-                    let io = d.received(&hook.con.read_buf[..hook.result as usize])?;
+                    let io = d.received(&hook.con.read_buf[..hook.result.try_into().unwrap()])?;
                     let still_handshaking = d.tls.is_handshaking();
                     let fd = d.fixed;
                     debug!("rustls op: {io:?}");
@@ -1312,7 +1331,7 @@ fn op_completion(
                         hook.con.write(bytes_written, ops);
                     }
                     if bytes_read > 0 {
-                        hook.con.read_sync(&read_buf[..bytes_read], ops)?;
+                        hook.con.read_sync(&read_buf[..bytes_read], ops);
                     }
 
                     if bytes_to_write == 0 && !still_handshaking {
@@ -1409,6 +1428,7 @@ fn op_completion(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 #[nonblocking]
 fn mainloop(
     mut ring: io_uring::IoUring,
@@ -1485,7 +1505,7 @@ fn mainloop(
                         );
                         continue;
                     }
-                    let fixed = io_uring::types::Fixed(result as u32);
+                    let fixed = io_uring::types::Fixed(result.try_into().unwrap());
                     // set_nodelay(result);
                     let id = pooltracker.alloc().unwrap();
                     debug!("Allocated connection {id} when accept()={result}");
@@ -1513,18 +1533,21 @@ fn mainloop(
                             passfd_msghdr,
                         )));
                     }
-                    if result == 0 {
-                        warn!("Received empty passed fd");
-                    } else if result > 0 {
-                        match receive_passed_connection(passfd_msghdr, result as usize) {
+                    match result.cmp(&0) {
+                        std::cmp::Ordering::Equal => warn!("Received empty passed fd"),
+                        std::cmp::Ordering::Greater => match receive_passed_connection(
+                            passfd_msghdr,
+                            result.try_into().unwrap(),
+                        ) {
                             Ok((fd, clienthello)) => {
                                 trace!(
                                     "Passfd extracted: fd={fd:?} clienthello {} bytes",
                                     clienthello.len()
                                 );
                                 let id = pooltracker.alloc().unwrap();
-                                let fixed =
-                                    io_uring::types::Fixed((RESERVED_FIXED_SLOTS + id) as u32);
+                                let fixed = io_uring::types::Fixed(
+                                    (RESERVED_FIXED_SLOTS + id).try_into().unwrap(),
+                                );
                                 debug!("Allocated {id} with passfd");
                                 let new_conn = connections.get(id);
                                 new_conn.init_fd(
@@ -1536,12 +1559,11 @@ fn mainloop(
                                 );
                             }
                             Err(e) => error!("Receiving passed connection: {e}"),
-                        }
-                    } else {
-                        error!(
+                        },
+                        std::cmp::Ordering::Less => error!(
                             "recvmsg() error on passed fd, error {}",
                             std::io::Error::from_raw_os_error(result.abs())
-                        );
+                        ),
                     }
                 }
                 _ => {
@@ -1598,6 +1620,7 @@ fn mainloop(
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser)]
 struct Opt {
     #[arg(
@@ -1687,6 +1710,9 @@ fn parse_bool(input: &str) -> Result<bool, String> {
         _ => Err(format!("Invalid value for flag: {input}")),
     }
 }
+
+#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_possible_truncation)]
 fn parse_duration(time_str: &str) -> Result<std::time::Duration, String> {
     if time_str.ends_with("ms") {
         let ms = time_str
@@ -1771,7 +1797,7 @@ fn is_ktls_loaded() -> Result<bool> {
             libc::SOL_TCP,
             libc::TCP_ULP,
             ulp_name.as_ptr().cast::<libc::c_void>(),
-            ulp_name.len() as libc::socklen_t,
+            ulp_name.len().try_into()?,
         )
     };
 
@@ -1785,6 +1811,7 @@ fn is_ktls_loaded() -> Result<bool> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let opt = Opt::parse();
     tracing_subscriber::fmt()
@@ -1852,7 +1879,7 @@ fn main() -> Result<()> {
                 }
             }
             let sock = std::os::unix::net::UnixDatagram::bind(pass)
-                .context(format!("binding passfd {pass:?}"))?;
+                .context(format!("binding passfd {}", pass.display()))?;
             nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::PassCred, &true)
                 .context("setsockopt(PassCred)")?;
             Ok::<_, Error>(sock)
