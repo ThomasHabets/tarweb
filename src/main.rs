@@ -276,9 +276,14 @@ impl Connection {
     ///
     /// We reuse `Connection` objects between connections, which is why this is
     /// not just part of `new()`.
-    fn init(&mut self, fixed: FixedFile, tls: rustls::ServerConnection) {
+    fn init(&mut self, fixed: FixedFile, tls: Option<rustls::ServerConnection>, ops: &mut SQueue) {
         debug_assert!(matches![self.state, State::Idle]);
-        self.state = State::Handshaking(HandshakeData::new(fixed, tls));
+        if let Some(tls) = tls {
+            self.state = State::Handshaking(HandshakeData::new(fixed, tls));
+        } else {
+            self.state = State::Reading(fixed);
+            self.read(ops);
+        }
         self.last_action = std::time::Instant::now();
     }
 
@@ -291,7 +296,7 @@ impl Connection {
         raw_fd: OwnedFd,
         fd: FixedFile,
         bytes: Vec<u8>,
-        tls: rustls::ServerConnection,
+        tls: Option<rustls::ServerConnection>,
         ops: &mut SQueue,
     ) {
         use std::os::fd::IntoRawFd;
@@ -301,7 +306,7 @@ impl Connection {
             fd,
             raw_fd,
             clienthello: bytes,
-            tls,
+            tls: tls.unwrap(),
         });
         let State::Registering(ref reg) = self.state else {
             unreachable!()
@@ -1443,20 +1448,25 @@ fn mainloop(
     let mut ops: SQueue = ArrayVec::new();
     let mut last_submit = std::time::Instant::now();
     let mut syscalls = 0;
-    debug!("Loading certs");
-    let certs = tarweb::load_certs(&opt.tls_cert)
-        .with_context(|| format!("Loading certs from {}", opt.tls_cert.display()))?;
-    // Load private key.
-    debug!("Loading key");
-    let key = tarweb::load_private_key(&opt.tls_key)
-        .with_context(|| format!("Loading private key from {}", opt.tls_key.display()))?;
-    debug!("Creating TLS config");
-    let mut config =
-        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-            .with_no_client_auth()
-            .with_single_cert(certs, key)?;
-    config.enable_secret_extraction = true;
-    let config = Arc::new(config);
+    let tls_config = if let (Some(cf), Some(kf)) = (&opt.tls_cert, &opt.tls_key) {
+        debug!("Loading certs");
+        let certs = tarweb::load_certs(cf)
+            .with_context(|| format!("Loading certs from {}", cf.display()))?;
+        // Load private key.
+        debug!("Loading key");
+        let key = tarweb::load_private_key(kf)
+            .with_context(|| format!("Loading private key from {}", kf.display()))?;
+        debug!("Creating TLS config");
+        let mut config =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(certs, key)?;
+        config.enable_secret_extraction = true;
+        Some(Arc::new(config))
+    } else {
+        None
+    };
+
     info!("Starting main thread loop");
     loop {
         let mut cq = ring.completion();
@@ -1510,8 +1520,11 @@ fn mainloop(
                     let id = pooltracker.alloc().unwrap();
                     debug!("Allocated connection {id} when accept()={result}");
                     let new_conn = connections.get(id);
-                    let tls = rustls::ServerConnection::new(config.clone())?;
-                    new_conn.init(fixed, tls);
+                    let tls = tls_config
+                        .as_ref()
+                        .map(|c| rustls::ServerConnection::new(c.clone()))
+                        .transpose()?;
+                    new_conn.init(fixed, tls, &mut ops);
                     new_conn.read(&mut ops);
                 }
                 USER_DATA_TIMEOUT => {
@@ -1550,13 +1563,11 @@ fn mainloop(
                                 );
                                 debug!("Allocated {id} with passfd");
                                 let new_conn = connections.get(id);
-                                new_conn.init_fd(
-                                    fd,
-                                    fixed,
-                                    clienthello.clone(),
-                                    rustls::ServerConnection::new(config.clone())?,
-                                    &mut ops,
-                                );
+                                let tls = tls_config
+                                    .as_ref()
+                                    .map(|c| rustls::ServerConnection::new(c.clone()))
+                                    .transpose()?;
+                                new_conn.init_fd(fd, fixed, clienthello.clone(), tls, &mut ops);
                             }
                             Err(e) => error!("Receiving passed connection: {e}"),
                         },
@@ -1693,10 +1704,10 @@ struct Opt {
     prefix: String,
 
     #[arg(long, short = 'P', help = "TLS private key")]
-    tls_key: std::path::PathBuf,
+    tls_key: Option<std::path::PathBuf>,
 
     #[arg(long, short = 'C', help = "TLS certificate chain")]
-    tls_cert: std::path::PathBuf,
+    tls_cert: Option<std::path::PathBuf>,
 
     tarfile: std::path::PathBuf,
 }
