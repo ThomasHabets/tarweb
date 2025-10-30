@@ -41,8 +41,6 @@ use clap::Parser;
 use rtsan_standalone::nonblocking;
 use tracing::{debug, error, info, trace, warn};
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-
 mod archive;
 use archive::Archive;
 
@@ -1220,23 +1218,6 @@ fn make_op_recvmsg_fixed(hdr: *mut libc::msghdr) -> io_uring::squeue::Entry {
         .user_data(USER_DATA_PASSED_FD)
 }
 
-fn load_certs<P: AsRef<std::path::Path>>(
-    filename: P,
-) -> std::io::Result<Vec<CertificateDer<'static>>> {
-    // Open certificate file.
-    let certfile = std::fs::File::open(filename)?;
-    let mut reader = std::io::BufReader::new(certfile);
-    rustls_pemfile::certs(&mut reader).collect()
-}
-
-fn load_private_key<P: AsRef<std::path::Path>>(
-    filename: P,
-) -> std::io::Result<PrivateKeyDer<'static>> {
-    let keyfile = std::fs::File::open(filename)?;
-    let mut reader = std::io::BufReader::new(keyfile);
-    rustls_pemfile::private_key(&mut reader).map(|key| key.unwrap())
-}
-
 fn op_completion(
     hook: &mut Hook,
     ops: &mut SQueue,
@@ -1444,11 +1425,11 @@ fn mainloop(
     let mut last_submit = std::time::Instant::now();
     let mut syscalls = 0;
     debug!("Loading certs");
-    let certs = load_certs(&opt.tls_cert)
+    let certs = tarweb::load_certs(&opt.tls_cert)
         .with_context(|| format!("Loading certs from {}", opt.tls_cert.display()))?;
     // Load private key.
     debug!("Loading key");
-    let key = load_private_key(&opt.tls_key)
+    let key = tarweb::load_private_key(&opt.tls_key)
         .with_context(|| format!("Loading private key from {}", opt.tls_key.display()))?;
     debug!("Creating TLS config");
     let mut config =

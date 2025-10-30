@@ -24,7 +24,9 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use std::net::ToSocketAddrs;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixDatagram;
 use tracing::{debug, info, trace, warn};
 
@@ -46,6 +48,12 @@ struct Opt {
     /// Address to listen to.
     #[arg(long, short, default_value = "[::]:443")]
     listen: std::net::SocketAddr,
+
+    #[arg(long)]
+    cert_file: Option<std::path::PathBuf>,
+
+    #[arg(long)]
+    key_file: Option<std::path::PathBuf>,
 
     #[arg(long)]
     sock: std::path::PathBuf,
@@ -286,16 +294,31 @@ fn extract_sni(clienthello: &[u8]) -> Result<Option<String>> {
 }
 
 #[derive(Debug)]
+struct TlsConfig {
+    cert_file: std::path::PathBuf,
+    key_file: std::path::PathBuf,
+}
+
+#[derive(Debug)]
 enum Backend {
     // Just close the connection.
     Null,
 
     // Connect to a unix socket and pass in bytes read so far, and the file
     // descriptor to continue.
-    Pass(std::path::PathBuf),
+    Pass {
+        path: std::path::PathBuf,
+        tls: Option<TlsConfig>,
+    },
 
     // Proxy string. DNS resolved on every new connection.
-    Proxy(String),
+    //
+    // If a TlsConfig is provided then the handshake and kTLS setup is done by
+    // the SNI router.
+    Proxy {
+        addr: String,
+        tls: Option<TlsConfig>,
+    },
 }
 
 #[derive(Debug)]
@@ -304,17 +327,127 @@ struct Rule {
     backend: Backend,
 }
 
+// TODO: this should probably become a protobuf.
 #[derive(Debug)]
 struct Config {
     rules: Vec<Rule>,
     default_backend: Backend,
 }
 
+/// Perform TLS handshake and setsockopt with kTLS.
+///
+/// Returns the new stream and the new initial bytes.
+async fn tls_handshake(
+    mut stream: tokio::net::TcpStream,
+    mut bytes: Vec<u8>,
+    config: &TlsConfig,
+) -> Result<(tokio::net::TcpStream, Vec<u8>)> {
+    use std::io::Read;
+    use tokio::io::AsyncWriteExt;
+
+    let certs = tarweb::load_certs(&config.cert_file)?;
+    let key = tarweb::load_private_key(&config.key_file)?;
+
+    debug!(
+        "Handshaking with {:?}/{:?}",
+        config.cert_file, config.key_file
+    );
+    let cfg = Arc::new({
+        let mut cfg =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(certs, key)?;
+        cfg.enable_secret_extraction = true;
+        cfg
+    });
+
+    let mut tls = rustls::ServerConnection::new(cfg)?;
+    loop {
+        // Give bytes we have to rustls.
+        {
+            let mut cur = std::io::Cursor::new(&bytes);
+            let n = tls.read_tls(&mut cur)?;
+            bytes.drain(0..n);
+        }
+        let io = tls.process_new_packets()?;
+
+        // Send rustls bytes to the peer.
+        let bytes_to_write = io.tls_bytes_to_write();
+        if bytes_to_write > 0 {
+            let mut buf = vec![0u8; bytes_to_write];
+            let mut cur = std::io::Cursor::new(&mut buf);
+            let n = tls.write_tls(&mut cur)?;
+            // TODO: can we assume remote side will not be overwhelmed?
+            // If it is, and insists on writing, then we deadlock (time out).
+            stream.write_all(&buf[..n]).await?;
+        }
+        let still_handshaking = tls.is_handshaking();
+        if !still_handshaking {
+            let plain_n = io.plaintext_bytes_to_read();
+            let mut buf = vec![0u8; plain_n];
+            let n = tls.reader().read(&mut buf[..plain_n])?;
+            assert_eq!(plain_n, n);
+
+            // Enable initial TLS option.
+            let ulp_name = b"tls\0";
+            let rc = unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_TCP,
+                    libc::TCP_ULP,
+                    ulp_name.as_ptr() as _,
+                    ulp_name.len() as _,
+                )
+            };
+            if rc < 0 {
+                return Err(anyhow!(
+                    "setsockopt()=>{rc}: {}",
+                    std::io::Error::from_raw_os_error(rc.abs())
+                ));
+            }
+
+            // Hand over keys.
+            let suite = tls.negotiated_cipher_suite().ok_or(anyhow!("bleh"))?;
+            let keys = tls.dangerous_extract_secrets()?;
+            let tls_rx = ktls::CryptoInfo::from_rustls(suite, keys.rx)?;
+            let tls_tx = ktls::CryptoInfo::from_rustls(suite, keys.tx)?;
+            for (name, s) in [(libc::TLS_RX, tls_rx), (libc::TLS_TX, tls_tx)] {
+                let rc = unsafe {
+                    libc::setsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_TLS,
+                        name,
+                        s.as_ptr(),
+                        s.size() as u32,
+                    )
+                };
+                if rc < 0 {
+                    return Err(anyhow!(
+                        "setsockopt()=>{rc}: {}",
+                        std::io::Error::from_raw_os_error(rc.abs())
+                    ));
+                }
+            }
+            return Ok((stream, buf));
+        }
+
+        // Handshake still going.
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).await?;
+        bytes.extend(&buf[..n]);
+
+        // TODO: what should this magic value be?
+        if bytes.len() > 8192 {
+            return Err(anyhow!("max TLS outstanding size exceeded"));
+        }
+    }
+}
+
 /// A backend has been selected. Deal with the stream and its backend as
 /// appropriate.
 async fn handle_conn_backend(
     id: usize,
-    mut stream: tokio::net::TcpStream,
+    stream: tokio::net::TcpStream,
     bytes: Vec<u8>,
     backend: &Backend,
 ) -> Result<()> {
@@ -323,7 +456,11 @@ async fn handle_conn_backend(
             trace!("id={id} Null backend. Closing");
             Ok(())
         }
-        Backend::Pass(path) => {
+        Backend::Pass { path, tls } => {
+            // Connecting to a UnixDatagram should be cheap, and not at all be
+            // visible to the backend. It's only when we SendMsg that it can
+            // cause any load. So we first do this connect, so that we don't
+            // needlessly do a handshake only to then never connect to anything.
             let sock = tokio::net::UnixDatagram::unbound().context("create UnixDatagram")?;
             sock.connect(path)
                 .with_context(|| format!("connect to {:?}", path.display()))?;
@@ -341,12 +478,14 @@ async fn handle_conn_backend(
                     ucred.gid()
                 );
             }
+            let (stream, bytes) = if let Some(tls) = tls {
+                tls_handshake(stream, bytes, tls).await?
+            } else {
+                (stream, bytes)
+            };
             pass_fd_over_uds(stream, sock, bytes).await
         }
-        Backend::Proxy(addr) => {
-            use std::net::ToSocketAddrs;
-            use tokio::io::AsyncWriteExt;
-
+        Backend::Proxy { addr, tls } => {
             let addrs = addr.to_socket_addrs()?;
             let mut conn = None;
             for addr in addrs {
@@ -361,6 +500,11 @@ async fn handle_conn_backend(
                     }
                 }
             }
+            let (mut stream, bytes) = if let Some(tls) = tls {
+                tls_handshake(stream, bytes, tls).await?
+            } else {
+                (stream, bytes)
+            };
             let Some(mut conn) = conn else {
                 return Err(anyhow!("failed to connect to all backends"));
             };
@@ -450,10 +594,26 @@ async fn main() -> Result<()> {
             },
             Rule {
                 re: regex::Regex::new("bar")?,
-                backend: Backend::Proxy("localhost:8080".to_string()),
+                backend: Backend::Proxy {
+                    addr: "localhost:8080".to_string(),
+                    tls: None,
+                },
+            },
+            Rule {
+                re: regex::Regex::new("baz")?,
+                backend: Backend::Pass {
+                    path: opt.sock.clone(),
+                    tls: Some(TlsConfig {
+                        cert_file: opt.cert_file.unwrap().clone(),
+                        key_file: opt.key_file.unwrap().clone(),
+                    }),
+                },
             },
         ],
-        default_backend: Backend::Pass(opt.sock.clone()),
+        default_backend: Backend::Pass {
+            path: opt.sock.clone(),
+            tls: None,
+        },
     };
     mainloop(Arc::new(config), listener).await
 }
@@ -503,14 +663,23 @@ mod tests {
                         },
                         Rule {
                             re: regex::Regex::new("socket")?,
-                            backend: Backend::Pass(sockfile.clone()),
+                            backend: Backend::Pass {
+                                path: sockfile.clone(),
+                                tls: None,
+                            },
                         },
                         Rule {
                             re: regex::Regex::new("bar")?,
-                            backend: Backend::Proxy(format!("[::1]:{backend_bar_port}")),
+                            backend: Backend::Proxy {
+                                addr: format!("[::1]:{backend_bar_port}"),
+                                tls: None,
+                            },
                         },
                     ],
-                    default_backend: Backend::Proxy(format!("[::1]:{backend_baz_port}")),
+                    default_backend: Backend::Proxy {
+                        addr: format!("[::1]:{backend_baz_port}"),
+                        tls: None,
+                    },
                 };
                 let _main =
                     tokio::task::spawn(async move { mainloop(Arc::new(config), listener).await });
