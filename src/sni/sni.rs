@@ -585,7 +585,7 @@ async fn main() -> Result<()> {
         .context(format!("listening to {}", opt.listen))?;
     sock::set_nodelay(listener.as_raw_fd())?;
     // Config.
-    let config = Config {
+    let mut config = Config {
         rules: vec![
             Rule {
                 re: regex::Regex::new("foo")?,
@@ -598,22 +598,24 @@ async fn main() -> Result<()> {
                     tls: None,
                 },
             },
-            Rule {
-                re: regex::Regex::new("baz")?,
-                backend: Backend::Pass {
-                    path: opt.sock.clone(),
-                    tls: Some(TlsConfig {
-                        cert_file: opt.cert_file.unwrap().clone(),
-                        key_file: opt.key_file.unwrap().clone(),
-                    }),
-                },
-            },
         ],
         default_backend: Backend::Pass {
             path: opt.sock.clone(),
             tls: None,
         },
     };
+    if let (Some(cf), Some(kf)) = (opt.cert_file, opt.key_file) {
+        config.rules.push(Rule {
+            re: regex::Regex::new("baz")?,
+            backend: Backend::Pass {
+                path: opt.sock.clone(),
+                tls: Some(TlsConfig {
+                    cert_file: cf.clone(),
+                    key_file: kf.clone(),
+                }),
+            },
+        });
+    }
     mainloop(Arc::new(config), listener).await
 }
 
