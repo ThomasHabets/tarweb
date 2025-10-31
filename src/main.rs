@@ -749,6 +749,8 @@ fn find_cmsg(msghdr: &libc::msghdr) -> (Option<libc::ucred>, Vec<OwnedFd>) {
                 assert_eq!(data.len(), std::mem::size_of::<libc::ucred>());
                 let mut creds = std::mem::MaybeUninit::<libc::ucred>::uninit();
                 let creds = unsafe {
+                    // Can't guarantee that data is aligned for ucred, so copy
+                    // as bytes (u8).
                     std::ptr::copy_nonoverlapping(
                         data.as_ptr(),
                         creds.as_mut_ptr().cast::<u8>(),
