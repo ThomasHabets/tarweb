@@ -75,8 +75,8 @@ fn load_tls(cfg: Option<&protos::backend::Tls>) -> Result<Option<TlsConfig>> {
         return Ok(None);
     };
     Ok(Some(TlsConfig {
-        cert_file: cfg.cert_file.clone().into(),
-        key_file: cfg.key_file.clone().into(),
+        certs: tarweb::load_certs(&cfg.cert_file)?,
+        key: tarweb::load_private_key(&cfg.key_file)?,
     }))
 }
 
@@ -363,8 +363,8 @@ fn extract_sni(clienthello: &[u8]) -> Result<Option<String>> {
 
 #[derive(Debug)]
 struct TlsConfig {
-    cert_file: std::path::PathBuf,
-    key_file: std::path::PathBuf,
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
 }
 
 #[derive(Debug)]
@@ -413,18 +413,12 @@ async fn tls_handshake(
     use std::io::Read;
     use tokio::io::AsyncWriteExt;
 
-    let certs = tarweb::load_certs(&config.cert_file)?;
-    let key = tarweb::load_private_key(&config.key_file)?;
-
-    debug!(
-        "Handshaking with {:?}/{:?}",
-        config.cert_file, config.key_file
-    );
+    debug!("Handshaking…");
     let cfg = Arc::new({
         let mut cfg =
             rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
                 .with_no_client_auth()
-                .with_single_cert(certs, key)?;
+                .with_single_cert(config.certs.clone(), config.key.clone_key())?;
         cfg.enable_secret_extraction = true;
         // Enable key log file to file named from env SSLKEYLOGFILE.
         // cfg.key_log = Arc::new(rustls::KeyLogFile::new());
