@@ -33,6 +33,10 @@ use tracing::{debug, info, trace, warn};
 
 use tarweb::sock;
 
+pub mod protos {
+    include!(concat!(env!("OUT_DIR"), "/tarweb.rs"));
+}
+
 // How much capacity to prepare for ClientHello and stuff.
 const BUF_CAPACITY: usize = 2048;
 
@@ -56,8 +60,73 @@ struct Opt {
     #[arg(long)]
     key_file: Option<std::path::PathBuf>,
 
+    /// Asciiproto config.
+    #[arg(long)]
+    config: String,
+
     #[arg(long)]
     sock: std::path::PathBuf,
+}
+
+#[allow(clippy::unnecessary_wraps)]
+// TODO: actually load the configs.
+fn load_tls(cfg: Option<&protos::backend::Tls>) -> Result<Option<TlsConfig>> {
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+    Ok(Some(TlsConfig {
+        cert_file: cfg.cert_file.clone().into(),
+        key_file: cfg.key_file.clone().into(),
+    }))
+}
+
+fn load_backend(be: &protos::backend::Backend) -> Result<Backend> {
+    Ok(match be {
+        protos::backend::Backend::Null(_) => Backend::Null,
+        protos::backend::Backend::Proxy(p) => Backend::Proxy {
+            addr: p.addr.clone(),
+            tls: load_tls(p.tls.as_ref())?,
+        },
+        protos::backend::Backend::Pass(p) => Backend::Pass {
+            path: p.path.clone().into(),
+            tls: load_tls(p.tls.as_ref())?,
+        },
+    })
+}
+
+fn load_config(filename: &str) -> Result<Config> {
+    let pool = prost_reflect::DescriptorPool::decode(PROTO_DESCRIPTOR)?;
+    let md = pool
+        .get_message_by_name("tarweb.SNIConfig")
+        .ok_or(anyhow!("Unable to reflect SNIConfig"))?;
+    let txt = std::fs::read_to_string(filename)?;
+    let dyn_msg = prost_reflect::DynamicMessage::parse_text_format(md, &txt)?;
+
+    let protocfg: protos::SniConfig = dyn_msg.transcode_to()?;
+
+    let mut config = Config {
+        rules: vec![],
+        default_backend: load_backend(
+            &protocfg
+                .default_backend
+                .ok_or(anyhow!("Config missing default backend"))?
+                .backend
+                .ok_or(anyhow!("Default backend missing an actual backend"))?,
+        )?,
+    };
+    for rule in protocfg.rules {
+        config.rules.push(Rule {
+            re: regex::Regex::new(&rule.regex)?,
+            backend: load_backend(
+                &rule
+                    .backend
+                    .ok_or(anyhow!("Rule missing backend"))?
+                    .backend
+                    .ok_or(anyhow!("Rule backend has no actual backend"))?,
+            )?,
+        });
+    }
+    Ok(config)
 }
 
 /// Read enough bytes from `stream` to cover the entire TLS `ClientHello` handshake
@@ -597,6 +666,8 @@ async fn mainloop(config: Arc<Config>, listener: tokio::net::TcpListener) -> Res
     }
 }
 
+const PROTO_DESCRIPTOR: &[u8] = include_bytes!("../../descriptor.bin");
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt = Opt::parse();
@@ -611,49 +682,7 @@ async fn main() -> Result<()> {
         .context(format!("listening to {}", opt.listen))?;
     sock::set_nodelay(listener.as_raw_fd())?;
     // Config.
-    let mut config = Config {
-        rules: vec![
-            Rule {
-                re: regex::Regex::new("foo")?,
-                backend: Backend::Null,
-            },
-            Rule {
-                re: regex::Regex::new("bar")?,
-                backend: Backend::Proxy {
-                    addr: "localhost:8080".to_string(),
-                    tls: None,
-                },
-            },
-        ],
-        default_backend: Backend::Pass {
-            path: opt.sock.clone(),
-            tls: None,
-        },
-    };
-    if let (Some(cf), Some(kf)) = (opt.cert_file, opt.key_file) {
-        config.rules.extend([
-            Rule {
-                re: regex::Regex::new("baz")?,
-                backend: Backend::Pass {
-                    path: opt.sock.clone(),
-                    tls: Some(TlsConfig {
-                        cert_file: cf.clone(),
-                        key_file: kf.clone(),
-                    }),
-                },
-            },
-            Rule {
-                re: regex::Regex::new("tls-proxy")?,
-                backend: Backend::Proxy {
-                    addr: "localhost:8080".to_string(),
-                    tls: Some(TlsConfig {
-                        cert_file: cf.clone(),
-                        key_file: kf.clone(),
-                    }),
-                },
-            },
-        ]);
-    }
+    let config = load_config(&opt.config)?;
     mainloop(Arc::new(config), listener).await
 }
 

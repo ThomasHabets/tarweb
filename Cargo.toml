@@ -42,6 +42,12 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread"] }
 zeroize = { version = "1", features = ["simd"] }
 regex = "1.12.2"
+prost = "0.14.1"
+serde = { version = "1.0.228", features = ["derive"] }
+prost-reflect = { version = "0.16.2", features = ["text-format"] }
+
+[build-dependencies]
+prost-build = "0.14.1"
 
 [dev-dependencies]
 tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "process", "sync", "time"] }

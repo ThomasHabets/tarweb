@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package tarweb;
+
+message Rule {
+        string regex = 1;
+        Backend backend = 2;
+}
+
+message Backend {
+        message Tls {
+                string cert_file = 1;
+                string key_file = 2;
+        }
+        message Null {
+        }
+        message Proxy {
+                string addr = 1;
+                Tls tls = 2;
+        }
+        message Pass {
+                string path = 1;
+                Tls tls = 2;
+        }
+        oneof backend {
+                Null null = 1;
+                Proxy proxy = 2;
+                Pass pass = 3;
+        }
+}
+
+message SNIConfig {
+        repeated Rule rules = 1;
+        Backend default_backend = 2;
+}
+
