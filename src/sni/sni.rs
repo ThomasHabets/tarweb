@@ -70,14 +70,22 @@ struct Opt {
 
 #[allow(clippy::unnecessary_wraps)]
 // TODO: actually load the configs.
-fn load_tls(cfg: Option<&protos::backend::Tls>) -> Result<Option<TlsConfig>> {
+fn load_tls(cfg: Option<&protos::backend::Tls>) -> Result<Option<Arc<rustls::ServerConfig>>> {
     let Some(cfg) = cfg else {
         return Ok(None);
     };
-    Ok(Some(TlsConfig {
-        certs: tarweb::load_certs(&cfg.cert_file)?,
-        key: tarweb::load_private_key(&cfg.key_file)?,
-    }))
+    let certs = tarweb::load_certs(&cfg.cert_file)?;
+    let key = tarweb::load_private_key(&cfg.key_file)?;
+    Ok(Some(Arc::new({
+        let mut cfg =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(certs, key)?;
+        cfg.enable_secret_extraction = true;
+        // Enable key log file to file named from env SSLKEYLOGFILE.
+        // cfg.key_log = Arc::new(rustls::KeyLogFile::new());
+        cfg
+    })))
 }
 
 fn load_backend(be: &protos::backend::Backend) -> Result<Backend> {
@@ -362,12 +370,6 @@ fn extract_sni(clienthello: &[u8]) -> Result<Option<String>> {
 }
 
 #[derive(Debug)]
-struct TlsConfig {
-    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
-    key: rustls::pki_types::PrivateKeyDer<'static>,
-}
-
-#[derive(Debug)]
 enum Backend {
     // Just close the connection.
     Null,
@@ -376,7 +378,7 @@ enum Backend {
     // descriptor to continue.
     Pass {
         path: std::path::PathBuf,
-        tls: Option<TlsConfig>,
+        tls: Option<Arc<rustls::ServerConfig>>,
     },
 
     // Proxy string. DNS resolved on every new connection.
@@ -385,7 +387,7 @@ enum Backend {
     // the SNI router.
     Proxy {
         addr: String,
-        tls: Option<TlsConfig>,
+        tls: Option<Arc<rustls::ServerConfig>>,
     },
 }
 
@@ -408,22 +410,12 @@ struct Config {
 async fn tls_handshake(
     mut stream: tokio::net::TcpStream,
     mut bytes: Vec<u8>,
-    config: &TlsConfig,
+    cfg: Arc<rustls::ServerConfig>,
 ) -> Result<(tokio::net::TcpStream, Vec<u8>)> {
     use std::io::Read;
     use tokio::io::AsyncWriteExt;
 
     debug!("Handshaking…");
-    let cfg = Arc::new({
-        let mut cfg =
-            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .with_no_client_auth()
-                .with_single_cert(config.certs.clone(), config.key.clone_key())?;
-        cfg.enable_secret_extraction = true;
-        // Enable key log file to file named from env SSLKEYLOGFILE.
-        // cfg.key_log = Arc::new(rustls::KeyLogFile::new());
-        cfg
-    });
 
     let mut tls = rustls::ServerConnection::new(cfg)?;
     loop {
@@ -512,7 +504,7 @@ async fn handle_conn_backend_proxy(
     stream: tokio::net::TcpStream,
     bytes: Vec<u8>,
     addr: &str,
-    tls: Option<&TlsConfig>,
+    tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
     let addrs = addr.to_socket_addrs()?;
     let mut conn = None;
@@ -607,14 +599,14 @@ async fn handle_conn_backend(
                 );
             }
             let (stream, bytes) = if let Some(tls) = tls {
-                tls_handshake(stream, bytes, tls).await?
+                tls_handshake(stream, bytes, tls.clone()).await?
             } else {
                 (stream, bytes)
             };
             pass_fd_over_uds(stream, sock, bytes).await
         }
         Backend::Proxy { addr, tls } => {
-            handle_conn_backend_proxy(id, stream, bytes, addr, tls.as_ref()).await
+            handle_conn_backend_proxy(id, stream, bytes, addr, tls.clone()).await
         }
     }
 }
