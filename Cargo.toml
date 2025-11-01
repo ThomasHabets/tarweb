@@ -8,6 +8,7 @@ readme = "README.md"
 repository = "https://github.com/ThomasHabets/tarweb"
 description = "io-uring based static file web server, with SNI router"
 keywords = ["webserver"]
+default-run = "tarweb"
 
 [dependencies]
 anyhow = "1"
@@ -62,7 +63,7 @@ debug = true
 
 [[bin]]
 name = "sni_router"
-path = "src/sni/sni.rs"
+path = "src/bin/sni.rs"
 
 [lib]
 name = "tarweb"
