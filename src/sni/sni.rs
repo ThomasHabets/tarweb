@@ -426,6 +426,8 @@ async fn tls_handshake(
                 .with_no_client_auth()
                 .with_single_cert(certs, key)?;
         cfg.enable_secret_extraction = true;
+        // Enable key log file to file named from env SSLKEYLOGFILE.
+        // cfg.key_log = Arc::new(rustls::KeyLogFile::new());
         cfg
     });
 
