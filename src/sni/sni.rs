@@ -442,6 +442,70 @@ async fn tls_handshake(
     }
 }
 
+async fn handle_conn_backend_proxy(
+    id: usize,
+    stream: tokio::net::TcpStream,
+    bytes: Vec<u8>,
+    addr: &str,
+    tls: Option<&TlsConfig>,
+) -> Result<()> {
+    let addrs = addr.to_socket_addrs()?;
+    let mut conn = None;
+    for addr in addrs {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(ok) => {
+                trace!("id={id} Connected to backend {addr}");
+                conn = Some(ok);
+                break;
+            }
+            Err(e) => {
+                debug!("id={id} Failed to connect to backend {addr:?}: {e}");
+            }
+        }
+    }
+    let (mut stream, bytes) = if let Some(tls) = tls {
+        tls_handshake(stream, bytes, tls).await?
+    } else {
+        (stream, bytes)
+    };
+    let Some(mut conn) = conn else {
+        return Err(anyhow!("failed to connect to all backends"));
+    };
+    let (mut up_r, mut up_w) = conn.split();
+    let (mut down_r, mut down_w) = stream.split();
+    let upstream = async {
+        let me = down_r.local_addr()?;
+        let peer = down_r.peer_addr()?;
+        let src_port = peer.port();
+        let src_addr = peer.ip().to_string();
+        let proto = if peer.is_ipv4() {
+            "TCP4"
+        } else if peer.is_ipv6() {
+            "TCP6"
+        } else {
+            "UNKNOWN"
+        };
+        let dst_addr = me.ip().to_string();
+        let dst_port = me.port();
+        up_w.write_all(
+            format!("PROXY {proto} {src_addr} {dst_addr} {src_port} {dst_port}\r\n").as_bytes(),
+        )
+        .await?;
+        up_w.write_all(&bytes).await?;
+        tokio::io::copy(&mut down_r, &mut up_w).await?;
+        up_w.shutdown().await?;
+        trace!("id={id} Upstream write completed");
+        Ok::<_, anyhow::Error>(())
+    };
+    let downstream = async {
+        tokio::io::copy(&mut up_r, &mut down_w).await?;
+        down_w.shutdown().await?;
+        trace!("id={id} Downstream write completed");
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::try_join!(upstream, downstream)?;
+    Ok(())
+}
 /// A backend has been selected. Deal with the stream and its backend as
 /// appropriate.
 async fn handle_conn_backend(
@@ -485,45 +549,7 @@ async fn handle_conn_backend(
             pass_fd_over_uds(stream, sock, bytes).await
         }
         Backend::Proxy { addr, tls } => {
-            let addrs = addr.to_socket_addrs()?;
-            let mut conn = None;
-            for addr in addrs {
-                match tokio::net::TcpStream::connect(addr).await {
-                    Ok(ok) => {
-                        trace!("id={id} Connected to backend {addr}");
-                        conn = Some(ok);
-                        break;
-                    }
-                    Err(e) => {
-                        debug!("id={id} Failed to connect to backend {addr:?}: {e}");
-                    }
-                }
-            }
-            let (mut stream, bytes) = if let Some(tls) = tls {
-                tls_handshake(stream, bytes, tls).await?
-            } else {
-                (stream, bytes)
-            };
-            let Some(mut conn) = conn else {
-                return Err(anyhow!("failed to connect to all backends"));
-            };
-            let (mut up_r, mut up_w) = conn.split();
-            let (mut down_r, mut down_w) = stream.split();
-            let upstream = async {
-                up_w.write_all(&bytes).await?;
-                tokio::io::copy(&mut down_r, &mut up_w).await?;
-                up_w.shutdown().await?;
-                trace!("id={id} Upstream write completed");
-                Ok::<_, anyhow::Error>(())
-            };
-            let downstream = async {
-                tokio::io::copy(&mut up_r, &mut down_w).await?;
-                down_w.shutdown().await?;
-                trace!("id={id} Downstream write completed");
-                Ok::<_, anyhow::Error>(())
-            };
-            tokio::try_join!(upstream, downstream)?;
-            Ok(())
+            handle_conn_backend_proxy(id, stream, bytes, addr, tls.as_ref()).await
         }
     }
 }
