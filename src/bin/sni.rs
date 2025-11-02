@@ -646,21 +646,20 @@ async fn mainloop(
     let mut hups = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .expect("Registering SIGHUP");
     loop {
-        let (stream, peer) = listener.accept().await?;
-        debug!("id={id} fd={} Accepted {}", stream.as_raw_fd(), peer);
-        if tokio::time::timeout(tokio::time::Duration::ZERO, hups.recv())
-            .await
-            .unwrap_or_default()
-            .is_some()
-        {
-            info!("Loading new config");
-            match load_config(config_filename) {
-                Ok(c) => config = Arc::new(c),
-                Err(e) => error!(
-                    "Failed to load config {config_filename:?}, staying with old config: {e}"
-                ),
+        let (stream, peer) = tokio::select! {
+            r = listener.accept() => r,
+            _ = hups.recv() => {
+                info!("Got SIGHUP. Loading new config");
+                match load_config(config_filename) {
+                    Ok(c) => config = Arc::new(c),
+                    Err(e) => error!(
+                        "Failed to load config {config_filename:?}, staying with old config: {e}"
+                    ),
+                }
+                continue;
             }
-        }
+        }?;
+        debug!("id={id} fd={} Accepted {}", stream.as_raw_fd(), peer);
         let config = config.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_conn(id, stream, &config).await {
