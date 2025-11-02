@@ -48,6 +48,8 @@ use archive::Archive;
 mod sock;
 use sock::set_nodelay;
 
+mod privs;
+
 type FixedFile = io_uring::types::Fixed;
 
 // Cache max age.
@@ -1475,6 +1477,9 @@ fn mainloop(
     };
 
     info!("Starting main thread loop");
+    if opt.secure {
+        privs::drop_privs(tls_config.is_some())?;
+    }
     loop {
         let mut cq = ring.completion();
         assert_eq!(cq.overflow(), 0);
@@ -1718,6 +1723,11 @@ struct Opt {
 
     #[arg(long, short = 'C', help = "TLS certificate chain")]
     tls_cert: Option<std::path::PathBuf>,
+
+    /// Drop all privileges, at risk of causing binary to crash when a library
+    /// starts doing a new thing.
+    #[arg(long)]
+    secure: bool,
 
     tarfile: std::path::PathBuf,
 }
@@ -2009,6 +2019,9 @@ fn main() -> Result<()> {
         }
         drop(listener);
         drop(passer);
+        if opt.secure {
+            privs::drop_privs(opt.tls_key.is_some())?;
+        }
         for handle in handles {
             handle.join().expect("foo")?;
         }

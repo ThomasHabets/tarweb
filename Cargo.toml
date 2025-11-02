@@ -46,6 +46,7 @@ regex = "1.12.2"
 prost = "0.14.1"
 serde = { version = "1.0.228", features = ["derive"] }
 prost-reflect = { version = "0.16.2", features = ["text-format"] }
+libseccomp = "0.4.0"
 
 [build-dependencies]
 prost-build = "0.14.1"
