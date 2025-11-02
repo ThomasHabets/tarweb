@@ -1,8 +1,19 @@
+//! # SNI router.
+//!
 //! TCP terminating server that snoops on TLS SNI, and then passes the FD on to
-//! another server, like tarweb.
+//! another server, like tarweb. Or if the other server doesn't support FD
+//! passing, it proxies the connection via the PROXY v1 protocol.
 //!
 //! The idea here is to actually make different routing decisions based on SNI,
 //! and depending on the match, either pass the FD, or do TCP level proxying.
+//!
+//! Optionally, the SNI router can also do the TLS handshake, and set up kTLS,
+//! so that the other server can just treat the connection as plaintext.
+//!
+//! If you enable *both* proxying (i.e. not FD passing) and TLS handshaking,
+//! then make sure the path to the other server is not going over an unencrypted
+//! channel, such as plain ethernet. You'll want it to be localhost, or over
+//! some VPN, since the connection to the backend will not be encrypted.
 //!
 //! ## Notable
 //!
@@ -12,13 +23,16 @@
 //! ## TODO
 //!
 //! * Add max connection idle time.
+//! * Add max connection time.
 //! * Think more about how to best degrade if `sendmsg()` passing the FD fails
 //!   with `EMSGSIZE`. Queue? Drop?
 //! * Maybe leave the unix socket connected, and only try to reconnect on error?
 //! * Add a bunch of tests.
 //! * Backup backends. E.g. if unix socket fails, maybe route to a "sorry
 //!   server".
+// Disable overly pedantic pedantic-level clippy lints.
 #![allow(clippy::similar_names)]
+
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
@@ -698,6 +712,8 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::atomic::Ordering;
 
+    const MAX_TEST_CONNECTION_TIME: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+
     #[tokio::test]
     async fn default_client() -> Result<()> {
         if false {
@@ -826,7 +842,7 @@ mod tests {
                     // Connected to nothing.
                     hit_something.store(true, Ordering::Relaxed);
                 }
-                tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+                tokio::time::timeout(MAX_TEST_CONNECTION_TIME, async {
                     tokio::try_join!(client, backend_bar, backend_baz, backend_sock,)
                 })
                 .await??;
