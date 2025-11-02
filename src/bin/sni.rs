@@ -29,7 +29,7 @@ use std::net::ToSocketAddrs;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixDatagram;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use tarweb::sock;
 
@@ -637,12 +637,30 @@ async fn handle_conn(id: usize, mut stream: tokio::net::TcpStream, config: &Conf
     handle_conn_backend(id, stream, bytes, &config.default_backend).await
 }
 
-async fn mainloop(config: Arc<Config>, listener: tokio::net::TcpListener) -> Result<()> {
+async fn mainloop(
+    mut config: Arc<Config>,
+    config_filename: &str,
+    listener: tokio::net::TcpListener,
+) -> Result<()> {
     let mut id = 0;
+    let mut hups = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .expect("Registering SIGHUP");
     loop {
         let (stream, peer) = listener.accept().await?;
         debug!("id={id} fd={} Accepted {}", stream.as_raw_fd(), peer);
-
+        if tokio::time::timeout(tokio::time::Duration::ZERO, hups.recv())
+            .await
+            .unwrap_or_default()
+            .is_some()
+        {
+            info!("Loading new config");
+            match load_config(config_filename) {
+                Ok(c) => config = Arc::new(c),
+                Err(e) => error!(
+                    "Failed to load config {config_filename:?}, staying with old config: {e}"
+                ),
+            }
+        }
         let config = config.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_conn(id, stream, &config).await {
@@ -661,7 +679,7 @@ async fn main() -> Result<()> {
     let opt = Opt::parse();
     tracing_subscriber::fmt()
         //.with_env_filter(format!("sni_router={}", opt.verbose))
-        .with_env_filter(opt.verbose)
+        .with_env_filter(&opt.verbose)
         .with_writer(std::io::stderr)
         .init();
     info!("SNI Router");
@@ -671,7 +689,7 @@ async fn main() -> Result<()> {
     sock::set_nodelay(listener.as_raw_fd())?;
     // Config.
     let config = load_config(&opt.config)?;
-    mainloop(Arc::new(config), listener).await
+    mainloop(Arc::new(config), &opt.config, listener).await
 }
 
 #[cfg(test)]
@@ -739,7 +757,9 @@ mod tests {
                     },
                 };
                 let _main =
-                    tokio::task::spawn(async move { mainloop(Arc::new(config), listener).await });
+                    tokio::task::spawn(
+                        async move { mainloop(Arc::new(config), "", listener).await },
+                    );
 
                 let (done_tx1, mut done_rx_bar) = tokio::sync::mpsc::channel::<()>(1);
                 let (done_tx2, mut done_rx_baz) = tokio::sync::mpsc::channel::<()>(1);
