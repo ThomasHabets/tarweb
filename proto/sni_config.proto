@@ -27,10 +27,21 @@ message Backend {
                 Proxy proxy = 2;
                 Pass pass = 3;
         }
+
+        // Max connection lifetime.
+        //
+        // For Proxy backends this is more real than for Pass backends.
+        //
+        // For Pass backends it's basically just the `ClientHello` snoop time,
+        // unless it's also the TLS handshake time. There's no timing out after
+        // the FD has been handed off.
+        uint64 max_lifetime_ms = 4;
 }
 
 message SNIConfig {
         repeated Rule rules = 1;
         Backend default_backend = 2;
-}
 
+        // See commend on field in Backend message.
+        uint64 max_lifetime_ms = 3;
+}

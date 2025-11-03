@@ -127,18 +127,41 @@ fn load_config(filename: &str) -> Result<Config> {
     let protocfg: protos::SniConfig = dyn_msg.transcode_to()?;
 
     let mut config = Config {
+        max_lifetime: if protocfg.max_lifetime_ms > 0 {
+            Some(tokio::time::Duration::from_millis(protocfg.max_lifetime_ms))
+        } else {
+            None
+        },
         rules: vec![],
         default_backend: load_backend(
             &protocfg
                 .default_backend
+                .as_ref()
                 .ok_or(anyhow!("Config missing default backend"))?
                 .backend
+                .clone()
                 .ok_or(anyhow!("Default backend missing an actual backend"))?,
         )?,
+        default_backend_timeout: protocfg.default_backend.and_then(|b| {
+            let t = b.max_lifetime_ms;
+            if t > 0 {
+                Some(tokio::time::Duration::from_millis(b.max_lifetime_ms))
+            } else {
+                None
+            }
+        }),
     };
     for rule in protocfg.rules {
         config.rules.push(Rule {
             re: regex::Regex::new(&rule.regex)?,
+            timeout: rule.backend.as_ref().and_then(|b| {
+                let t = b.max_lifetime_ms;
+                if t > 0 {
+                    Some(tokio::time::Duration::from_millis(b.max_lifetime_ms))
+                } else {
+                    None
+                }
+            }),
             backend: load_backend(
                 &rule
                     .backend
@@ -409,13 +432,16 @@ enum Backend {
 struct Rule {
     re: regex::Regex,
     backend: Backend,
+    timeout: Option<tokio::time::Duration>,
 }
 
 // TODO: this should probably become a protobuf.
 #[derive(Debug)]
 struct Config {
+    max_lifetime: Option<tokio::time::Duration>,
     rules: Vec<Rule>,
     default_backend: Backend,
+    default_backend_timeout: Option<tokio::time::Duration>,
 }
 
 /// Perform TLS handshake and setsockopt with kTLS.
@@ -645,10 +671,20 @@ async fn handle_conn(id: usize, mut stream: tokio::net::TcpStream, config: &Conf
     for rule in &config.rules {
         if is_full_match(&rule.re, &sni) {
             trace!("id={id} SNI {sni} matched rule {rule:?}");
-            return handle_conn_backend(id, stream, bytes, &rule.backend).await;
+            let fut = handle_conn_backend(id, stream, bytes, &rule.backend);
+            return if let Some(timeout) = rule.timeout {
+                tokio::time::timeout(timeout, fut).await?
+            } else {
+                fut.await
+            };
         }
     }
-    handle_conn_backend(id, stream, bytes, &config.default_backend).await
+    let fut = handle_conn_backend(id, stream, bytes, &config.default_backend);
+    if let Some(timeout) = config.default_backend_timeout {
+        tokio::time::timeout(timeout, fut).await?
+    } else {
+        fut.await
+    }
 }
 
 async fn mainloop(
@@ -676,7 +712,16 @@ async fn mainloop(
         debug!("id={id} fd={} Accepted {}", stream.as_raw_fd(), peer);
         let config = config.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(id, stream, &config).await {
+            let fut = handle_conn(id, stream, &config);
+            let res = if let Some(timeout) = config.max_lifetime {
+                match tokio::time::timeout(timeout, fut).await {
+                    Ok(o) => o,
+                    Err(e) => Err(anyhow!("connection timeout: {e}")),
+                }
+            } else {
+                fut.await
+            };
+            if let Err(e) = res {
                 warn!("id={id} Handling connection: {e:#}");
             }
             debug!("id={id} Done");
@@ -746,10 +791,12 @@ mod tests {
                 // Test config.
                 #[allow(clippy::regex_creation_in_loops)]
                 let config = Config {
+                    max_lifetime: Some(MAX_TEST_CONNECTION_TIME),
                     rules: vec![
                         Rule {
                             re: regex::Regex::new("foo")?,
                             backend: Backend::Null,
+                            timeout: None,
                         },
                         Rule {
                             re: regex::Regex::new("socket")?,
@@ -757,6 +804,7 @@ mod tests {
                                 path: sockfile.clone(),
                                 tls: None,
                             },
+                            timeout: None,
                         },
                         Rule {
                             re: regex::Regex::new("bar")?,
@@ -764,12 +812,14 @@ mod tests {
                                 addr: format!("[::1]:{backend_bar_port}"),
                                 tls: None,
                             },
+                            timeout: None,
                         },
                     ],
                     default_backend: Backend::Proxy {
                         addr: format!("[::1]:{backend_baz_port}"),
                         tls: None,
                     },
+                    default_backend_timeout: None,
                 };
                 let _main =
                     tokio::task::spawn(
