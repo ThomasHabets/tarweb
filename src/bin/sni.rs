@@ -28,12 +28,11 @@
 //!   with `EMSGSIZE`. Queue? Drop?
 //! * Maybe leave the unix socket connected, and only try to reconnect on error?
 //! * Add a bunch of tests.
-//! * Backup backends. E.g. if unix socket fails, maybe route to a "sorry
-//!   server".
 // Disable overly pedantic pedantic-level clippy lints.
 #![allow(clippy::similar_names)]
 
 use std::os::unix::io::AsRawFd;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -99,16 +98,30 @@ fn load_tls(cfg: Option<&protos::backend::Tls>) -> Result<Option<Arc<rustls::Ser
     })))
 }
 
-fn load_backend(be: &protos::backend::Backend) -> Result<Backend> {
+fn load_backend(be: &protos::backend::Backend, sorry: Option<&protos::Backend>) -> Result<Backend> {
+    if sorry.is_some_and(|s| s.sorry.is_some()) {
+        return Err(anyhow!("sorry servers can't have sorry servers"));
+    }
+    let sorry = sorry
+        .map(|s| load_backend(s.backend.as_ref().unwrap(), None))
+        .transpose()?
+        .map(Box::new);
     Ok(match be {
-        protos::backend::Backend::Null(_) => Backend::Null,
+        protos::backend::Backend::Null(_) => {
+            if sorry.is_some() {
+                return Err(anyhow!("null backend with sorry server not allowed"));
+            }
+            Backend::Null
+        }
         protos::backend::Backend::Proxy(p) => Backend::Proxy {
             addr: p.addr.clone(),
             tls: load_tls(p.tls.as_ref())?,
+            sorry,
         },
         protos::backend::Backend::Pass(p) => Backend::Pass {
             path: p.path.clone().into(),
             tls: load_tls(p.tls.as_ref())?,
+            sorry,
         },
     })
 }
@@ -130,15 +143,18 @@ fn load_config(filename: &str) -> Result<Config> {
             None
         },
         rules: vec![],
-        default_backend: load_backend(
-            &protocfg
+        default_backend: {
+            let (be, sorry) = protocfg
                 .default_backend
                 .as_ref()
-                .ok_or(anyhow!("Config missing default backend"))?
-                .backend
-                .clone()
-                .ok_or(anyhow!("Default backend missing an actual backend"))?,
-        )?,
+                .map(|d| (&d.backend, d.sorry.as_deref()))
+                .ok_or(anyhow!("Config missing default backend"))?;
+            load_backend(
+                be.as_ref()
+                    .ok_or(anyhow!("default backend missing an actual backend"))?,
+                sorry,
+            )?
+        },
         default_backend_timeout: protocfg.default_backend.and_then(|b| {
             let t = b.max_lifetime_ms;
             if t > 0 {
@@ -159,13 +175,18 @@ fn load_config(filename: &str) -> Result<Config> {
                     None
                 }
             }),
-            backend: load_backend(
-                &rule
+            backend: {
+                let (be, sorry) = rule
                     .backend
-                    .ok_or(anyhow!("Rule missing backend"))?
-                    .backend
-                    .ok_or(anyhow!("Rule backend has no actual backend"))?,
-            )?,
+                    .as_ref()
+                    .map(|d| (&d.backend, d.sorry.as_deref()))
+                    .ok_or(anyhow!("rule missing backend"))?;
+                load_backend(
+                    be.as_ref()
+                        .ok_or(anyhow!("backend missing actual backend"))?,
+                    sorry,
+                )?
+            },
         });
     }
     Ok(config)
@@ -413,6 +434,7 @@ enum Backend {
     Pass {
         path: std::path::PathBuf,
         tls: Option<Arc<rustls::ServerConfig>>,
+        sorry: Option<Box<Backend>>,
     },
 
     // Proxy string. DNS resolved on every new connection.
@@ -422,6 +444,7 @@ enum Backend {
     Proxy {
         addr: String,
         tls: Option<Arc<rustls::ServerConfig>>,
+        sorry: Option<Box<Backend>>,
     },
 }
 
@@ -536,13 +559,7 @@ async fn tls_handshake(
     }
 }
 
-async fn handle_conn_backend_proxy(
-    id: usize,
-    stream: tokio::net::TcpStream,
-    bytes: Vec<u8>,
-    addr: &str,
-    tls: Option<Arc<rustls::ServerConfig>>,
-) -> Result<()> {
+async fn connect_for_proxy(id: usize, addr: &str) -> Result<tokio::net::TcpStream> {
     let addrs = addr.to_socket_addrs()?;
     let mut conn = None;
     for addr in addrs {
@@ -557,13 +574,33 @@ async fn handle_conn_backend_proxy(
             }
         }
     }
+    conn.ok_or(anyhow!(
+        "failed to connect to any backend with address {addr}"
+    ))
+}
+
+async fn handle_conn_backend_proxy(
+    id: usize,
+    stream: tokio::net::TcpStream,
+    bytes: Vec<u8>,
+    addr: &str,
+    sorry: Option<&Backend>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
+    let mut conn = match connect_for_proxy(id, addr).await {
+        Ok(c) => c,
+        Err(e) => {
+            return match sorry {
+                None => Err(e),
+                Some(s) => handle_conn_backend(id, stream, bytes, s).await,
+            };
+        }
+    };
+
     let (mut stream, bytes) = if let Some(tls) = tls {
         tls_handshake(stream, bytes, tls).await?
     } else {
         (stream, bytes)
-    };
-    let Some(mut conn) = conn else {
-        return Err(anyhow!("failed to connect to all backends"));
     };
     let (mut up_r, mut up_w) = conn.split();
     let (mut down_r, mut down_w) = stream.split();
@@ -600,52 +637,66 @@ async fn handle_conn_backend_proxy(
     tokio::try_join!(upstream, downstream)?;
     Ok(())
 }
+
 /// A backend has been selected. Deal with the stream and its backend as
 /// appropriate.
-async fn handle_conn_backend(
+///
+/// This function recurses for the sorry server, and therefore needs the
+/// asyncness to be boxed.
+fn handle_conn_backend<'a>(
     id: usize,
     stream: tokio::net::TcpStream,
     bytes: Vec<u8>,
-    backend: &Backend,
-) -> Result<()> {
-    match backend {
-        Backend::Null => {
-            trace!("id={id} Null backend. Closing");
-            Ok(())
-        }
-        Backend::Pass { path, tls } => {
-            // Connecting to a UnixDatagram should be cheap, and not at all be
-            // visible to the backend. It's only when we SendMsg that it can
-            // cause any load. So we first do this connect, so that we don't
-            // needlessly do a handshake only to then never connect to anything.
-            let sock = tokio::net::UnixDatagram::unbound().context("create UnixDatagram")?;
-            sock.connect(path)
-                .with_context(|| format!("connect to {:?}", path.display()))?;
-            // This doesn't work, because we're using DGRAM. Maybe it works with
-            // SEQPACKET?
-            if false {
-                let ucred = nix::sys::socket::getsockopt(
-                    &sock,
-                    nix::sys::socket::sockopt::PeerCredentials,
-                )?;
-                debug!(
-                    "id={id} peer pid={} uid={} gid={}",
-                    ucred.pid(),
-                    ucred.uid(),
-                    ucred.gid()
-                );
+    backend: &'a Backend,
+) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        match backend {
+            Backend::Null => {
+                trace!("id={id} Null backend. Closing");
+                Ok(())
             }
-            let (stream, bytes) = if let Some(tls) = tls {
-                tls_handshake(stream, bytes, tls.clone()).await?
-            } else {
-                (stream, bytes)
-            };
-            pass_fd_over_uds(stream, sock, bytes).await
+            Backend::Pass { path, tls, sorry } => {
+                // Connecting to a UnixDatagram should be cheap, and not at all be
+                // visible to the backend. It's only when we SendMsg that it can
+                // cause any load. So we first do this connect, so that we don't
+                // needlessly do a handshake only to then never connect to anything.
+                let sock = tokio::net::UnixDatagram::unbound().context("create UnixDatagram")?;
+                if let Err(e) = sock
+                    .connect(path)
+                    .with_context(|| format!("connect to {:?}", path.display()))
+                {
+                    if let Some(s) = sorry {
+                        return handle_conn_backend(id, stream, bytes, s).await;
+                    }
+                    return Err(e);
+                }
+                // This doesn't work, because we're using DGRAM. Maybe it works with
+                // SEQPACKET?
+                if false {
+                    let ucred = nix::sys::socket::getsockopt(
+                        &sock,
+                        nix::sys::socket::sockopt::PeerCredentials,
+                    )?;
+                    debug!(
+                        "id={id} peer pid={} uid={} gid={}",
+                        ucred.pid(),
+                        ucred.uid(),
+                        ucred.gid()
+                    );
+                }
+                let (stream, bytes) = if let Some(tls) = tls {
+                    tls_handshake(stream, bytes, tls.clone()).await?
+                } else {
+                    (stream, bytes)
+                };
+                pass_fd_over_uds(stream, sock, bytes).await
+            }
+            Backend::Proxy { addr, tls, sorry } => {
+                handle_conn_backend_proxy(id, stream, bytes, addr, sorry.as_deref(), tls.clone())
+                    .await
+            }
         }
-        Backend::Proxy { addr, tls } => {
-            handle_conn_backend_proxy(id, stream, bytes, addr, tls.clone()).await
-        }
-    }
+    })
 }
 
 fn is_full_match(re: &regex::Regex, text: &str) -> bool {
@@ -800,6 +851,7 @@ mod tests {
                             backend: Backend::Pass {
                                 path: sockfile.clone(),
                                 tls: None,
+                                sorry: None,
                             },
                             timeout: None,
                         },
@@ -808,6 +860,7 @@ mod tests {
                             backend: Backend::Proxy {
                                 addr: format!("[::1]:{backend_bar_port}"),
                                 tls: None,
+                                sorry: None,
                             },
                             timeout: None,
                         },
@@ -815,6 +868,7 @@ mod tests {
                     default_backend: Backend::Proxy {
                         addr: format!("[::1]:{backend_baz_port}"),
                         tls: None,
+                        sorry: None,
                     },
                     default_backend_timeout: None,
                 };

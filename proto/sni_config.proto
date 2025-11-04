@@ -36,6 +36,9 @@ message Backend {
         // unless it's also the TLS handshake time. There's no timing out after
         // the FD has been handed off.
         uint64 max_lifetime_ms = 4;
+
+        // Sorry backend. Used if connecting to the backend fails.
+        Backend sorry = 5;
 }
 
 message SNIConfig {
