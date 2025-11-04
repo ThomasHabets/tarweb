@@ -77,9 +77,6 @@ struct Opt {
     /// Asciiproto config.
     #[arg(long)]
     config: String,
-
-    #[arg(long)]
-    sock: std::path::PathBuf,
 }
 
 #[allow(clippy::unnecessary_wraps)]
