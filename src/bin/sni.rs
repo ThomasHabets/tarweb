@@ -75,7 +75,7 @@ struct Opt {
     key_file: Option<std::path::PathBuf>,
 
     /// Asciiproto config.
-    #[arg(long)]
+    #[arg(long, short)]
     config: String,
 }
 
