@@ -131,7 +131,11 @@ fn load_config(filename: &str) -> Result<Config> {
     let md = pool
         .get_message_by_name("tarweb.SNIConfig")
         .ok_or(anyhow!("Unable to reflect SNIConfig"))?;
-    let txt = std::fs::read_to_string(filename)?;
+    let cwd = std::env::current_dir()
+        .map(|c| c.display().to_string())
+        .unwrap_or("<unknown>".to_string());
+    let txt = std::fs::read_to_string(filename)
+        .context(anyhow!("opening {filename:?} from cwd {cwd:?}"))?;
     let dyn_msg = prost_reflect::DynamicMessage::parse_text_format(md, &txt)?;
 
     let protocfg: protos::SniConfig = dyn_msg.transcode_to()?;
@@ -747,7 +751,8 @@ async fn mainloop(
         let (stream, peer) = tokio::select! {
             r = listener.accept() => r,
             _ = hups.recv() => {
-                info!("Got SIGHUP. Loading new config");
+                let cwd = std::env::current_dir().map(|c|c.display().to_string()).unwrap_or("<unknown>".to_string());
+                info!("Got SIGHUP. Loading new config {config_filename:?} in cwd {cwd:?}");
                 match load_config(config_filename) {
                     Ok(c) => config = Arc::new(c),
                     Err(e) => error!(
