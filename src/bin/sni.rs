@@ -30,6 +30,7 @@
 // Disable overly pedantic pedantic-level clippy lints.
 #![allow(clippy::similar_names)]
 
+use std::net::ToSocketAddrs;
 use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -37,7 +38,6 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use std::net::ToSocketAddrs;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixDatagram;
