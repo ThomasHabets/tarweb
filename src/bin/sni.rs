@@ -23,7 +23,6 @@
 //! ## TODO
 //!
 //! * Add max connection idle time.
-//! * Add max connection time.
 //! * Think more about how to best degrade if `sendmsg()` passing the FD fails
 //!   with `EMSGSIZE`. Queue? Drop?
 //! * Maybe leave the unix socket connected, and only try to reconnect on error?
