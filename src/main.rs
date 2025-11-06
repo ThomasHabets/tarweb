@@ -30,7 +30,7 @@
 // * --cpu-affinity=false (not sure why, but CPU affinity hurts a lot)
 #![allow(clippy::similar_names)]
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::pin::Pin;
@@ -379,14 +379,11 @@ impl Connection {
         matches![self.state, State::Closing]
     }
 
-    fn write_header_bytes(&mut self, ops: &mut SQueue, msg: &[u8], pos: usize, len: usize) {
+    // Header bytes have been put in `header_buf`, so this triggers write.
+    fn write_header_bytes(&mut self, ops: &mut SQueue, pos: usize, len: usize) {
         let State::Reading(fd) = self.state else {
             panic!("Called write_header in state {:?}", self.state);
         };
-        assert!(self.header_buf.is_empty());
-
-        // TODO: anything we can do about this copy? Create headers in-place?
-        self.header_buf.extend(msg.iter().copied());
         self.write_headers(ops, fd, pos, len);
     }
 
@@ -1062,100 +1059,115 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
         return Ok(());
     };
     debug!("Got request for path {}", req.path);
-    // TODO: replace with writev?
-    let len = req.len + 4;
+    let reqlen = req.len + 4;
+    let (pos, len) = answer_req(&mut hook.con.header_buf, &req, archive)
+        .context("failed to populate response headers")?;
+    hook.con.write_header_bytes(ops, pos, len);
+    hook.con.read_buf.copy_within(reqlen.., 0);
+    hook.con.read_buf_pos -= reqlen;
+    Ok(())
+}
 
-    if let Some(entry) = archive.entry(req.path) {
-        let mut status = "200 OK";
-        // TODO: actually, go with the smallest option. My experience just is
-        // that it's always this order.
-        let (subentry, encoding) = if req.encoding_brotli
-            && let Some(e) = entry.brotli()
-        {
-            (e, "Content-Encoding: br\r\n")
-        } else if req.encoding_zstd
-            && let Some(e) = entry.zstd()
-        {
-            (e, "Content-Encoding: zstd\r\n")
-        } else if req.encoding_gzip
-            && let Some(e) = entry.gzip()
-        {
-            (e, "Content-Encoding: gzip\r\n")
-        } else {
-            (entry.plain(), "")
-        };
-        let mut pos = subentry.pos;
-        let mut len = subentry.len;
-        let range = if let Some((start, end)) = req.range {
-            if start <= len && (start + end) < len {
-                status = "206 Partial Content";
-                pos += start;
-                len = end - start + 1;
-                &format!("Content-Range: bytes {start}-{end}/{}\r\n", subentry.len)
-            } else {
-                debug!("Invalid range request {start} {end} for file len {len}");
-                ""
-            }
-        } else {
-            ""
-        };
-        // TODO: pre-calculate many of these headers.
-        let mtime = entry.modified().map_or(String::new(), |mtime| {
-            format!("Last-Modified: {}\r\n", httpdate::fmt_http_date(*mtime))
-        });
-        let caching = if CACHE_AGE_SECS > 0 {
-            // Expires header is ignored when providing max-age.
-            &format!("Cache-Control: public, max-age={CACHE_AGE_SECS}\r\n")
-        } else {
-            ""
-        };
-        let etag = if let Some(e) = entry.etag() {
-            &format!("ETag: {e}\r\n")
-        } else {
-            ""
-        };
-        let common = format!(
-            "Connection: keep-alive\r\nDate: {}\r\nVary: accept-encoding\r\n{caching}{etag}{mtime}",
-            httpdate::fmt_http_date(std::time::SystemTime::now()),
-        );
+fn generate_some_headers(out: &mut HeaderBuf) -> Result<()> {
+    if CACHE_AGE_SECS > 0 {
+        // Expires header is ignored when providing max-age.
+        write!(out, "Cache-Control: public, max-age={CACHE_AGE_SECS}\r\n")?;
+    }
+    write!(
+        out,
+        "Connection: keep-alive\r\nDate: {}\r\nVary: accept-encoding\r\nServer: tarweb/{}\r\n",
+        httpdate::fmt_http_date(std::time::SystemTime::now()),
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    Ok(())
+}
 
-        if req.if_modified_since.zip(entry.modified()).is_some_and(|(h,e)| *e <= h)
-            // Split can only be iterated once, hence mut here.
-            || req.if_none_match.zip(entry.etag()).is_some_and(|(mut h,e)| {
-                h.any(|x| x.trim() == e)
-            })
-        {
-            hook.con.write_header_bytes(
-                ops,
-                format!("HTTP/1.1 304 Not Modified\r\n{common}Content-Length: 0\r\n\r\n")
-                    .as_bytes(),
-                pos,
-                len,
-            );
-        } else {
-            hook.con.write_header_bytes(
-                ops,
-                format!(
-                    "HTTP/1.1 {status}\r\n{common}{encoding}{range}Content-Length: {len}\r\n\r\n",
-                )
-                .as_bytes(),
-                pos,
-                len,
-            );
-        }
-    } else {
+fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(usize, usize)> {
+    let Some(entry) = archive.entry(req.path) else {
         let msg404 = "Not found\n";
         let len404 = msg404.len();
-        hook.con.write_header_bytes(
-            ops,
-            format!("HTTP/1.1 404 Not Found\r\nConnection: keep-alive\r\nContent-Length: {len404}\r\n\r\n{msg404}").as_bytes(),
-            0,
-            0,
-        );
+        write!(
+            out,
+            "HTTP/1.1 404 Not Found\r\nConnection: keep-alive\r\nContent-Length: {len404}\r\n"
+        )?;
+        generate_some_headers(out)?;
+        write!(out, "\r\n{msg404}")?;
+        return Ok((0, 0));
+    };
+
+    // Handle cached entries.
+    //
+    // Stuff all the regular headers in cached entries too..
+    if req.if_modified_since.zip(entry.modified()).is_some_and(|(h,e)| *e <= h)
+            // Split can only be iterated once, hence mut here.
+            || req.if_none_match.clone().zip(entry.etag()).is_some_and(|(mut h,e)| {
+                h.any(|x| x.trim() == e)
+            })
+    {
+        write!(out, "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n")?;
+        generate_some_headers(out)?;
+        write!(out, "\r\n")?;
+        return Ok((0, 0));
     }
-    hook.con.read_buf.copy_within(len.., 0);
-    hook.con.read_buf_pos -= len;
-    Ok(())
+
+    // Find the best accepted encoding.
+    //
+    // TODO: actually, go with the smallest option. My experience just is
+    // that it's always this order.
+    let (subentry, encoding) = if req.encoding_brotli
+        && let Some(e) = entry.brotli()
+    {
+        (e, "Content-Encoding: br\r\n")
+    } else if req.encoding_zstd
+        && let Some(e) = entry.zstd()
+    {
+        (e, "Content-Encoding: zstd\r\n")
+    } else if req.encoding_gzip
+        && let Some(e) = entry.gzip()
+    {
+        (e, "Content-Encoding: gzip\r\n")
+    } else {
+        (entry.plain(), "")
+    };
+    let mut pos = subentry.pos;
+    let mut len = subentry.len;
+
+    // At this point we know we have something.
+    //
+    // Write status header.
+    if let Some((start, end)) = req.range {
+        if start <= len && (start + end) < len {
+            pos += start;
+            len = end - start + 1;
+            write!(
+                out,
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\n",
+                subentry.len
+            )?;
+        } else {
+            debug!("Invalid range request {start} {end} for file len {len}");
+            write!(out, "HTTP/1.1 200 OK\r\n")?;
+        }
+    } else {
+        write!(out, "HTTP/1.1 200 OK\r\n")?;
+    }
+    generate_some_headers(out)?;
+
+    // Write request-specific headers.
+    //
+    // TODO: pre-calculate many of these headers.
+    if let Some(mtime) = entry.modified() {
+        write!(
+            out,
+            "Last-Modified: {}\r\n",
+            httpdate::fmt_http_date(*mtime)
+        )?;
+    }
+    if let Some(e) = entry.etag() {
+        write!(out, "ETag: {e}\r\n")?;
+    }
+    write!(out, "{encoding}Content-Length: {len}\r\n\r\n")?;
+    Ok((pos, len))
 }
 
 fn handle_connection(
