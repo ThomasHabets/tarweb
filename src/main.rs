@@ -1068,29 +1068,46 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
     Ok(())
 }
 
-fn generate_some_headers(out: &mut HeaderBuf) -> Result<()> {
+static COMMON_HEADERS: LazyLock<String> = LazyLock::new(|| {
+    use std::fmt::Write;
+
+    let mut s = String::new();
     if CACHE_AGE_SECS > 0 {
         // Expires header is ignored when providing max-age.
-        write!(out, "Cache-Control: public, max-age={CACHE_AGE_SECS}\r\n")?;
+        write!(
+            &mut s,
+            "Cache-Control: public, max-age={CACHE_AGE_SECS}\r\n"
+        )
+        .unwrap();
     }
     write!(
-        out,
-        "Connection: keep-alive\r\nDate: {}\r\nVary: accept-encoding\r\nServer: tarweb/{}\r\n",
-        httpdate::fmt_http_date(std::time::SystemTime::now()),
+        &mut s,
+        "Connection: keep-alive\r\nVary: accept-encoding\r\nServer: tarweb/{}\r\n",
         env!("CARGO_PKG_VERSION"),
-    )?;
-    Ok(())
+    )
+    .unwrap();
+    s
+});
+
+fn date_header(out: &mut HeaderBuf) -> Result<()> {
+    Ok(write!(
+        out,
+        "Date: {}\r\n",
+        httpdate::fmt_http_date(std::time::SystemTime::now())
+    )?)
 }
 
 fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(usize, usize)> {
+    let common = &COMMON_HEADERS;
+    let common = common.as_str();
     let Some(entry) = archive.entry(req.path) else {
         let msg404 = "Not found\n";
         let len404 = msg404.len();
         write!(
             out,
-            "HTTP/1.1 404 Not Found\r\nConnection: keep-alive\r\nContent-Length: {len404}\r\n"
+            "HTTP/1.1 404 Not Found\r\n{common}Connection: keep-alive\r\nContent-Length: {len404}\r\n"
         )?;
-        generate_some_headers(out)?;
+        date_header(out)?;
         write!(out, "\r\n{msg404}")?;
         return Ok((0, 0));
     };
@@ -1104,8 +1121,11 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
                 h.any(|x| x.trim() == e)
             })
     {
-        write!(out, "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n")?;
-        generate_some_headers(out)?;
+        write!(
+            out,
+            "HTTP/1.1 304 Not Modified\r\n{common}Content-Length: 0\r\n"
+        )?;
+        date_header(out)?;
         write!(out, "\r\n")?;
         return Ok((0, 0));
     }
@@ -1141,7 +1161,7 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
             len = end - start + 1;
             write!(
                 out,
-                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\n",
+                "HTTP/1.1 206 Partial Content\r\n{common}Content-Range: bytes {start}-{end}/{}\r\n",
                 subentry.len
             )?;
         } else {
@@ -1151,10 +1171,10 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
     } else {
         write!(out, "HTTP/1.1 200 OK\r\n")?;
     }
-    generate_some_headers(out)?;
+    date_header(out)?;
     write!(
         out,
-        "{}{encoding}Content-Length: {len}\r\n\r\n",
+        "{common}{}{encoding}Content-Length: {len}\r\n\r\n",
         entry.headers()
     )?;
     Ok((pos, len))
