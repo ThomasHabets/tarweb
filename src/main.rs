@@ -17,7 +17,7 @@
 // Conclusion: Wait for direct kernel support for io_uring sendfile.
 //
 // ## Other TODOs
-// * Ranged get
+// * Accept-ranges header.
 // * The code has no real structure. It's an experiment and I've banged on it
 //   until it worked. Fix that.
 // * We can use passfd and accept() at the same time if we manually set
@@ -35,6 +35,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use anyhow::{Context, Error, Result, anyhow};
 use arrayvec::ArrayVec;
@@ -51,6 +52,9 @@ use sock::set_nodelay;
 mod privs;
 
 type FixedFile = io_uring::types::Fixed;
+
+static RE_RANGE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?i)^bytes=(\d+)-(\d+)$").unwrap());
 
 // Cache max age.
 const CACHE_AGE_SECS: u64 = 300;
@@ -943,6 +947,7 @@ struct Request<'a> {
     encoding_zstd: bool,
     if_modified_since: Option<std::time::SystemTime>,
     if_none_match: Option<std::str::Split<'a, char>>,
+    range: Option<(usize, usize)>,
 }
 
 impl Request<'_> {
@@ -965,6 +970,7 @@ impl Request<'_> {
         let mut encoding_zstd = false;
         let mut if_modified_since = None;
         let mut if_none_match = None;
+        let mut range = None;
         for header in lines {
             let mut kv = header.splitn(2, ' ');
             let k = kv.next().unwrap_or("").to_lowercase();
@@ -989,6 +995,15 @@ impl Request<'_> {
                 "if-none-match:" => {
                     if_none_match = Some(v.split(','));
                 }
+                "range:" => {
+                    if let Some(m) = RE_RANGE.captures(v) {
+                        if let (Ok(start), Ok(end)) = (m[1].parse(), m[2].parse()) {
+                            range = Some((start, end));
+                        }
+                    } else {
+                        debug!("Invalid range header: {v:?}");
+                    }
+                }
                 _ => {}
             }
         }
@@ -1008,6 +1023,7 @@ impl Request<'_> {
             encoding_brotli,
             if_modified_since,
             if_none_match,
+            range,
         }))
     }
 }
@@ -1050,6 +1066,7 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
     let len = req.len + 4;
 
     if let Some(entry) = archive.entry(req.path) {
+        let mut status = "200 OK";
         // TODO: actually, go with the smallest option. My experience just is
         // that it's always this order.
         let (subentry, encoding) = if req.encoding_brotli
@@ -1066,6 +1083,21 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
             (e, "Content-Encoding: gzip\r\n")
         } else {
             (entry.plain(), "")
+        };
+        let mut pos = subentry.pos;
+        let mut len = subentry.len;
+        let range = if let Some((start, end)) = req.range {
+            if start <= len && (start + end) < len {
+                status = "206 Partial Content";
+                pos += start;
+                len = end - start + 1;
+                &format!("Content-Range: bytes {start}-{end}/{}\r\n", subentry.len)
+            } else {
+                debug!("Invalid range request {start} {end} for file len {len}");
+                ""
+            }
+        } else {
+            ""
         };
         // TODO: pre-calculate many of these headers.
         let mtime = entry.modified().map_or(String::new(), |mtime| {
@@ -1097,19 +1129,18 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
                 ops,
                 format!("HTTP/1.1 304 Not Modified\r\n{common}Content-Length: 0\r\n\r\n")
                     .as_bytes(),
-                subentry.pos,
-                subentry.len,
+                pos,
+                len,
             );
         } else {
             hook.con.write_header_bytes(
                 ops,
                 format!(
-                    "HTTP/1.1 200 OK\r\n{common}{encoding}Content-Length: {}\r\n\r\n",
-                    subentry.len,
+                    "HTTP/1.1 {status}\r\n{common}{encoding}{range}Content-Length: {len}\r\n\r\n",
                 )
                 .as_bytes(),
-                subentry.pos,
-                subentry.len,
+                pos,
+                len,
             );
         }
     } else {
