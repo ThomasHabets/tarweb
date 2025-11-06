@@ -1152,21 +1152,11 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
         write!(out, "HTTP/1.1 200 OK\r\n")?;
     }
     generate_some_headers(out)?;
-
-    // Write request-specific headers.
-    //
-    // TODO: pre-calculate many of these headers.
-    if let Some(mtime) = entry.modified() {
-        write!(
-            out,
-            "Last-Modified: {}\r\n",
-            httpdate::fmt_http_date(*mtime)
-        )?;
-    }
-    if let Some(e) = entry.etag() {
-        write!(out, "ETag: {e}\r\n")?;
-    }
-    write!(out, "{encoding}Content-Length: {len}\r\n\r\n")?;
+    write!(
+        out,
+        "{}{encoding}Content-Length: {len}\r\n\r\n",
+        entry.headers()
+    )?;
     Ok((pos, len))
 }
 

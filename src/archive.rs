@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::io::Read;
 
 use anyhow::{Context, Result};
@@ -100,6 +101,19 @@ impl Archive {
             let name = e.path()?;
             let name = name.to_string_lossy();
             let name = name.strip_prefix(prefix).unwrap_or(name.as_ref());
+            let modified = e
+                .header()
+                .mtime()
+                .map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
+                .ok();
+            let mut headers = String::new();
+            if let Some(m) = modified {
+                write!(
+                    &mut headers,
+                    "Last-Modified: {}\r\n",
+                    httpdate::fmt_http_date(m)
+                )?;
+            }
             content.insert(
                 name.to_string(),
                 ArchiveEntry {
@@ -110,22 +124,24 @@ impl Archive {
                     brotli: None,
                     gzip: None,
                     zstd: None,
-                    modified: e
-                        .header()
-                        .mtime()
-                        .map(|t| std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
-                        .ok(),
+                    modified,
                     etag: None, // Set later.
+                    headers,
                 },
             );
         }
         if etags {
             info!("Hashing etags…");
-            content.par_iter_mut().for_each(|(_k, v)| {
-                v.etag = Some(calculate_etag(
-                    &mmap[v.plain.pos..(v.plain.pos + v.plain.len)],
-                ));
-            });
+            content
+                .par_iter_mut()
+                .map(|(_k, v)| {
+                    let etag = calculate_etag(&mmap[v.plain.pos..(v.plain.pos + v.plain.len)]);
+                    write!(v.headers, "ETag: {etag}\r\n")?;
+                    v.etag = Some(etag);
+                    Ok::<(), anyhow::Error>(())
+                })
+                .find_first(std::result::Result::is_err)
+                .unwrap_or(Ok(()))?;
         }
         let c2 = content.clone();
         for (k, v) in &c2 {
@@ -192,6 +208,7 @@ pub struct ArchiveEntry {
     zstd: Option<ArchiveRange>,
     modified: Option<std::time::SystemTime>,
     etag: Option<String>,
+    headers: String,
 }
 
 impl ArchiveEntry {
@@ -212,5 +229,8 @@ impl ArchiveEntry {
     }
     pub fn etag(&self) -> Option<&str> {
         self.etag.as_deref()
+    }
+    pub fn headers(&self) -> &str {
+        &self.headers
     }
 }
