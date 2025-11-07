@@ -66,12 +66,6 @@ struct Opt {
     #[arg(long, short, default_value = "[::]:443")]
     listen: std::net::SocketAddr,
 
-    #[arg(long)]
-    cert_file: Option<std::path::PathBuf>,
-
-    #[arg(long)]
-    key_file: Option<std::path::PathBuf>,
-
     /// Restrict router to only be able to read under this directory.
     #[arg(long, default_value = "/")]
     restrict_dirs: Vec<std::path::PathBuf>,
