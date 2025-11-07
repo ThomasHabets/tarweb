@@ -3,7 +3,71 @@ use caps::CapSet;
 use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
 use tracing::{info, trace, warn};
 
+/// Drop privs suitable for SNI router.
+///
+/// # Errors
+///
+/// If dropping privs fails.
+///
+// Not actually dead code, just not used in tarweb, only SNI.
+#[allow(dead_code)]
+pub fn sni_drop() -> Result<()> {
+    use landlock::{
+        ABI, Access, AccessFs, AccessNet, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+        Scope, path_beneath_rules,
+    };
+    let abi = ABI::V6;
+
+    // Kernel 5.13 or better. tarweb already requires 6.7.
+    let status = Ruleset::default()
+        .handle_access(AccessFs::from_all(abi))?
+        .handle_access(AccessNet::BindTcp)?
+        .create()?
+        .set_no_new_privs(true)
+        .add_rules(path_beneath_rules(&["/"], AccessFs::from_read(abi)))?
+        .restrict_self()?;
+    match status.ruleset {
+        RulesetStatus::FullyEnforced => {
+            info!("Landlock enabled and fully enforced for filesystem and network");
+        }
+        other => {
+            return Err(anyhow!(
+                "Landlock status not fully enforced for filesystem and network: {other:?}"
+            ));
+        }
+    }
+
+    // These require kernel 6.12 or newer.
+    let status = Ruleset::default()
+        .scope(Scope::Signal)?
+        // .scope(Scope::AbstractUnixSocket)?
+        .create()?
+        .restrict_self()?;
+    match status.ruleset {
+        RulesetStatus::FullyEnforced => {
+            info!("Landlock enabled and fully enforced for signal");
+        }
+        other => warn!(
+            "Landlock status not fully enforced for signal (probably kernel <6.12): {other:?}"
+        ),
+    }
+    match std::net::TcpListener::bind("127.0.0.1:8080") {
+        Ok(_) => return Err(anyhow!("landlock failed to prevent tcp bind")),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(e) => {
+            return Err(anyhow!(
+                "unexpected error verifying landlock blocking connects: {e}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Drop privileges to bare minimum.
+///
+/// # Errors
+///
+/// If dropping privs fails.
 pub fn drop_privs(with_rustls: bool) -> Result<()> {
     landlock()?;
     no_new_privs()?;

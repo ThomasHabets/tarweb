@@ -796,6 +796,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&opt.listen)
         .await
         .context(format!("listening to {}", opt.listen))?;
+    tarweb::privs::sni_drop()?;
     sock::set_nodelay(listener.as_raw_fd())?;
     // Config.
     let config = load_config(&opt.config)?;

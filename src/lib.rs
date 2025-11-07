@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
+pub mod privs;
 pub mod sock;
 
 /// Load certificate chain from file.
