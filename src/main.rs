@@ -1195,7 +1195,13 @@ fn handle_connection(
         UserDataOp::Read | UserDataOp::Nop => {
             if hook.result < 0 {
                 if hook.result.abs() == libc::EIO {
-                    // TODO: for some reason I'm getting EIO after curl is done.
+                    // TLS messages manifest as EIO where the details are
+                    // attached as control messages. See:
+                    // https://github.com/ThomasHabets/tarweb/issues/2
+                    //
+                    // I'm not aware of any message that doesn't mean "and then
+                    // we close the connection", so here we just skip to the
+                    // end.
                     trace!("Got EIO on read");
                     hook.con.close(modern, ops);
                     return Ok(());
