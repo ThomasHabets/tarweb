@@ -11,7 +11,7 @@ use tracing::{info, trace, warn};
 ///
 // Not actually dead code, just not used in tarweb, only SNI.
 #[allow(dead_code)]
-pub fn sni_drop() -> Result<()> {
+pub fn sni_drop(dirs: &[&std::path::Path]) -> Result<()> {
     use landlock::{
         ABI, Access, AccessFs, AccessNet, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
         Scope, path_beneath_rules,
@@ -24,7 +24,7 @@ pub fn sni_drop() -> Result<()> {
         .handle_access(AccessNet::BindTcp)?
         .create()?
         .set_no_new_privs(true)
-        .add_rules(path_beneath_rules(&["/"], AccessFs::from_read(abi)))?
+        .add_rules(path_beneath_rules(dirs, AccessFs::from_read(abi)))?
         .restrict_self()?;
     match status.ruleset {
         RulesetStatus::FullyEnforced => {

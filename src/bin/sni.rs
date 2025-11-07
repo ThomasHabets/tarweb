@@ -72,6 +72,10 @@ struct Opt {
     #[arg(long)]
     key_file: Option<std::path::PathBuf>,
 
+    /// Restrict router to only be able to read under this directory.
+    #[arg(long, default_value = "/")]
+    restrict_dirs: Vec<std::path::PathBuf>,
+
     /// Asciiproto config.
     #[arg(long, short)]
     config: String,
@@ -796,7 +800,12 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&opt.listen)
         .await
         .context(format!("listening to {}", opt.listen))?;
-    tarweb::privs::sni_drop()?;
+    tarweb::privs::sni_drop(
+        &opt.restrict_dirs
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .collect::<Vec<_>>(),
+    )?;
     sock::set_nodelay(listener.as_raw_fd())?;
     // Config.
     let config = load_config(&opt.config)?;
