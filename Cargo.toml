@@ -48,6 +48,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 prost-reflect = { version = "0.16.2", features = ["text-format"] }
 libseccomp = "0.4.0"
 caps = "0.5.6"
+landlock = "0.4.3"
 
 [build-dependencies]
 prost-build = "0.14.1"

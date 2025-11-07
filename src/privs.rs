@@ -1,9 +1,11 @@
 use anyhow::{Context, Result, anyhow};
 use caps::CapSet;
 use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
+use tracing::{info, trace, warn};
 
 /// Drop privileges to bare minimum.
 pub fn drop_privs(with_rustls: bool) -> Result<()> {
+    landlock()?;
     no_new_privs()?;
     drop_caps()?;
     seccomp(with_rustls)?;
@@ -12,7 +14,7 @@ pub fn drop_privs(with_rustls: bool) -> Result<()> {
 
 /// Prevent adding back privileges, such as by running a suid binary.
 fn no_new_privs() -> Result<()> {
-    tracing::trace!("Setting no new privs");
+    trace!("Setting no new privs");
     let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if ret != 0 {
         Err(anyhow!(
@@ -24,9 +26,61 @@ fn no_new_privs() -> Result<()> {
     }
 }
 
+fn landlock() -> Result<()> {
+    use landlock::{ABI, Access, AccessFs, AccessNet, Ruleset, RulesetAttr, RulesetStatus, Scope};
+    let abi = ABI::V6;
+
+    // Kernel 5.13 or better. tarweb already requires 6.7.
+    let status = Ruleset::default()
+        .handle_access(AccessFs::from_all(abi))?
+        .handle_access(AccessNet::from_all(abi))?
+        .create()?
+        .restrict_self()?;
+    match status.ruleset {
+        RulesetStatus::FullyEnforced => {
+            info!("Landlock enabled and fully enforced for filesystem and network");
+        }
+        other => {
+            return Err(anyhow!(
+                "Landlock status not fully enforced for filesystem and network: {other:?}"
+            ));
+        }
+    }
+
+    // These require kernel 6.12 or newer.
+    let status = Ruleset::default()
+        .scope(Scope::Signal)?
+        .scope(Scope::AbstractUnixSocket)?
+        .create()?
+        .restrict_self()?;
+    match status.ruleset {
+        RulesetStatus::FullyEnforced => {
+            info!("Landlock enabled and fully enforced for signal & abstract unix socket");
+        }
+        other => warn!(
+            "Landlock status not fully enforced for signal & abstract unix socket (probably kernel <6.12): {other:?}"
+        ),
+    }
+
+    // Test the access.
+    if std::fs::read_dir("/").is_ok() {
+        return Err(anyhow!("landlock failed to prevent listing root fs"));
+    }
+    match std::net::TcpStream::connect("127.0.0.1:8080") {
+        Ok(_) => return Err(anyhow!("landlock failed to prevent tcp connect")),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Err(e) => {
+            return Err(anyhow!(
+                "unexpected error verifying landlock blocking connects: {e}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Drop all capabilities, if present.
 fn drop_caps() -> Result<()> {
-    tracing::trace!("Dropping caps");
+    trace!("Dropping caps");
 
     // These should not fail.
     for set in [
@@ -42,7 +96,7 @@ fn drop_caps() -> Result<()> {
     {
         let set = CapSet::Bounding;
         if let Err(e) = caps::clear(None, set) {
-            tracing::debug!("Dropping priv {set:?} failed: {e}");
+            trace!("Expected: Dropping priv {set:?} failed: {e}");
         }
     }
     Ok(())
