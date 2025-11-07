@@ -51,7 +51,7 @@ pub fn sni_drop(dirs: &[&std::path::Path]) -> Result<()> {
             "Landlock status not fully enforced for signal (probably kernel <6.12): {other:?}"
         ),
     }
-    match std::net::TcpListener::bind("127.0.0.1:8080") {
+    match std::net::TcpListener::bind("127.0.0.1:0") {
         Ok(_) => return Err(anyhow!("landlock failed to prevent tcp bind")),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
         Err(e) => {

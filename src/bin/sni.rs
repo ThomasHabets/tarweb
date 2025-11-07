@@ -54,12 +54,8 @@ const BUF_CAPACITY: usize = 2048;
 
 #[derive(clap::Parser)]
 struct Opt {
-    #[arg(
-        long,
-        short,
-        help = "Verbosity level. Can be error, warn info, debug, or trace.",
-        default_value = "info"
-    )]
+    /// Verbosity level. Can be error, warn info, debug, or trace.
+    #[arg(long, short, default_value = "info")]
     verbose: String,
 
     /// Address to listen to.
