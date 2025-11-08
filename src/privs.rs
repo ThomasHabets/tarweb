@@ -16,6 +16,9 @@ pub fn sni_drop(dirs: &[&std::path::Path]) -> Result<()> {
         ABI, Access, AccessFs, AccessNet, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
         Scope, path_beneath_rules,
     };
+
+    drop_caps()?;
+
     let abi = ABI::V6;
 
     // Kernel 5.13 or better. tarweb already requires 6.7.
@@ -51,6 +54,8 @@ pub fn sni_drop(dirs: &[&std::path::Path]) -> Result<()> {
             "Landlock status not fully enforced for signal (probably kernel <6.12): {other:?}"
         ),
     }
+
+    // Confirm access denied.
     match std::net::TcpListener::bind("127.0.0.1:0") {
         Ok(_) => return Err(anyhow!("landlock failed to prevent tcp bind")),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
