@@ -25,7 +25,7 @@ jobs:
     - name: apt-get update
       run: sudo apt-get update
     - name: Install stuff
-      run: sudo apt-get install libseccomp-dev
+      run: sudo apt-get install libseccomp-dev protobuf-compiler libprotobuf-dev
     - name: Install tickbox
       run: cargo install tickbox
     - name: Run tests
