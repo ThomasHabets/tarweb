@@ -56,6 +56,8 @@ prost-build = "0.14.1"
 [dev-dependencies]
 tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "process", "sync", "time"] }
 tempfile = "3.23.0"
+reqwest = { version = "0.12.24", features = ["blocking", "rustls-tls", "native-tls-vendored", "gzip"] }
+#reqwest = { version = "0.12.24", features = ["blocking", "rustls-tls", "native-tls-vendored"] }
 
 [features]
 # Not supported on riscv64

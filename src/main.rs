@@ -1137,14 +1137,17 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
     let (subentry, encoding) = if req.encoding_brotli
         && let Some(e) = entry.brotli()
     {
+        trace!("Replaced with br");
         (e, "Content-Encoding: br\r\n")
     } else if req.encoding_zstd
         && let Some(e) = entry.zstd()
     {
+        trace!("Replaced with zstd");
         (e, "Content-Encoding: zstd\r\n")
     } else if req.encoding_gzip
         && let Some(e) = entry.gzip()
     {
+        trace!("Replaced with gzip");
         (e, "Content-Encoding: gzip\r\n")
     } else {
         (entry.plain(), "")
