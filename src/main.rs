@@ -123,6 +123,21 @@ type SQueue = ArrayVec<io_uring::squeue::Entry, 10_000>;
 type ReadBuf = [u8; MAX_READ_BUF];
 type HeaderBuf = ArrayVec<u8, MAX_HEADER_BUF>;
 
+/// Find first crlf sequence in a byte array.
+///
+/// Needed for finding end of proxy line.
+fn find_crlf(buf: &[u8]) -> Option<usize> {
+    (0..buf.len().saturating_sub(1)).find(|&i| buf[i] == b'\r' && buf[i + 1] == b'\n')
+    /*
+    for i in 0..buf.len().saturating_sub(1) {
+        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
+            return Some(i);
+        }
+    }
+    None
+        */
+}
+
 // State only needed during handshake.
 //
 // After handshake is completed, we'll enable kernel TLS, and won't need to use
@@ -171,6 +186,9 @@ enum State {
     // as a FixedFile. After that we'll close the original (real) file
     // descriptor.
     Registering(RegisteringData),
+
+    // Read call outstanding for reading a PROXY line.
+    ProxyLine(FixedFile, Option<rustls::ServerConnection>),
 
     // rustls handshaking happening.
     //
@@ -225,6 +243,7 @@ impl State {
             State::WritingData(_, _, _) => "writingdata",
             State::Reading(_) => "reading",
             State::WritingHeaders(_, _, _) => "writingheaders",
+            State::ProxyLine(..) => "ProxyLine",
             State::Handshaking(_) => "handshaking",
             State::EnablingKtls(_) => "enablingKTLS",
         }
@@ -282,9 +301,18 @@ impl Connection {
     ///
     /// We reuse `Connection` objects between connections, which is why this is
     /// not just part of `new()`.
-    fn init(&mut self, fixed: FixedFile, tls: Option<rustls::ServerConnection>, ops: &mut SQueue) {
+    fn init(
+        &mut self,
+        fixed: FixedFile,
+        proxy_line: bool,
+        tls: Option<rustls::ServerConnection>,
+        ops: &mut SQueue,
+    ) {
         debug_assert!(matches![self.state, State::Idle]);
-        if let Some(tls) = tls {
+        if proxy_line {
+            self.state = State::ProxyLine(fixed, tls);
+            self.read(ops);
+        } else if let Some(tls) = tls {
             self.state = State::Handshaking(HandshakeData::new(fixed, tls));
         } else {
             self.state = State::Reading(fixed);
@@ -369,6 +397,7 @@ impl Connection {
             State::Reading(fd) => Some(fd),
             State::WritingHeaders(fd, _, _) => Some(fd),
             State::WritingData(fd, _, _) => Some(fd),
+            State::ProxyLine(fd, ..) => Some(fd),
             State::Registering(RegisteringData { fd, .. }) => Some(fd),
             State::Closing => None,
         }
@@ -637,6 +666,7 @@ impl Connection {
     fn read(&mut self, ops: &mut SQueue) {
         let read_buf = &mut self.read_buf[self.read_buf_pos..];
         let fd = match &self.state {
+            State::ProxyLine(fd, ..) => *fd,
             State::Reading(fd) => *fd,
             State::Handshaking(data) => data.fixed,
             State::EnablingKtls(fd) => *fd,
@@ -1318,6 +1348,66 @@ fn op_completion(
 ) -> Result<()> {
     debug!("Op completed: {hook:?}");
 
+    // Handshake bytes setup for completed read operations.
+    if let UserDataOp::Read = hook.op {
+        if let State::Handshaking(..) = hook.con.state {
+            if hook.result == 0 {
+                hook.con.close(opt.async_cancel2, ops);
+                return Ok(());
+            }
+            if hook.result < 0 {
+                warn!("Read error: {}", hook.result);
+                hook.con.close(opt.async_cancel2, ops);
+                return Ok(());
+            }
+            let len: usize = hook.result.try_into().unwrap();
+            hook.con.read_buf_pos += len;
+        }
+
+        // Handshake bytes setup.
+        if let State::ProxyLine(..) = hook.con.state {
+            assert_eq!(hook.con.read_buf_pos, 0);
+            let State::ProxyLine(fd, tls) = std::mem::replace(&mut hook.con.state, State::Idle)
+            else {
+                unreachable!();
+            };
+            assert!(
+                UserDataOp::Read == hook.op,
+                "ProxyLine state only accepts Read completions."
+            );
+            if hook.result == 0 {
+                hook.con.close(opt.async_cancel2, ops);
+                return Ok(());
+            }
+            if hook.result < 0 {
+                warn!("Read error: {}", hook.result);
+                hook.con.close(opt.async_cancel2, ops);
+                return Ok(());
+            }
+            let data = &hook.con.read_buf[..hook.result.try_into().unwrap()];
+            if let Some(end) = find_crlf(data) {
+                let proxyline = &data[..end];
+                let rest = &data[(end + 2)..].to_vec();
+                trace!(
+                    "Got proxyline {proxyline:?}: {}",
+                    String::from_utf8_lossy(proxyline)
+                );
+                trace!("Got {} post-proxyline bytes", rest.len());
+                if let Some(tls) = tls {
+                    trace!("Entering handshaking state");
+                    hook.con.state = State::Handshaking(HandshakeData::new(fd, tls));
+                    hook.con.read_buf_pos = 0;
+                    // TODO: drain ..len instead.
+                    hook.con.read_sync(rest, ops);
+                } else {
+                    hook.con.state = State::Reading(fd);
+                }
+            } else {
+                unimplemented!("handle case of partial proxy line")
+            }
+        }
+    }
+
     //trace!("Read buf pos: {}", data.con.read_buf_pos);
     match &mut hook.con.state {
         State::Idle => panic!("Can't happen: op {hook:?} on Idle connection"),
@@ -1327,13 +1417,15 @@ fn op_completion(
         State::Reading(_) => {}
         State::WritingData(_, _, _) => {}
         State::WritingHeaders(_, _, _) => {}
+        State::ProxyLine(..) => {}
 
         // Handshake states.
         State::EnablingKtls(fd) => {
             assert!(
                 matches![hook.op, UserDataOp::SetSockOpt],
-                "Expected SetSockOpt, got {:?}",
-                hook.op
+                "Expected SetSockOpt, got {:?} result {}",
+                hook.op,
+                hook.result
             );
             if hook.result != 0 {
                 return Err(Error::msg(format!(
@@ -1357,21 +1449,18 @@ fn op_completion(
 
         State::Handshaking(d) => {
             match &hook.op {
-                UserDataOp::Read => {
-                    if hook.result == 0 {
-                        hook.con.close(opt.async_cancel2, ops);
-                        return Ok(());
+                UserDataOp::Read | UserDataOp::Nop => {
+                    if false {
+                        trace!(
+                            "Handshake data: {:?}",
+                            &hook.con.read_buf[..hook.con.read_buf_pos]
+                        );
                     }
-                    if hook.result < 0 {
-                        warn!("Read error: {}", hook.result);
-                        hook.con.close(opt.async_cancel2, ops);
-                        return Ok(());
-                    }
-
-                    let io = d.received(&hook.con.read_buf[..hook.result.try_into().unwrap()])?;
+                    let io = d.received(&hook.con.read_buf[..hook.con.read_buf_pos])?;
                     let still_handshaking = d.tls.is_handshaking();
                     let fd = d.fixed;
                     debug!("rustls op: {io:?}");
+                    hook.con.read_buf_pos = 0;
 
                     // Handle bytes write.
                     // TODO: fix needless copy.
@@ -1595,8 +1684,8 @@ fn mainloop(
                         .as_ref()
                         .map(|c| rustls::ServerConnection::new(c.clone()))
                         .transpose()?;
-                    new_conn.init(fixed, tls, &mut ops);
-                    new_conn.read(&mut ops);
+                    new_conn.init(fixed, true, tls, &mut ops);
+                    //new_conn.read(&mut ops);
                 }
                 USER_DATA_TIMEOUT => {
                     // TODO: expire old connections.
