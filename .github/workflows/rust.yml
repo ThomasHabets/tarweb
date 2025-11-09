@@ -18,15 +18,15 @@ jobs:
       run: rustup install nightly
     - name: Install clippy
       run: rustup component add --toolchain nightly clippy
-    - name: Cargo install
+    - name: Cargo install deny
       run: cargo install cargo-deny
-    - name: Build
-      run: cargo build --verbose
     - name: apt-get update
       run: sudo apt-get update
     - name: Install stuff
       run: sudo apt-get install libseccomp-dev protobuf-compiler libprotobuf-dev
     - name: Install tickbox
       run: cargo install tickbox
+    - name: Build
+      run: cargo build --verbose
     - name: Run tests
       run: NODIFF=true CLEANUP=true tickbox --dir tickbox/pre-commit --disable-tui --max-concurrency=1
