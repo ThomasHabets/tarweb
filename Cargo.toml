@@ -56,8 +56,10 @@ prost-build = "0.14.1"
 [dev-dependencies]
 tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "process", "sync", "time"] }
 tempfile = "3.23.0"
+# TODO: For some reason SSL needs to be vendored, or linking fails.
+# Why is openssl even linked to? That's what rustls is for.
 reqwest = { version = "0.12.24", features = ["blocking", "rustls-tls", "native-tls-vendored", "gzip"] }
-#reqwest = { version = "0.12.24", features = ["blocking", "rustls-tls", "native-tls-vendored"] }
+#reqwest = { version = "0.12.24", features = ["blocking", "rustls-tls", "gzip"] }
 
 [features]
 # Not supported on riscv64
