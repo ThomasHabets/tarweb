@@ -1,0 +1,32 @@
+name: Build and test
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Rustup upgrade
+      run: rustup install nightly
+    - name: Install clippy
+      run: rustup component add --toolchain nightly clippy
+    - name: Cargo install
+      run: cargo install cargo-deny
+    - name: Build
+      run: cargo build --verbose
+    - name: apt-get update
+      run: sudo apt-get update
+    - name: Install stuff
+      run: sudo apt-get install libseccomp-dev
+    - name: Install tickbox
+      run: cargo install tickbox
+    - name: Run tests
+      run: NODIFF=true CLEANUP=true tickbox --dir tickbox/pre-commit --disable-tui --max-concurrency=1
