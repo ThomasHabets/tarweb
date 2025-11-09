@@ -1937,6 +1937,9 @@ fn main() -> Result<()> {
             "Can't use both -listen and --passfd at the same time."
         ));
     }
+    if opt.listen.is_none() && opt.passfd.is_none() {
+        return Err(anyhow!("Either -listen or --passfd must be provided"));
+    }
 
     let listener = opt
         .listen
