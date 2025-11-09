@@ -282,13 +282,12 @@ impl Connection {
     ///
     /// We reuse `Connection` objects between connections, which is why this is
     /// not just part of `new()`.
-    fn init(&mut self, fixed: FixedFile, tls: Option<rustls::ServerConnection>, ops: &mut SQueue) {
+    fn init(&mut self, fixed: FixedFile, tls: Option<rustls::ServerConnection>) {
         debug_assert!(matches![self.state, State::Idle]);
         if let Some(tls) = tls {
             self.state = State::Handshaking(HandshakeData::new(fixed, tls));
         } else {
             self.state = State::Reading(fixed);
-            self.read(ops);
         }
         self.last_action = std::time::Instant::now();
     }
@@ -1598,7 +1597,7 @@ fn mainloop(
                         .as_ref()
                         .map(|c| rustls::ServerConnection::new(c.clone()))
                         .transpose()?;
-                    new_conn.init(fixed, tls, &mut ops);
+                    new_conn.init(fixed, tls);
                     new_conn.read(&mut ops);
                 }
                 USER_DATA_TIMEOUT => {
