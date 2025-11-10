@@ -125,7 +125,7 @@ fn start_server(dir: &std::path::Path) -> Result<(KillOnDrop, std::net::SocketAd
             dir.join("site.tar").to_str().unwrap(),
         ])
         //.stderr(std::process::Stdio::piped())
-        //.stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()?;
     let mut ch = KillOnDrop(Some(child));
     let addr = addr.parse()?;
@@ -163,6 +163,65 @@ fn curl_http() -> Result<()> {
         }
     }
     let child = child_dropper.into().wait_with_output()?;
+    println!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
+    Ok(())
+}
+
+#[test]
+fn range_nocompress() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let (child, addr) = start_server(dir.path())?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    // First byte only.
+    for (start, end, want) in [
+        // Good ranges at start.
+        (0, 0, "h"),
+        (0, 1, "he"),
+        (0, 2, "hel"),
+        (0, 9, "hello worl"),
+        (0, 10, "hello world"),
+        // Good ranges from mid.
+        (1, 1, "e"),
+        (2, 4, "llo"),
+        (6, 6, "w"),
+        (10, 10, "d"),
+        (8, 9, "rl"),
+        (8, 10, "rld"),
+        // Bad ranges.
+        (0, 11, "hello world"),  // One out of bounds.
+        (0, 100, "hello world"), // Many out of bounds.
+        (1, 0, "hello world"),   // Bad order.
+        (8, 11, "hello world"),  // Out of range.
+    ] {
+        let resp = client
+            .get(format!("http://{addr}/"))
+            .header("range", &format!("bytes={start}-{end}"))
+            .send()?;
+        let hs = resp.headers();
+        assert_eq!(
+            hs.get("content-length").unwrap(),
+            &want.len().to_string(),
+            "Bad content length for {start},{end}"
+        );
+        if end > 10 || end < start {
+            assert!(
+                hs.get("content-range").is_none(),
+                "Failed for {start},{end}"
+            );
+        } else {
+            assert_eq!(
+                hs.get("content-range").unwrap(),
+                &format!("bytes {start}-{end}/11"),
+                "Failed for {start},{end}"
+            );
+        }
+        assert_eq!(resp.text()?, want, "Bad output for {start},{end}");
+    }
+    let child = child.into();
+    let child = child.wait_with_output()?;
     println!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
     Ok(())
 }

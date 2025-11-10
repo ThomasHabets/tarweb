@@ -1173,7 +1173,7 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
     //
     // Write status header.
     if let Some((start, end)) = req.range {
-        if start <= len && (start + end) < len {
+        if start <= len && end < len && (start <= end) {
             pos += start;
             len = end - start + 1;
             write!(
