@@ -1,28 +1,53 @@
+// TODO test:
+// * Compressed range get.
+// * Through SNI router
+// * With PROXY
+// * Without proxy
+// * Proxy pass
+// * Inline proxying.
+// * Print server error log if assert fails.
 use std::io::{Read, Write};
 use std::process::Command;
 
 use anyhow::Result;
 
 // const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-struct KillOnDrop(Option<std::process::Child>);
+struct Child {
+    process: Option<std::process::Child>,
+    thread: Option<std::thread::JoinHandle<Result<Vec<u8>>>>,
+}
 
-impl KillOnDrop {
-    fn is_done(&mut self) -> Result<bool> {
-        Ok(self.0.as_mut().unwrap().try_wait()?.is_some())
+impl Child {
+    fn new(process: std::process::Child, thread: std::thread::JoinHandle<Result<Vec<u8>>>) -> Self {
+        Self {
+            process: Some(process),
+            thread: Some(thread),
+        }
     }
-    fn into(mut self) -> std::process::Child {
+    fn is_done(&mut self) -> Result<bool> {
+        Ok(self.process.as_mut().unwrap().try_wait()?.is_some())
+    }
+    fn into(mut self) -> Result<(std::process::Child, Result<Vec<u8>>)> {
         self.stop();
-        self.0.take().unwrap()
+        let mut child = self.process.take().unwrap();
+        let _ = child.wait();
+        let stderr = self
+            .thread
+            .take()
+            .unwrap()
+            .join()
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        Ok((child, stderr))
     }
     fn stop(&mut self) {
-        if let Some(w) = &mut self.0 {
+        if let Some(w) = &mut self.process {
             let _ = w.kill();
             let _ = w.wait();
         }
     }
 }
 
-impl Drop for KillOnDrop {
+impl Drop for Child {
     fn drop(&mut self) {
         self.stop();
     }
@@ -97,7 +122,7 @@ fn make_tarfile(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn probe_tcp(child: &mut KillOnDrop, addr: std::net::SocketAddr) -> Result<()> {
+fn probe_tcp(child: &mut Child, addr: std::net::SocketAddr) -> Result<()> {
     while std::net::TcpStream::connect(addr).is_err() {
         if child.is_done()? {
             return Err(anyhow::anyhow!("server has exited"));
@@ -106,7 +131,7 @@ fn probe_tcp(child: &mut KillOnDrop, addr: std::net::SocketAddr) -> Result<()> {
     Ok(())
 }
 
-fn start_server(dir: &std::path::Path) -> Result<(KillOnDrop, std::net::SocketAddr)> {
+fn start_server(dir: &std::path::Path) -> Result<(Child, std::net::SocketAddr)> {
     make_tarfile(dir)?;
 
     // Bind to a port to pick a port number.
@@ -116,7 +141,7 @@ fn start_server(dir: &std::path::Path) -> Result<(KillOnDrop, std::net::SocketAd
 
     // TODO: depends on this port being free. Find a free port instead.
     let addr = format!("[::1]:{port}");
-    let child = Command::new(env!("CARGO_BIN_EXE_tarweb"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tarweb"))
         .args([
             "-v",
             "trace",
@@ -124,10 +149,15 @@ fn start_server(dir: &std::path::Path) -> Result<(KillOnDrop, std::net::SocketAd
             &addr,
             dir.join("site.tar").to_str().unwrap(),
         ])
-        //.stderr(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()?;
-    let mut ch = KillOnDrop(Some(child));
+    let mut stderr = child.stderr.take().unwrap();
+    let thread = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        stderr.read_to_end(&mut v)?;
+        Ok(v)
+    });
+    let mut ch = Child::new(child, thread);
     let addr = addr.parse()?;
     probe_tcp(&mut ch, addr)?;
     Ok((ch, addr))
@@ -162,7 +192,7 @@ fn curl_http() -> Result<()> {
             assert_eq!(stdout, content);
         }
     }
-    let child = child_dropper.into().wait_with_output()?;
+    let child = child_dropper.into()?.0.wait_with_output()?;
     println!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
     Ok(())
 }
@@ -220,9 +250,13 @@ fn range_nocompress() -> Result<()> {
         }
         assert_eq!(resp.text()?, want, "Bad output for {start},{end}");
     }
-    let child = child.into();
+    let (child, stderr) = child.into()?;
     let child = child.wait_with_output()?;
-    println!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
+    println!(
+        "tarweb out:\n{}\nerr:\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&stderr?)
+    );
     Ok(())
 }
 
@@ -304,7 +338,7 @@ fn some_requests() -> Result<()> {
             }
         }
     }
-    let child = child_dropper.into();
+    let (child, _stderr) = child_dropper.into()?;
     let child = child.wait_with_output()?;
     println!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
     Ok(())
