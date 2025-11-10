@@ -175,12 +175,10 @@ fn some_requests() -> Result<()> {
     for compressed in [false, true] {
         for auto_decompress in [false, true] {
             for (path, code, content, has_compressed) in [
-                /*
                 ("non-existing", 404, "Not found\n", false),
                 ("", 200, "hello world", false),
                 ("index.html", 200, "hello world", false),
                 ("something.txt", 200, "the big brown etcetera", false),
-                */
                 ("compressed.txt", 200, "what's updog?", true),
             ] {
                 eprintln!("-------- compressed={compressed}/{auto_decompress} {path:?} -----");
