@@ -16,7 +16,8 @@ message Backend {
         }
         message Proxy {
                 string addr = 1;
-                Tls tls = 2;
+                bool proxy_header = 2;
+                Tls tls = 3;
         }
         message Pass {
                 string path = 1;

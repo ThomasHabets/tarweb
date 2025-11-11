@@ -108,6 +108,7 @@ fn load_backend(be: &protos::backend::Backend, sorry: Option<&protos::Backend>) 
         }
         protos::backend::Backend::Proxy(p) => Backend::Proxy {
             addr: p.addr.clone(),
+            proxy_header: p.proxy_header,
             tls: load_tls(p.tls.as_ref())?,
             sorry,
         },
@@ -440,6 +441,7 @@ enum Backend {
     // the SNI router.
     Proxy {
         addr: String,
+        proxy_header: bool,
         tls: Option<Arc<rustls::ServerConfig>>,
         sorry: Option<Box<Backend>>,
     },
@@ -582,6 +584,7 @@ async fn handle_conn_backend_proxy(
     bytes: Vec<u8>,
     addr: &str,
     sorry: Option<&Backend>,
+    proxy_header: bool,
     tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
     let mut conn = match connect_for_proxy(id, addr).await {
@@ -602,23 +605,26 @@ async fn handle_conn_backend_proxy(
     let (mut up_r, mut up_w) = conn.split();
     let (mut down_r, mut down_w) = stream.split();
     let upstream = async {
-        let me = down_r.local_addr()?;
-        let peer = down_r.peer_addr()?;
-        let src_port = peer.port();
-        let src_addr = peer.ip().to_string();
-        let proto = if peer.is_ipv4() {
-            "TCP4"
-        } else if peer.is_ipv6() {
-            "TCP6"
-        } else {
-            "UNKNOWN"
-        };
-        let dst_addr = me.ip().to_string();
-        let dst_port = me.port();
-        up_w.write_all(
-            format!("PROXY {proto} {src_addr} {dst_addr} {src_port} {dst_port}\r\n").as_bytes(),
-        )
-        .await?;
+        if proxy_header {
+            let me = down_r.local_addr()?;
+            let peer = down_r.peer_addr()?;
+            let src_port = peer.port();
+            let src_addr = peer.ip().to_string();
+            let proto = if peer.is_ipv4() {
+                "TCP4"
+            } else if peer.is_ipv6() {
+                "TCP6"
+            } else {
+                "UNKNOWN"
+            };
+            let dst_addr = me.ip().to_string();
+            let dst_port = me.port();
+            up_w.write_all(
+                format!("PROXY {proto} {src_addr} {dst_addr} {src_port} {dst_port}\r\n").as_bytes(),
+            )
+            .await?;
+        }
+        // Re-write ClientHello or anything else pre-read.
         up_w.write_all(&bytes).await?;
         tokio::io::copy(&mut down_r, &mut up_w).await?;
         up_w.shutdown().await?;
@@ -688,9 +694,22 @@ fn handle_conn_backend<'a>(
                 };
                 pass_fd_over_uds(stream, sock, bytes).await
             }
-            Backend::Proxy { addr, tls, sorry } => {
-                handle_conn_backend_proxy(id, stream, bytes, addr, sorry.as_deref(), tls.clone())
-                    .await
+            Backend::Proxy {
+                addr,
+                proxy_header,
+                tls,
+                sorry,
+            } => {
+                handle_conn_backend_proxy(
+                    id,
+                    stream,
+                    bytes,
+                    addr,
+                    sorry.as_deref(),
+                    *proxy_header,
+                    tls.clone(),
+                )
+                .await
             }
         }
     })
@@ -863,6 +882,7 @@ mod tests {
                             re: regex::Regex::new("bar")?,
                             backend: Backend::Proxy {
                                 addr: format!("[::1]:{backend_bar_port}"),
+                                proxy_header: false,
                                 tls: None,
                                 sorry: None,
                             },
@@ -871,6 +891,7 @@ mod tests {
                     ],
                     default_backend: Backend::Proxy {
                         addr: format!("[::1]:{backend_baz_port}"),
+                        proxy_header: false,
                         tls: None,
                         sorry: None,
                     },
