@@ -1,5 +1,4 @@
 // TODO test:
-// * Compressed range get.
 // * Through SNI router
 // * With PROXY
 // * Without proxy
@@ -63,6 +62,29 @@ fn gzip(bs: &[u8]) -> Result<Vec<u8>> {
         let mut stdin = child.stdin.take().unwrap();
         stdin.write_all(bs)?;
         stdin.flush()?;
+    }
+    if !child.wait()?.success() {
+        return Err(anyhow::anyhow!("failed to gzip"));
+    }
+    if let Some(mut stdout) = child.stdout.take() {
+        stdout.read_to_end(&mut out)?;
+    }
+    Ok(out)
+}
+
+fn gunzip(bs: &[u8]) -> Result<Vec<u8>> {
+    let mut child = std::process::Command::new("gunzip")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let mut out = Vec::new();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(bs)?;
+        stdin.flush()?;
+    }
+    if !child.wait()?.success() {
+        return Err(anyhow::anyhow!("failed to gzip"));
     }
     if let Some(mut stdout) = child.stdout.take() {
         stdout.read_to_end(&mut out)?;
@@ -250,6 +272,100 @@ fn range_nocompress() -> Result<()> {
         }
         assert_eq!(resp.text()?, want, "Bad output for {start},{end}");
     }
+    let (child, stderr) = child.into()?;
+    let child = child.wait_with_output()?;
+    println!(
+        "tarweb out:\n{}\nerr:\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&stderr?)
+    );
+    Ok(())
+}
+
+#[test]
+fn range_compress() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let (child, addr) = start_server(dir.path())?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .no_gzip()
+        .build()?;
+    let bytes_re = regex::Regex::new(r"(?i)^bytes (\d+)-(\d+)/(\d+)$").unwrap();
+
+    let mut full = Vec::new();
+    let total_len: usize;
+
+    // First byte only.
+    {
+        let resp = client
+            .get(format!("http://{addr}/compressed.txt"))
+            .header("accept-encoding", "gzip")
+            .header("range", "bytes=0-0")
+            .send()?;
+        let hs = resp.headers();
+        assert_eq!(hs.get("content-length").unwrap(), "1");
+        let m = bytes_re
+            .captures(hs.get("content-range").unwrap().to_str()?)
+            .unwrap();
+        assert_eq!(&m[1], "0");
+        assert_eq!(&m[2], "0");
+        total_len = m[3].parse()?;
+        full.extend(resp.bytes()?);
+    }
+
+    // Half of rest.
+    {
+        let resp = client
+            .get(format!("http://{addr}/compressed.txt"))
+            .header("accept-encoding", "gzip")
+            .header("range", &format!("bytes=1-{}", total_len / 2))
+            .send()?;
+        let hs = resp.headers();
+        assert_eq!(
+            hs.get("content-length").unwrap(),
+            &(total_len / 2).to_string()
+        );
+        let m = bytes_re
+            .captures(hs.get("content-range").unwrap().to_str()?)
+            .unwrap();
+        assert_eq!(&m[1], "1");
+        assert_eq!(&m[2], (total_len / 2).to_string());
+        assert_eq!(&m[3], total_len.to_string());
+        full.extend(resp.bytes()?);
+    }
+
+    // Second half.
+    {
+        let resp = client
+            .get(format!("http://{addr}/compressed.txt"))
+            .header("accept-encoding", "gzip")
+            .header(
+                "range",
+                &format!("bytes={}-{}", total_len / 2 + 1, total_len - 1),
+            )
+            .send()?;
+        let hs = resp.headers();
+        assert_eq!(
+            hs.get("content-length").unwrap(),
+            &(total_len - total_len / 2 - 1).to_string()
+        );
+        let m = bytes_re
+            .captures(hs.get("content-range").unwrap().to_str()?)
+            .unwrap();
+        assert_eq!(&m[1], (total_len / 2 + 1).to_string());
+        assert_eq!(&m[2], (total_len - 1).to_string());
+        assert_eq!(&m[3], total_len.to_string());
+        full.extend(resp.bytes()?);
+    }
+
+    let plain = gunzip(&full)?;
+    assert_eq!(
+        String::from_utf8(plain)?,
+        "what's updog?",
+        "{} bytes compressed wrong",
+        full.len()
+    );
+
     let (child, stderr) = child.into()?;
     let child = child.wait_with_output()?;
     println!(
