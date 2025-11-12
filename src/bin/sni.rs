@@ -91,12 +91,16 @@ fn load_tls(cfg: Option<&protos::backend::Tls>) -> Result<Option<Arc<rustls::Ser
     })))
 }
 
-fn load_backend(be: &protos::backend::Backend, sorry: Option<&protos::Backend>) -> Result<Backend> {
+fn load_backend(
+    be: &protos::backend::Backend,
+    frontend_tls: Option<&protos::backend::Tls>,
+    sorry: Option<&protos::Backend>,
+) -> Result<Backend> {
     if sorry.is_some_and(|s| s.sorry.is_some()) {
         return Err(anyhow!("sorry servers can't have sorry servers"));
     }
     let sorry = sorry
-        .map(|s| load_backend(s.backend.as_ref().unwrap(), None))
+        .map(|s| load_backend(s.backend.as_ref().unwrap(), s.frontend_tls.as_ref(), None))
         .transpose()?
         .map(Box::new);
     Ok(match be {
@@ -109,12 +113,12 @@ fn load_backend(be: &protos::backend::Backend, sorry: Option<&protos::Backend>) 
         protos::backend::Backend::Proxy(p) => Backend::Proxy {
             addr: p.addr.clone(),
             proxy_header: p.proxy_header,
-            tls: load_tls(p.tls.as_ref())?,
+            frontend_tls: load_tls(frontend_tls)?,
             sorry,
         },
         protos::backend::Backend::Pass(p) => Backend::Pass {
             path: p.path.clone().into(),
-            tls: load_tls(p.tls.as_ref())?,
+            frontend_tls: load_tls(frontend_tls)?,
             sorry,
         },
     })
@@ -142,14 +146,15 @@ fn load_config(filename: &str) -> Result<Config> {
         },
         rules: vec![],
         default_backend: {
-            let (be, sorry) = protocfg
+            let (be, frontend_tls, sorry) = protocfg
                 .default_backend
                 .as_ref()
-                .map(|d| (&d.backend, d.sorry.as_deref()))
+                .map(|d| (&d.backend, d.frontend_tls.as_ref(), d.sorry.as_deref()))
                 .ok_or(anyhow!("Config missing default backend"))?;
             load_backend(
                 be.as_ref()
                     .ok_or(anyhow!("default backend missing an actual backend"))?,
+                frontend_tls,
                 sorry,
             )?
         },
@@ -174,14 +179,15 @@ fn load_config(filename: &str) -> Result<Config> {
                 }
             }),
             backend: {
-                let (be, sorry) = rule
+                let (be, frontend_tls, sorry) = rule
                     .backend
                     .as_ref()
-                    .map(|d| (&d.backend, d.sorry.as_deref()))
+                    .map(|d| (&d.backend, d.frontend_tls.as_ref(), d.sorry.as_deref()))
                     .ok_or(anyhow!("rule missing backend"))?;
                 load_backend(
                     be.as_ref()
                         .ok_or(anyhow!("backend missing actual backend"))?,
+                    frontend_tls,
                     sorry,
                 )?
             },
@@ -431,7 +437,7 @@ enum Backend {
     // descriptor to continue.
     Pass {
         path: std::path::PathBuf,
-        tls: Option<Arc<rustls::ServerConfig>>,
+        frontend_tls: Option<Arc<rustls::ServerConfig>>,
         sorry: Option<Box<Backend>>,
     },
 
@@ -442,7 +448,7 @@ enum Backend {
     Proxy {
         addr: String,
         proxy_header: bool,
-        tls: Option<Arc<rustls::ServerConfig>>,
+        frontend_tls: Option<Arc<rustls::ServerConfig>>,
         sorry: Option<Box<Backend>>,
     },
 }
@@ -590,6 +596,8 @@ async fn handle_conn_backend_proxy(
     let mut conn = match connect_for_proxy(id, addr).await {
         Ok(c) => c,
         Err(e) => {
+            // TODO: only do sorry server if handshake and/or PROXY protocol
+            // message did not complete. Basically if connect didn't complete.
             return match sorry {
                 None => Err(e),
                 Some(s) => handle_conn_backend(id, stream, bytes, s).await,
@@ -658,7 +666,11 @@ fn handle_conn_backend<'a>(
                 trace!("id={id} Null backend. Closing");
                 Ok(())
             }
-            Backend::Pass { path, tls, sorry } => {
+            Backend::Pass {
+                path,
+                frontend_tls,
+                sorry,
+            } => {
                 // Connecting to a UnixDatagram should be cheap, and not at all be
                 // visible to the backend. It's only when we SendMsg that it can
                 // cause any load. So we first do this connect, so that we don't
@@ -687,7 +699,7 @@ fn handle_conn_backend<'a>(
                         ucred.gid()
                     );
                 }
-                let (stream, bytes) = if let Some(tls) = tls {
+                let (stream, bytes) = if let Some(tls) = frontend_tls {
                     tls_handshake(stream, bytes, tls.clone()).await?
                 } else {
                     (stream, bytes)
@@ -697,7 +709,7 @@ fn handle_conn_backend<'a>(
             Backend::Proxy {
                 addr,
                 proxy_header,
-                tls,
+                frontend_tls,
                 sorry,
             } => {
                 handle_conn_backend_proxy(
@@ -707,7 +719,7 @@ fn handle_conn_backend<'a>(
                     addr,
                     sorry.as_deref(),
                     *proxy_header,
-                    tls.clone(),
+                    frontend_tls.clone(),
                 )
                 .await
             }
@@ -873,7 +885,7 @@ mod tests {
                             re: regex::Regex::new("socket")?,
                             backend: Backend::Pass {
                                 path: sockfile.clone(),
-                                tls: None,
+                                frontend_tls: None,
                                 sorry: None,
                             },
                             timeout: None,
@@ -883,7 +895,7 @@ mod tests {
                             backend: Backend::Proxy {
                                 addr: format!("[::1]:{backend_bar_port}"),
                                 proxy_header: false,
-                                tls: None,
+                                frontend_tls: None,
                                 sorry: None,
                             },
                             timeout: None,
@@ -892,7 +904,7 @@ mod tests {
                     default_backend: Backend::Proxy {
                         addr: format!("[::1]:{backend_baz_port}"),
                         proxy_header: false,
-                        tls: None,
+                        frontend_tls: None,
                         sorry: None,
                     },
                     default_backend_timeout: None,

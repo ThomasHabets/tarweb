@@ -17,11 +17,9 @@ message Backend {
         message Proxy {
                 string addr = 1;
                 bool proxy_header = 2;
-                Tls tls = 3;
         }
         message Pass {
                 string path = 1;
-                Tls tls = 2;
         }
         oneof backend {
                 Null null = 1;
@@ -40,6 +38,17 @@ message Backend {
 
         // Sorry backend. Used if connecting to the backend fails.
         Backend sorry = 5;
+
+        // Enabling frontend TLS causes the SNI router to complete the handshake
+        // with the client.
+        //
+        // The handshake happens *after* connecting to the backend, for two
+        // reasons:
+        // 1. Don't waste a handshake if the backend is down.
+        // 2. If we fail to connect to the regular backend, the Sorry server may wish to get the connection *without* frontend TLS offloaded.
+        //
+        // Note that frontend TLS with a null backend is a wasted handshake.
+        Tls frontend_tls = 6;
 }
 
 message SNIConfig {
