@@ -305,6 +305,8 @@ async fn pass_fd_over_uds(
 
     // Send sync, but per above *should* be fine to write. Also with
     // `MSG_DONTWAIT` it shouldn't block.
+    //
+    // This error is sorryable, if it failed in its entirety.
     let sent = sendmsg::<()>(
         sock.as_raw_fd(),
         &iov,
@@ -313,7 +315,9 @@ async fn pass_fd_over_uds(
         None,
     )
     .context("sendmsg SCM_RIGHTS")?;
+
     if sent != bytes.len() {
+        // This is not sorryable.
         return Err(anyhow!(
             "sendmsg: expected to send {} bytes, sent {sent}",
             bytes.len()
@@ -488,7 +492,12 @@ async fn tls_handshake(
 
     debug!("Handshaking…");
 
-    let mut tls = rustls::ServerConnection::new(cfg)?;
+    // If this fails, we could actually still continue with a sorry server in
+    // the caller, but it seems like a very unlikely case, so let's just fail.
+    //
+    // Anything after creating the config is unsafe to go to sorry-server.
+    let mut tls = rustls::ServerConnection::new(cfg)
+        .context("creating TLS server config: This is sorry-able, but is not implemented")?;
     loop {
         // Give bytes we have to rustls.
         {
@@ -602,8 +611,7 @@ async fn handle_conn_backend_proxy(
     let mut conn = match connect_for_proxy(id, addr).await {
         Ok(c) => c,
         Err(e) => {
-            // TODO: only do sorry server if handshake and/or PROXY protocol
-            // message did not complete. Basically if connect didn't complete.
+            info!("Primary backend connect failure: {e}");
             return match sorry {
                 None => Err(e),
                 Some(s) => handle_conn_backend(id, stream, bytes, s).await,
@@ -686,6 +694,7 @@ fn handle_conn_backend<'a>(
                     .connect(path)
                     .with_context(|| format!("connect to {:?}", path.display()))
                 {
+                    info!("Primary backend connect failure: {e}");
                     if let Some(s) = sorry {
                         return handle_conn_backend(id, stream, bytes, s).await;
                     }
@@ -694,6 +703,8 @@ fn handle_conn_backend<'a>(
                 // This doesn't work, because we're using DGRAM. Maybe it works with
                 // SEQPACKET?
                 if false {
+                    // While this error is sorry-able, but since it doesn't work
+                    // anyway, shrug.
                     let ucred = nix::sys::socket::getsockopt(
                         &sock,
                         nix::sys::socket::sockopt::PeerCredentials,
