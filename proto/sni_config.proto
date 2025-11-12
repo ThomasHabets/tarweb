@@ -21,7 +21,7 @@ message Backend {
         message Pass {
                 string path = 1;
         }
-        oneof backend {
+        oneof backend_type {
                 Null null = 1;
                 Proxy proxy = 2;
                 Pass pass = 3;

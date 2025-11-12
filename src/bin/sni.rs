@@ -92,7 +92,7 @@ fn load_tls(cfg: Option<&protos::backend::Tls>) -> Result<Option<Arc<rustls::Ser
 }
 
 fn load_backend(
-    be: &protos::backend::Backend,
+    be: &protos::backend::BackendType,
     frontend_tls: Option<&protos::backend::Tls>,
     sorry: Option<&protos::Backend>,
 ) -> Result<Backend> {
@@ -100,23 +100,29 @@ fn load_backend(
         return Err(anyhow!("sorry servers can't have sorry servers"));
     }
     let sorry = sorry
-        .map(|s| load_backend(s.backend.as_ref().unwrap(), s.frontend_tls.as_ref(), None))
+        .map(|s| {
+            load_backend(
+                s.backend_type.as_ref().unwrap(),
+                s.frontend_tls.as_ref(),
+                None,
+            )
+        })
         .transpose()?
         .map(Box::new);
     Ok(match be {
-        protos::backend::Backend::Null(_) => {
+        protos::backend::BackendType::Null(_) => {
             if sorry.is_some() {
                 return Err(anyhow!("null backend with sorry server not allowed"));
             }
             Backend::Null
         }
-        protos::backend::Backend::Proxy(p) => Backend::Proxy {
+        protos::backend::BackendType::Proxy(p) => Backend::Proxy {
             addr: p.addr.clone(),
             proxy_header: p.proxy_header,
             frontend_tls: load_tls(frontend_tls)?,
             sorry,
         },
-        protos::backend::Backend::Pass(p) => Backend::Pass {
+        protos::backend::BackendType::Pass(p) => Backend::Pass {
             path: p.path.clone().into(),
             frontend_tls: load_tls(frontend_tls)?,
             sorry,
@@ -149,7 +155,7 @@ fn load_config(filename: &str) -> Result<Config> {
             let (be, frontend_tls, sorry) = protocfg
                 .default_backend
                 .as_ref()
-                .map(|d| (&d.backend, d.frontend_tls.as_ref(), d.sorry.as_deref()))
+                .map(|d| (&d.backend_type, d.frontend_tls.as_ref(), d.sorry.as_deref()))
                 .ok_or(anyhow!("Config missing default backend"))?;
             load_backend(
                 be.as_ref()
@@ -182,7 +188,7 @@ fn load_config(filename: &str) -> Result<Config> {
                 let (be, frontend_tls, sorry) = rule
                     .backend
                     .as_ref()
-                    .map(|d| (&d.backend, d.frontend_tls.as_ref(), d.sorry.as_deref()))
+                    .map(|d| (&d.backend_type, d.frontend_tls.as_ref(), d.sorry.as_deref()))
                     .ok_or(anyhow!("rule missing backend"))?;
                 load_backend(
                     be.as_ref()
