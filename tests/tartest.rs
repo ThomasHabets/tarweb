@@ -1,8 +1,4 @@
 // TODO test:
-// * With PROXY
-// * Without proxy
-// * Proxy pass
-// * Inline proxying.
 // * Print server error log if assert fails.
 use std::io::{Read, Write};
 use std::process::Command;
@@ -167,7 +163,11 @@ fn probe_pass(child: &mut Child, addr: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn start_server_pass(dir: &std::path::Path, with_tls: bool) -> Result<(Child, std::path::PathBuf)> {
+fn start_server_pass(
+    dir: &std::path::Path,
+    with_tls: bool,
+    with_proxyline: bool,
+) -> Result<(Child, std::path::PathBuf)> {
     make_tarfile(dir)?;
     let addr = dir.join("pass.sock");
 
@@ -181,10 +181,13 @@ fn start_server_pass(dir: &std::path::Path, with_tls: bool) -> Result<(Child, st
             dir.join("key.pem").to_str().unwrap(),
         ]);
     }
+    if with_proxyline {
+        child.args(["--proxy-protocol"]);
+    }
     let mut child = child
         .args([dir.join("site.tar").to_str().unwrap()])
         .stdout(std::process::Stdio::piped())
-        //.stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()?;
     let mut stderr = child.stdout.take().unwrap();
     let thread = std::thread::spawn(move || {
@@ -197,7 +200,11 @@ fn start_server_pass(dir: &std::path::Path, with_tls: bool) -> Result<(Child, st
     Ok((ch, addr))
 }
 
-fn start_server(dir: &std::path::Path, with_tls: bool) -> Result<(Child, std::net::SocketAddr)> {
+fn start_server(
+    dir: &std::path::Path,
+    with_tls: bool,
+    with_proxyline: bool,
+) -> Result<(Child, std::net::SocketAddr)> {
     make_tarfile(dir)?;
 
     // Bind to a port to pick a port number.
@@ -215,6 +222,9 @@ fn start_server(dir: &std::path::Path, with_tls: bool) -> Result<(Child, std::ne
             "--tls-key",
             dir.join("key.pem").to_str().unwrap(),
         ]);
+    }
+    if with_proxyline {
+        child.args(["--proxy-protocol"]);
     }
     let mut child = child
         .args([dir.join("site.tar").to_str().unwrap()])
@@ -266,7 +276,7 @@ fn start_router(config: &std::path::Path) -> Result<(Child, std::net::SocketAddr
 #[test]
 fn curl_http() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child_dropper, addr) = start_server(dir.path(), false)?;
+    let (child_dropper, addr) = start_server(dir.path(), false, false)?;
 
     for compressed in [false, true] {
         for (path, content) in [
@@ -300,7 +310,7 @@ fn curl_http() -> Result<()> {
 #[test]
 fn range_nocompress() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child, addr) = start_server(dir.path(), false)?;
+    let (child, addr) = start_server(dir.path(), false, false)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -363,7 +373,7 @@ fn range_nocompress() -> Result<()> {
 #[test]
 fn range_compress() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child, addr) = start_server(dir.path(), false)?;
+    let (child, addr) = start_server(dir.path(), false, false)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .no_gzip()
@@ -457,7 +467,7 @@ fn range_compress() -> Result<()> {
 #[test]
 fn some_requests() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child_dropper, addr) = start_server(dir.path(), false)?;
+    let (child_dropper, addr) = start_server(dir.path(), false, false)?;
 
     for compressed in [false, true] {
         for auto_decompress in [false, true] {
@@ -548,7 +558,12 @@ fn e2e() -> Result<()> {
 
     // create certs.
     {
-        let subject_alt_names = vec!["foo".to_string(), "localhost".to_string()];
+        let subject_alt_names = vec![
+            "foo".to_string(),
+            "proxy-frontend".to_string(),
+            "proxy-proxy".to_string(),
+            "localhost".to_string(),
+        ];
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(subject_alt_names).unwrap();
         let cert_der = cert.pem();
@@ -562,8 +577,9 @@ fn e2e() -> Result<()> {
     }
 
     // Start tarweb.
-    let (_plain_tarweb, plain_addr) = start_server(dir.path(), false)?;
-    let (_tls_tarweb, tls_addr) = start_server_pass(dir.path(), true)?;
+    let (_plain_tarweb, plain_addr) = start_server(dir.path(), false, false)?;
+    let (_plainline_tarweb, plainline_addr) = start_server(dir.path(), false, true)?;
+    let (_tls_tarweb, tls_addr) = start_server_pass(dir.path(), true, false)?;
 
     // Set up config.
     {
@@ -579,28 +595,41 @@ rules: <
         >
 >
 rules: <
-        regex: "bar"
+        regex: "proxy-frontend"
         backend: <
                 proxy: <
                     addr: "{plain_addr}"
                 >
                 frontend_tls: <
-                    cert_file: "{}"
-                    key_file: "{}"
+                    cert_file: "{cert}"
+                    key_file: "{key}"
+                >
+        >
+>
+rules: <
+        regex: "proxy-proxy"
+        backend: <
+                proxy: <
+                    addr: "{plainline_addr}"
+                    proxy_header: true,
+                >
+                frontend_tls: <
+                    cert_file: "{cert}"
+                    key_file: "{key}"
                 >
         >
 >
 default_backend: <
         # For localhost SNI, let tarweb deal with the handshaking.
         pass: <
-                path: "{}"
+                path: "{tls_addr}"
         >
 >
 max_lifetime_ms: 10000
 "#,
-                dir.path().join("cert.crt").display(),
-                dir.path().join("key.pem").display(),
-                tls_addr.display(),
+                cert = dir.path().join("cert.crt").display(),
+                key = dir.path().join("key.pem").display(),
+                tls_addr = tls_addr.display(),
             )
             .as_bytes(),
         )?;
@@ -628,33 +657,36 @@ max_lifetime_ms: 10000
         );
     }
 
-    // Try a few URLs on the default handler SNI.
-    for (path, content) in [
-        ("", "hello world"),
-        ("index.html", "hello world"),
-        ("something.txt", "the big brown etcetera"),
-        ("compressed.txt", "what's updog?"),
-    ] {
-        eprintln!("-------- {path:?} -----");
-        let mut curl = Command::new("curl");
-        let curl = curl
-            .args([
-                "-sS",
-                "--cacert",
-                dir.path().join("cert.crt").to_str().unwrap(),
-                "--connect-to",
-                &format!("localhost:443:{router_addr}"),
-                &format!("https://localhost/{path}"),
-            ])
-            .output()?;
+    // Try a few URLs on what should work.
+    //for sni in ["localhost", "proxy-frontend", "proxy-proxy"] {
+    for sni in ["proxy-proxy"] {
+        for (path, content) in [
+            ("", "hello world"),
+            ("index.html", "hello world"),
+            ("something.txt", "the big brown etcetera"),
+            ("compressed.txt", "what's updog?"),
+        ] {
+            eprintln!("-------- Path with SNI {sni:?}: {path:?} -----");
+            let mut curl = Command::new("curl");
+            let curl = curl
+                .args([
+                    "-sS",
+                    "--cacert",
+                    dir.path().join("cert.crt").to_str().unwrap(),
+                    "--connect-to",
+                    &format!("{sni}:443:{router_addr}"),
+                    &format!("https://{sni}/{path}"),
+                ])
+                .output()?;
 
-        let stdout = String::from_utf8(curl.stdout)?;
-        let stderr = String::from_utf8(curl.stderr)?;
-        assert!(
-            curl.status.success(),
-            "curl failed. Stdout: \n{stdout:?}\nStderr:\n{stderr}"
-        );
-        assert_eq!(stdout, content);
+            let stdout = String::from_utf8(curl.stdout)?;
+            let stderr = String::from_utf8(curl.stderr)?;
+            assert!(
+                curl.status.success(),
+                "curl failed. Stdout: \n{stdout:?}\nStderr:\n{stderr}"
+            );
+            assert_eq!(stdout, content);
+        }
     }
     /*
     let (child, _stderr) = child_dropper.into()?;

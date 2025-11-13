@@ -1363,6 +1363,7 @@ fn op_completion(
                     "ProxyLine state only accepts Read completions."
                 );
                 if hook.result == 0 {
+                    hook.con.state = State::ProxyLine(fd, tls);
                     hook.con.close(opt.async_cancel2, ops);
                     return Ok(());
                 }
@@ -1387,7 +1388,12 @@ fn op_completion(
                         // TODO: drain ..len instead.
                         hook.con.read_sync(rest, ops);
                     } else {
+                        trace!("Entering Reading state");
                         hook.con.state = State::Reading(fd);
+                        hook.con.read_buf_pos = 0;
+                        hook.con.read_sync(rest, ops);
+                        hook.con.issue_nop(ops);
+                        return Ok(());
                     }
                 } else {
                     unimplemented!("handle case of partial proxy line")
@@ -1395,6 +1401,9 @@ fn op_completion(
             }
             // Reading state is handled in handle_connection, not here.
             State::Reading(..) => {}
+
+            // We expect reads to finish here as they cancel.
+            State::Closing => {}
             other => panic!("Got read in state {other:?}"),
         }
     }
