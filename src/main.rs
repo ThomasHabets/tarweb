@@ -1592,6 +1592,9 @@ fn mainloop(
     archive: &Archive,
 ) -> Result<()> {
     info!("Thread main");
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .unwrap();
     let mut pooltracker = PoolTracker::new(opt.max_connections);
     let mut ops: SQueue = ArrayVec::new();
     let mut last_submit = std::time::Instant::now();
