@@ -849,7 +849,7 @@ async fn main() -> Result<()> {
     )?;
     sock::set_nodelay(listener.as_raw_fd())?;
     // Config.
-    let config = load_config(&opt.config)?;
+    let config = load_config(&opt.config).context(format!("Loading config {:?}", opt.config))?;
     mainloop(Arc::new(config), &opt.config, listener).await
 }
 
