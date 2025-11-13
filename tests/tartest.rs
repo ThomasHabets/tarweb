@@ -594,6 +594,28 @@ max_lifetime_ms: 10000
         f.sync_all()?;
     }
     let (_router, router_addr) = start_router(&dir.path().join("config.cfg"))?;
+
+    // Ensure `foo` SNI fails.
+    {
+        let curl = Command::new("curl")
+            .args([
+                "-sS",
+                "--cacert",
+                dir.path().join("cert.crt").to_str().unwrap(),
+                "--connect-to",
+                &format!("foo:443:{router_addr}"),
+                "https://foo/",
+            ])
+            .output()?;
+        let stdout = String::from_utf8(curl.stdout)?;
+        let stderr = String::from_utf8(curl.stderr)?;
+        assert!(
+            !curl.status.success(),
+            "curl succeeded, shouldn't. Stdout: \n{stdout:?}\nStderr:\n{stderr}"
+        );
+    }
+
+    // Try a few URLs on the default handler SNI.
     for (path, content) in [
         ("", "hello world"),
         ("index.html", "hello world"),
@@ -602,14 +624,16 @@ max_lifetime_ms: 10000
     ] {
         eprintln!("-------- {path:?} -----");
         let mut curl = Command::new("curl");
-        curl.args([
-            "-sS",
-            "--cacert",
-            dir.path().join("cert.crt").to_str().unwrap(),
-            "--connect-to",
-            &format!("localhost:443:{router_addr}"),
-        ]);
-        let curl = curl.args([&format!("https://localhost/{path}")]).output()?;
+        let curl = curl
+            .args([
+                "-sS",
+                "--cacert",
+                dir.path().join("cert.crt").to_str().unwrap(),
+                "--connect-to",
+                &format!("localhost:443:{router_addr}"),
+                &format!("https://localhost/{path}"),
+            ])
+            .output()?;
 
         let stdout = String::from_utf8(curl.stdout)?;
         let stderr = String::from_utf8(curl.stderr)?;
