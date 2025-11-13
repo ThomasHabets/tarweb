@@ -144,6 +144,8 @@ fn make_tarfile(dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+// Probe_tcp keeps trying to connect until it succeeds. If child process is
+// exited, then that's an error.
 fn probe_tcp(child: &mut Child, addr: std::net::SocketAddr) -> Result<()> {
     while std::net::TcpStream::connect(addr).is_err() {
         if child.is_done()? {
@@ -153,7 +155,7 @@ fn probe_tcp(child: &mut Child, addr: std::net::SocketAddr) -> Result<()> {
     Ok(())
 }
 
-fn start_server(dir: &std::path::Path) -> Result<(Child, std::net::SocketAddr)> {
+fn start_server(dir: &std::path::Path, with_tls: bool) -> Result<(Child, std::net::SocketAddr)> {
     make_tarfile(dir)?;
 
     // Bind to a port to pick a port number.
@@ -163,17 +165,22 @@ fn start_server(dir: &std::path::Path) -> Result<(Child, std::net::SocketAddr)> 
 
     // TODO: depends on this port being free. Find a free port instead.
     let addr = format!("[::1]:{port}");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_tarweb"))
-        .args([
-            "-v",
-            "trace",
-            "-l",
-            &addr,
-            dir.join("site.tar").to_str().unwrap(),
-        ])
-        .stderr(std::process::Stdio::piped())
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tarweb"));
+    child.args(["-v", "trace", "-l", &addr]);
+    if with_tls {
+        child.args([
+            "--tls-cert",
+            dir.join("cert.crt").to_str().unwrap(),
+            "--tls-key",
+            dir.join("key.pem").to_str().unwrap(),
+        ]);
+    }
+    let mut child = child
+        .args([dir.join("site.tar").to_str().unwrap()])
+        .stdout(std::process::Stdio::piped())
+        //.stderr(std::process::Stdio::piped())
         .spawn()?;
-    let mut stderr = child.stderr.take().unwrap();
+    let mut stderr = child.stdout.take().unwrap();
     let thread = std::thread::spawn(move || {
         let mut v = Vec::new();
         stderr.read_to_end(&mut v)?;
@@ -185,10 +192,40 @@ fn start_server(dir: &std::path::Path) -> Result<(Child, std::net::SocketAddr)> 
     Ok((ch, addr))
 }
 
+fn start_router(config: &std::path::Path) -> Result<(Child, std::net::SocketAddr)> {
+    // Bind to a port to pick a port number.
+    let l = std::net::TcpListener::bind("[::]:0")?;
+    let port = l.local_addr()?.port();
+    drop(l);
+
+    // TODO: depends on this port being free. Find a free port instead.
+    let addr = format!("[::1]:{port}");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sni_router"))
+        .args(["-v", "trace", "-l", &addr, "-c", config.to_str().unwrap()])
+        .stdout(std::process::Stdio::piped())
+        //.stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let mut stderr = child.stdout.take().unwrap();
+    let thread = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        stderr.read_to_end(&mut v)?;
+        Ok(v)
+    });
+    let mut ch = Child::new(child, thread);
+    let addr = addr.parse()?;
+    if let Err(e) = probe_tcp(&mut ch, addr) {
+        let ch = ch.into()?.0.wait_with_output()?;
+        println!("out:\n{}", String::from_utf8_lossy(&ch.stdout));
+        println!("err:\n{}", String::from_utf8_lossy(&ch.stderr));
+        return Err(e);
+    }
+    Ok((ch, addr))
+}
+
 #[test]
 fn curl_http() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child_dropper, addr) = start_server(dir.path())?;
+    let (child_dropper, addr) = start_server(dir.path(), false)?;
 
     for compressed in [false, true] {
         for (path, content) in [
@@ -222,7 +259,7 @@ fn curl_http() -> Result<()> {
 #[test]
 fn range_nocompress() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child, addr) = start_server(dir.path())?;
+    let (child, addr) = start_server(dir.path(), false)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -285,7 +322,7 @@ fn range_nocompress() -> Result<()> {
 #[test]
 fn range_compress() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child, addr) = start_server(dir.path())?;
+    let (child, addr) = start_server(dir.path(), false)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .no_gzip()
@@ -379,7 +416,7 @@ fn range_compress() -> Result<()> {
 #[test]
 fn some_requests() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child_dropper, addr) = start_server(dir.path())?;
+    let (child_dropper, addr) = start_server(dir.path(), false)?;
 
     for compressed in [false, true] {
         for auto_decompress in [false, true] {
@@ -457,5 +494,148 @@ fn some_requests() -> Result<()> {
     let (child, _stderr) = child_dropper.into()?;
     let child = child.wait_with_output()?;
     println!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+#[test]
+fn e2e() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .unwrap();
+    let dir = tempfile::TempDir::new()?;
+
+    // create certs.
+    {
+        let subject_alt_names = vec!["foo".to_string(), "localhost".to_string()];
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(subject_alt_names).unwrap();
+        let cert_der = cert.pem();
+        let key_der = signing_key.serialize_pem();
+        let mut f = std::fs::File::create(dir.path().join("cert.crt"))?;
+        f.write_all(cert_der.as_bytes())?;
+        f.sync_all()?;
+        let mut f = std::fs::File::create(dir.path().join("key.pem"))?;
+        f.write_all(key_der.as_bytes())?;
+        f.sync_all()?;
+    }
+
+    // Start tarweb.
+    //let (plain_tarweb, plain_addr) = start_server(dir.path())?;
+    let (_tls_tarweb, tls_addr) = start_server(dir.path(), true)?;
+
+    // Set up config.
+    {
+        println!("Writing {:?}", dir.path().join("config.cfg"));
+        let mut f = std::fs::File::create(dir.path().join("config.cfg"))?;
+        f.write_all(
+            format!(
+                r#"
+rules: <
+        regex: "foo"
+        backend: <
+                null: <>
+        >
+>
+default_backend: <
+        # For localhost SNI, let tarweb deal with the handshaking.
+        proxy: <
+                addr: "{tls_addr:?}"
+        >
+>
+max_lifetime_ms: 10000
+"#
+            )
+            .as_bytes(),
+        )?;
+        f.sync_all()?;
+    }
+    let (_router, router_addr) = start_router(&dir.path().join("config.cfg"))?;
+    for compressed in [false, true] {
+        for auto_decompress in [false, true] {
+            for (path, code, content, has_compressed) in [
+                ("non-existing", 404, "Not found\n", false),
+                ("", 200, "hello world", false),
+                ("index.html", 200, "hello world", false),
+                ("something.txt", 200, "the big brown etcetera", false),
+                ("compressed.txt", 200, "what's updog?", true),
+            ] {
+                eprintln!("-------- compressed={compressed}/{auto_decompress} {path:?} -----");
+                // Load your root CA (PEM)
+                let ca = std::fs::read(dir.path().join("cert.crt"))?;
+                let cert = reqwest::Certificate::from_pem(&ca)?;
+
+                let mut client = reqwest::blocking::Client::builder()
+                    .add_root_certificate(cert)
+                    .danger_accept_invalid_hostnames(true)
+                    .timeout(std::time::Duration::from_secs(10));
+
+                if !auto_decompress || !compressed {
+                    // It seems reqwest will automatically request gzip if
+                    // the feature is enabled? I thought it only would be if I
+                    // add the header?
+                    client = client.no_gzip();
+                }
+                let client = client.build()?;
+                let mut req = client.get(format!("https://{router_addr}/{path}"));
+                if compressed {
+                    req = req.header("accept-encoding", "gzip");
+                }
+                let resp = req.send()?;
+
+                // Check response.
+                assert_eq!(resp.status(), code);
+                eprintln!("{:?}", resp.headers());
+                for (k, v) in [
+                    ("server", "tarweb/0.1.0"),
+                    ("cache-control", "public, max-age=300"),
+                    ("connection", "keep-alive"),
+                    ("vary", "accept-encoding"),
+                    ("content-length", &content.len().to_string()),
+                ] {
+                    if k == "content-length" && has_compressed && compressed {
+                        if auto_decompress {
+                            // Auto decompress does not provide a content-length.
+                            continue;
+                        }
+                        // Else the header just has to exist, because we don't
+                        // keep track of how long the payload is.
+                        //
+                        // Pedantic clippy is being idiotic here.
+                        #[allow(clippy::expect_fun_call)]
+                        {
+                            assert_ne!(
+                                resp.headers().get(k).expect(&format!("no {k:?} header")),
+                                ""
+                            );
+                        }
+                        continue;
+                    }
+
+                    #[allow(clippy::expect_fun_call)]
+                    {
+                        assert_eq!(resp.headers().get(k).expect(&format!("no {k:?} header")), v);
+                    }
+                }
+                if compressed && !auto_decompress && has_compressed {
+                    assert_eq!(
+                        resp.headers()
+                            .get(reqwest::header::CONTENT_ENCODING)
+                            .unwrap(),
+                        "gzip"
+                    );
+                }
+                if !compressed || auto_decompress {
+                    assert_eq!(resp.text()?, content);
+                }
+            }
+        }
+    }
+    /*
+    let (child, _stderr) = child_dropper.into()?;
+    let child = child.wait_with_output()?;
+    println!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
+    */
+    drop(dir);
     Ok(())
 }
