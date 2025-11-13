@@ -755,21 +755,24 @@ async fn handle_conn(id: usize, mut stream: tokio::net::TcpStream, config: &Conf
     // Read and validate a full TLS ClientHello.
     let (bytes, clienthello) = read_tls_clienthello(&mut stream).await?;
     debug!("id={id} ClientHello len={} bytes", clienthello.len());
-    let Some(sni) = extract_sni(&clienthello)? else {
-        warn!("Failed to extract SNI");
-        return Ok(());
-    };
-    debug!("id={id} SNI: {sni:?}");
+    match extract_sni(&clienthello)? {
+        Some(sni) => {
+            debug!("id={id} SNI: {sni:?}");
 
-    for rule in &config.rules {
-        if is_full_match(&rule.re, &sni) {
-            trace!("id={id} SNI {sni} matched rule {rule:?}");
-            let fut = handle_conn_backend(id, stream, bytes, &rule.backend);
-            return if let Some(timeout) = rule.timeout {
-                tokio::time::timeout(timeout, fut).await?
-            } else {
-                fut.await
-            };
+            for rule in &config.rules {
+                if is_full_match(&rule.re, &sni) {
+                    trace!("id={id} SNI {sni} matched rule {rule:?}");
+                    let fut = handle_conn_backend(id, stream, bytes, &rule.backend);
+                    return if let Some(timeout) = rule.timeout {
+                        tokio::time::timeout(timeout, fut).await?
+                    } else {
+                        fut.await
+                    };
+                }
+            }
+        }
+        None => {
+            warn!("id={id} Failed to extract SNI");
         }
     }
     let fut = handle_conn_backend(id, stream, bytes, &config.default_backend);
