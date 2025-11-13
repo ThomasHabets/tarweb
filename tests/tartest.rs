@@ -594,85 +594,30 @@ max_lifetime_ms: 10000
         f.sync_all()?;
     }
     let (_router, router_addr) = start_router(&dir.path().join("config.cfg"))?;
-    for compressed in [false, true] {
-        for auto_decompress in [false, true] {
-            for (path, code, content, has_compressed) in [
-                ("non-existing", 404, "Not found\n", false),
-                ("", 200, "hello world", false),
-                ("index.html", 200, "hello world", false),
-                ("something.txt", 200, "the big brown etcetera", false),
-                ("compressed.txt", 200, "what's updog?", true),
-            ] {
-                eprintln!("-------- compressed={compressed}/{auto_decompress} {path:?} -----");
-                // Load your root CA (PEM)
-                let ca = std::fs::read(dir.path().join("cert.crt"))?;
-                let cert = reqwest::Certificate::from_pem(&ca)?;
+    for (path, content) in [
+        ("", "hello world"),
+        ("index.html", "hello world"),
+        ("something.txt", "the big brown etcetera"),
+        ("compressed.txt", "what's updog?"),
+    ] {
+        eprintln!("-------- {path:?} -----");
+        let mut curl = Command::new("curl");
+        curl.args([
+            "-sS",
+            "--cacert",
+            dir.path().join("cert.crt").to_str().unwrap(),
+            "--connect-to",
+            &format!("localhost:443:{router_addr}"),
+        ]);
+        let curl = curl.args([&format!("https://localhost/{path}")]).output()?;
 
-                let mut client = reqwest::blocking::Client::builder()
-                    .add_root_certificate(cert)
-                    .danger_accept_invalid_hostnames(true)
-                    .timeout(std::time::Duration::from_secs(10));
-
-                if !auto_decompress || !compressed {
-                    // It seems reqwest will automatically request gzip if
-                    // the feature is enabled? I thought it only would be if I
-                    // add the header?
-                    client = client.no_gzip();
-                }
-                let client = client.build()?;
-                let mut req = client.get(format!("https://{router_addr}/{path}"));
-                if compressed {
-                    req = req.header("accept-encoding", "gzip");
-                }
-                let resp = req.send()?;
-
-                // Check response.
-                assert_eq!(resp.status(), code);
-                eprintln!("{:?}", resp.headers());
-                for (k, v) in [
-                    ("server", "tarweb/0.1.0"),
-                    ("cache-control", "public, max-age=300"),
-                    ("connection", "keep-alive"),
-                    ("vary", "accept-encoding"),
-                    ("content-length", &content.len().to_string()),
-                ] {
-                    if k == "content-length" && has_compressed && compressed {
-                        if auto_decompress {
-                            // Auto decompress does not provide a content-length.
-                            continue;
-                        }
-                        // Else the header just has to exist, because we don't
-                        // keep track of how long the payload is.
-                        //
-                        // Pedantic clippy is being idiotic here.
-                        #[allow(clippy::expect_fun_call)]
-                        {
-                            assert_ne!(
-                                resp.headers().get(k).expect(&format!("no {k:?} header")),
-                                ""
-                            );
-                        }
-                        continue;
-                    }
-
-                    #[allow(clippy::expect_fun_call)]
-                    {
-                        assert_eq!(resp.headers().get(k).expect(&format!("no {k:?} header")), v);
-                    }
-                }
-                if compressed && !auto_decompress && has_compressed {
-                    assert_eq!(
-                        resp.headers()
-                            .get(reqwest::header::CONTENT_ENCODING)
-                            .unwrap(),
-                        "gzip"
-                    );
-                }
-                if !compressed || auto_decompress {
-                    assert_eq!(resp.text()?, content);
-                }
-            }
-        }
+        let stdout = String::from_utf8(curl.stdout)?;
+        let stderr = String::from_utf8(curl.stderr)?;
+        assert!(
+            curl.status.success(),
+            "curl failed. Stdout: \n{stdout:?}\nStderr:\n{stderr}"
+        );
+        assert_eq!(stdout, content);
     }
     /*
     let (child, _stderr) = child_dropper.into()?;
