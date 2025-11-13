@@ -155,6 +155,49 @@ fn probe_tcp(child: &mut Child, addr: std::net::SocketAddr) -> Result<()> {
     Ok(())
 }
 
+fn probe_pass(child: &mut Child, addr: &std::path::Path) -> Result<()> {
+    loop {
+        let sock = std::os::unix::net::UnixDatagram::unbound()?;
+        if sock.connect(addr).is_ok() {
+            break;
+        }
+        if child.is_done()? {
+            return Err(anyhow::anyhow!("server has exited"));
+        }
+    }
+    Ok(())
+}
+
+fn start_server_pass(dir: &std::path::Path, with_tls: bool) -> Result<(Child, std::path::PathBuf)> {
+    make_tarfile(dir)?;
+    let addr = dir.join("pass.sock");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tarweb"));
+    child.args(["-v", "trace", "--passfd", addr.to_str().unwrap()]);
+    if with_tls {
+        child.args([
+            "--tls-cert",
+            dir.join("cert.crt").to_str().unwrap(),
+            "--tls-key",
+            dir.join("key.pem").to_str().unwrap(),
+        ]);
+    }
+    let mut child = child
+        .args([dir.join("site.tar").to_str().unwrap()])
+        .stdout(std::process::Stdio::piped())
+        //.stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let mut stderr = child.stdout.take().unwrap();
+    let thread = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        stderr.read_to_end(&mut v)?;
+        Ok(v)
+    });
+    let mut ch = Child::new(child, thread);
+    probe_pass(&mut ch, &addr)?;
+    Ok((ch, addr))
+}
+
 fn start_server(dir: &std::path::Path, with_tls: bool) -> Result<(Child, std::net::SocketAddr)> {
     make_tarfile(dir)?;
 
@@ -163,7 +206,6 @@ fn start_server(dir: &std::path::Path, with_tls: bool) -> Result<(Child, std::ne
     let port = l.local_addr()?.port();
     drop(l);
 
-    // TODO: depends on this port being free. Find a free port instead.
     let addr = format!("[::1]:{port}");
     let mut child = Command::new(env!("CARGO_BIN_EXE_tarweb"));
     child.args(["-v", "trace", "-l", &addr]);
@@ -522,7 +564,7 @@ fn e2e() -> Result<()> {
 
     // Start tarweb.
     //let (plain_tarweb, plain_addr) = start_server(dir.path())?;
-    let (_tls_tarweb, tls_addr) = start_server(dir.path(), true)?;
+    let (_tls_tarweb, tls_addr) = start_server_pass(dir.path(), true)?;
 
     // Set up config.
     {
@@ -539,12 +581,13 @@ rules: <
 >
 default_backend: <
         # For localhost SNI, let tarweb deal with the handshaking.
-        proxy: <
-                addr: "{tls_addr:?}"
+        pass: <
+                path: "{}"
         >
 >
 max_lifetime_ms: 10000
-"#
+"#,
+                tls_addr.display()
             )
             .as_bytes(),
         )?;
