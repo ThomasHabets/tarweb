@@ -186,10 +186,10 @@ fn start_server_pass(
     }
     let mut child = child
         .args([dir.join("site.tar").to_str().unwrap()])
-        .stdout(std::process::Stdio::piped())
+        //.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()?;
-    let mut stderr = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
     let thread = std::thread::spawn(move || {
         let mut v = Vec::new();
         stderr.read_to_end(&mut v)?;
@@ -588,6 +588,7 @@ fn e2e() -> Result<()> {
     let (_plain_tarweb, plain_addr) = start_server(dir.path(), false, false)?;
     let (_plainline_tarweb, plainline_addr) = start_server(dir.path(), false, true)?;
     let (_tls_tarweb, tls_addr) = start_server_pass(dir.path(), true, false)?;
+    let (_tlsline_tarweb, tlsline_addr) = start_server(dir.path(), true, true)?;
 
     // Set up config.
     {
@@ -631,7 +632,7 @@ rules: <
         regex: "proxy-proxy"
         backend: <
                 proxy: <
-                    addr: "{plainline_addr}"
+                    addr: "{tlsline_addr}"
                     proxy_header: true,
                 >
         >
@@ -675,7 +676,15 @@ max_lifetime_ms: 10000
     }
 
     // Try a few URLs on what should work.
-    for sni in ["localhost", "proxy-frontend", "proxy-frontend-proxy"] {
+    for sni in [
+        "localhost",
+        "proxy",
+        "proxy-frontend",
+        "proxy-proxy",
+        "proxy-frontend-proxy",
+    ] {
+        //for sni in ["localhost", "proxy", "proxy-frontend", "proxy-proxy"] {
+        //for sni in ["proxy-frontend-proxy"] {
         for (path, content) in [
             ("", "hello world"),
             ("index.html", "hello world"),
