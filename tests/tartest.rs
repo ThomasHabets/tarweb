@@ -1,4 +1,4 @@
-// TODO test:
+// ## TODO
 // * Print server error log if assert fails.
 use std::io::{Read, Write};
 use std::process::Command;
@@ -559,10 +559,18 @@ fn e2e() -> Result<()> {
     // create certs.
     {
         let subject_alt_names = vec![
+            // Null.
             "foo".to_string(),
-            "proxy-frontend".to_string(),
-            "proxy-proxy".to_string(),
+            // Pass FD.
             "localhost".to_string(),
+            // Frontend TLS.
+            "proxy-frontend".to_string(),
+            // Frontend TLS and proxy protocol.
+            "proxy-frontend-proxy".to_string(),
+            // Proxy protocol.
+            "proxy-proxy".to_string(),
+            // Proxy.
+            "proxy".to_string(),
         ];
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(subject_alt_names).unwrap();
@@ -607,7 +615,7 @@ rules: <
         >
 >
 rules: <
-        regex: "proxy-proxy"
+        regex: "proxy-frontend-proxy"
         backend: <
                 proxy: <
                     addr: "{plainline_addr}"
@@ -616,6 +624,15 @@ rules: <
                 frontend_tls: <
                     cert_file: "{cert}"
                     key_file: "{key}"
+                >
+        >
+>
+rules: <
+        regex: "proxy-proxy"
+        backend: <
+                proxy: <
+                    addr: "{plainline_addr}"
+                    proxy_header: true,
                 >
         >
 >
@@ -658,8 +675,7 @@ max_lifetime_ms: 10000
     }
 
     // Try a few URLs on what should work.
-    //for sni in ["localhost", "proxy-frontend", "proxy-proxy"] {
-    for sni in ["proxy-proxy"] {
+    for sni in ["localhost", "proxy-frontend", "proxy-frontend-proxy"] {
         for (path, content) in [
             ("", "hello world"),
             ("index.html", "hello world"),
