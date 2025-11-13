@@ -1,5 +1,4 @@
 // TODO test:
-// * Through SNI router
 // * With PROXY
 // * Without proxy
 // * Proxy pass
@@ -563,7 +562,7 @@ fn e2e() -> Result<()> {
     }
 
     // Start tarweb.
-    //let (plain_tarweb, plain_addr) = start_server(dir.path())?;
+    let (_plain_tarweb, plain_addr) = start_server(dir.path(), false)?;
     let (_tls_tarweb, tls_addr) = start_server_pass(dir.path(), true)?;
 
     // Set up config.
@@ -579,6 +578,18 @@ rules: <
                 null: <>
         >
 >
+rules: <
+        regex: "bar"
+        backend: <
+                proxy: <
+                    addr: "{plain_addr}"
+                >
+                frontend_tls: <
+                    cert_file: "{}"
+                    key_file: "{}"
+                >
+        >
+>
 default_backend: <
         # For localhost SNI, let tarweb deal with the handshaking.
         pass: <
@@ -587,7 +598,9 @@ default_backend: <
 >
 max_lifetime_ms: 10000
 "#,
-                tls_addr.display()
+                dir.path().join("cert.crt").display(),
+                dir.path().join("key.pem").display(),
+                tls_addr.display(),
             )
             .as_bytes(),
         )?;

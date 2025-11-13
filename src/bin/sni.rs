@@ -832,6 +832,13 @@ const PROTO_DESCRIPTOR: &[u8] = include_bytes!("../../descriptor.bin");
 #[tokio::main]
 async fn main() -> Result<()> {
     let opt = Opt::parse();
+
+    // This is only needed for integration tests, that get multiple crypto
+    // implementation features turned on, so we have to pick one.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .unwrap();
+
     tracing_subscriber::fmt()
         //.with_env_filter(format!("sni_router={}", opt.verbose))
         .with_env_filter(&opt.verbose)

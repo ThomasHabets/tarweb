@@ -1592,9 +1592,6 @@ fn mainloop(
     archive: &Archive,
 ) -> Result<()> {
     info!("Thread main");
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .unwrap();
     let mut pooltracker = PoolTracker::new(opt.max_connections);
     let mut ops: SQueue = ArrayVec::new();
     let mut last_submit = std::time::Instant::now();
@@ -1991,6 +1988,13 @@ fn is_ktls_loaded() -> Result<bool> {
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let opt = Opt::parse();
+
+    // This is only needed for integration tests, that get multiple crypto
+    // implementation features turned on, so we have to pick one.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .unwrap();
+
     tracing_subscriber::fmt()
         .with_env_filter(format!("tarweb={}", opt.verbose))
         .with_writer(std::io::stderr)
