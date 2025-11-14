@@ -5,15 +5,63 @@ use std::process::Command;
 
 use anyhow::Result;
 
+// Dump stderr from all processes on Drop unless success is set.
+struct LogDump {
+    success: bool,
+    processes: Vec<Child>,
+}
+
+impl LogDump {
+    fn new() -> Self {
+        Self {
+            success: false,
+            processes: Vec::new(),
+        }
+    }
+    fn add(&mut self, child: Child) {
+        self.processes.push(child);
+    }
+    fn set_success(&mut self) {
+        self.success = true;
+    }
+}
+
+impl Drop for LogDump {
+    fn drop(&mut self) {
+        if !self.success {
+            eprintln!("============ Dropping child process data");
+            let v = std::mem::take(&mut self.processes);
+            for proc in v {
+                eprintln!("============ Process: {}", proc.name);
+                match proc.shutdown() {
+                    Ok((ch, err)) => {
+                        eprintln!("process ended with {:?}", ch.wait_with_output().unwrap());
+                        eprintln!("{}", String::from_utf8_lossy(&err.unwrap()));
+                    }
+                    Err(e) => {
+                        panic!("Failed to stop process: {e}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 // const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 struct Child {
+    name: String,
     process: Option<std::process::Child>,
     thread: Option<std::thread::JoinHandle<Result<Vec<u8>>>>,
 }
 
 impl Child {
-    fn new(process: std::process::Child, thread: std::thread::JoinHandle<Result<Vec<u8>>>) -> Self {
+    fn new(
+        name: String,
+        process: std::process::Child,
+        thread: std::thread::JoinHandle<Result<Vec<u8>>>,
+    ) -> Self {
         Self {
+            name,
             process: Some(process),
             thread: Some(thread),
         }
@@ -21,7 +69,7 @@ impl Child {
     fn is_done(&mut self) -> Result<bool> {
         Ok(self.process.as_mut().unwrap().try_wait()?.is_some())
     }
-    fn into(mut self) -> Result<(std::process::Child, Result<Vec<u8>>)> {
+    fn shutdown(mut self) -> Result<(std::process::Child, Result<Vec<u8>>)> {
         self.stop();
         let mut child = self.process.take().unwrap();
         let _ = child.wait();
@@ -163,11 +211,13 @@ fn probe_pass(child: &mut Child, addr: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn start_server_pass(
+fn start_server_pass<S: Into<String>>(
+    name: S,
     dir: &std::path::Path,
     with_tls: bool,
     with_proxyline: bool,
 ) -> Result<(Child, std::path::PathBuf)> {
+    let name = name.into();
     make_tarfile(dir)?;
     let addr = dir.join("pass.sock");
 
@@ -195,16 +245,18 @@ fn start_server_pass(
         stderr.read_to_end(&mut v)?;
         Ok(v)
     });
-    let mut ch = Child::new(child, thread);
+    let mut ch = Child::new(name, child, thread);
     probe_pass(&mut ch, &addr)?;
     Ok((ch, addr))
 }
 
-fn start_server(
+fn start_server<S: Into<String>>(
+    name: S,
     dir: &std::path::Path,
     with_tls: bool,
     with_proxyline: bool,
 ) -> Result<(Child, std::net::SocketAddr)> {
+    let name = name.into();
     make_tarfile(dir)?;
 
     // Bind to a port to pick a port number.
@@ -228,22 +280,26 @@ fn start_server(
     }
     let mut child = child
         .args([dir.join("site.tar").to_str().unwrap()])
-        .stdout(std::process::Stdio::piped())
-        //.stderr(std::process::Stdio::piped())
+        //.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()?;
-    let mut stderr = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
     let thread = std::thread::spawn(move || {
         let mut v = Vec::new();
         stderr.read_to_end(&mut v)?;
         Ok(v)
     });
-    let mut ch = Child::new(child, thread);
+    let mut ch = Child::new(name, child, thread);
     let addr = addr.parse()?;
     probe_tcp(&mut ch, addr)?;
     Ok((ch, addr))
 }
 
-fn start_router(config: &std::path::Path) -> Result<(Child, std::net::SocketAddr)> {
+fn start_router<S: Into<String>>(
+    name: S,
+    config: &std::path::Path,
+) -> Result<(Child, std::net::SocketAddr)> {
+    let name = name.into();
     // Bind to a port to pick a port number.
     let l = std::net::TcpListener::bind("[::]:0")?;
     let port = l.local_addr()?.port();
@@ -253,19 +309,19 @@ fn start_router(config: &std::path::Path) -> Result<(Child, std::net::SocketAddr
     let addr = format!("[::1]:{port}");
     let mut child = Command::new(env!("CARGO_BIN_EXE_sni_router"))
         .args(["-v", "trace", "-l", &addr, "-c", config.to_str().unwrap()])
-        .stdout(std::process::Stdio::piped())
-        //.stderr(std::process::Stdio::piped())
+        //.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()?;
-    let mut stderr = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
     let thread = std::thread::spawn(move || {
         let mut v = Vec::new();
         stderr.read_to_end(&mut v)?;
         Ok(v)
     });
-    let mut ch = Child::new(child, thread);
+    let mut ch = Child::new(name, child, thread);
     let addr = addr.parse()?;
     if let Err(e) = probe_tcp(&mut ch, addr) {
-        let ch = ch.into()?.0.wait_with_output()?;
+        let ch = ch.shutdown()?.0.wait_with_output()?;
         println!("out:\n{}", String::from_utf8_lossy(&ch.stdout));
         println!("err:\n{}", String::from_utf8_lossy(&ch.stderr));
         return Err(e);
@@ -276,7 +332,7 @@ fn start_router(config: &std::path::Path) -> Result<(Child, std::net::SocketAddr
 #[test]
 fn curl_http() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child_dropper, addr) = start_server(dir.path(), false, false)?;
+    let (child_dropper, addr) = start_server("tarweb", dir.path(), false, false)?;
 
     for compressed in [false, true] {
         for (path, content) in [
@@ -302,7 +358,7 @@ fn curl_http() -> Result<()> {
             assert_eq!(stdout, content);
         }
     }
-    let child = child_dropper.into()?.0.wait_with_output()?;
+    let child = child_dropper.shutdown()?.0.wait_with_output()?;
     println!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
     Ok(())
 }
@@ -310,7 +366,7 @@ fn curl_http() -> Result<()> {
 #[test]
 fn range_nocompress() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child, addr) = start_server(dir.path(), false, false)?;
+    let (child, addr) = start_server("tarweb", dir.path(), false, false)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -360,7 +416,7 @@ fn range_nocompress() -> Result<()> {
         }
         assert_eq!(resp.text()?, want, "Bad output for {start},{end}");
     }
-    let (child, stderr) = child.into()?;
+    let (child, stderr) = child.shutdown()?;
     let child = child.wait_with_output()?;
     println!(
         "tarweb out:\n{}\nerr:\n{}",
@@ -373,7 +429,7 @@ fn range_nocompress() -> Result<()> {
 #[test]
 fn range_compress() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child, addr) = start_server(dir.path(), false, false)?;
+    let (child, addr) = start_server("tarweb", dir.path(), false, false)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .no_gzip()
@@ -454,7 +510,7 @@ fn range_compress() -> Result<()> {
         full.len()
     );
 
-    let (child, stderr) = child.into()?;
+    let (child, stderr) = child.shutdown()?;
     let child = child.wait_with_output()?;
     println!(
         "tarweb out:\n{}\nerr:\n{}",
@@ -467,7 +523,7 @@ fn range_compress() -> Result<()> {
 #[test]
 fn some_requests() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child_dropper, addr) = start_server(dir.path(), false, false)?;
+    let (child_dropper, addr) = start_server("tarweb", dir.path(), false, false)?;
 
     for compressed in [false, true] {
         for auto_decompress in [false, true] {
@@ -542,7 +598,7 @@ fn some_requests() -> Result<()> {
             }
         }
     }
-    let (child, _stderr) = child_dropper.into()?;
+    let (child, _stderr) = child_dropper.shutdown()?;
     let child = child.wait_with_output()?;
     println!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
     Ok(())
@@ -551,6 +607,7 @@ fn some_requests() -> Result<()> {
 #[allow(clippy::too_many_lines)]
 #[test]
 fn e2e() -> Result<()> {
+    let mut logdump = LogDump::new();
     rustls::crypto::ring::default_provider()
         .install_default()
         .unwrap();
@@ -585,10 +642,16 @@ fn e2e() -> Result<()> {
     }
 
     // Start tarweb.
-    let (_plain_tarweb, plain_addr) = start_server(dir.path(), false, false)?;
-    let (_plainline_tarweb, plainline_addr) = start_server(dir.path(), false, true)?;
-    let (_tls_tarweb, tls_addr) = start_server_pass(dir.path(), true, false)?;
-    let (_tlsline_tarweb, tlsline_addr) = start_server(dir.path(), true, true)?;
+    let (plain_tarweb, plain_addr) = start_server("tarweb plain", dir.path(), false, false)?;
+    logdump.add(plain_tarweb);
+    let (plainline_tarweb, plainline_addr) =
+        start_server("tarweb plain proxy line", dir.path(), false, true)?;
+    logdump.add(plainline_tarweb);
+    let (tls_tarweb, tls_addr) = start_server_pass("tarweb TLS pass", dir.path(), true, false)?;
+    logdump.add(tls_tarweb);
+    let (tlsline_tarweb, tlsline_addr) =
+        start_server("tarweb TLS proxy line", dir.path(), true, true)?;
+    logdump.add(tlsline_tarweb);
 
     // Set up config.
     {
@@ -653,7 +716,7 @@ max_lifetime_ms: 10000
         )?;
         f.sync_all()?;
     }
-    let (_router, router_addr) = start_router(&dir.path().join("config.cfg"))?;
+    let (_router, router_addr) = start_router("sni", &dir.path().join("config.cfg"))?;
 
     // Ensure `foo` SNI fails.
     {
@@ -719,5 +782,6 @@ max_lifetime_ms: 10000
     println!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
     */
     drop(dir);
+    logdump.set_success();
     Ok(())
 }
