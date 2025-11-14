@@ -604,13 +604,30 @@ fn some_requests() -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 #[test]
-fn e2e() -> Result<()> {
+fn e2e_proxy() -> Result<()> {
+    e2e("proxy")
+}
+#[test]
+fn e2e_proxy_frontend_tls() -> Result<()> {
+    e2e("proxy-frontend")
+}
+#[test]
+fn e2e_proxy_proxyline() -> Result<()> {
+    e2e("proxy-proxy")
+}
+#[test]
+fn e2e_proxy_frontend_tls_proxyline() -> Result<()> {
+    e2e("proxy-frontend-proxy")
+}
+#[test]
+fn e2e_pass() -> Result<()> {
+    e2e("localhost")
+}
+
+#[allow(clippy::too_many_lines)]
+fn e2e(sni: &str) -> Result<()> {
     let mut logdump = LogDump::new();
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .unwrap();
     let dir = tempfile::TempDir::new()?;
 
     // create certs.
@@ -655,7 +672,6 @@ fn e2e() -> Result<()> {
 
     // Set up config.
     {
-        println!("Writing {:?}", dir.path().join("config.cfg"));
         let mut f = std::fs::File::create(dir.path().join("config.cfg"))?;
         f.write_all(
             format!(
@@ -739,42 +755,32 @@ max_lifetime_ms: 10000
     }
 
     // Try a few URLs on what should work.
-    for sni in [
-        "localhost",
-        "proxy",
-        "proxy-frontend",
-        "proxy-proxy",
-        "proxy-frontend-proxy",
+    for (path, content) in [
+        ("", "hello world"),
+        ("index.html", "hello world"),
+        ("something.txt", "the big brown etcetera"),
+        ("compressed.txt", "what's updog?"),
     ] {
-        //for sni in ["localhost", "proxy", "proxy-frontend", "proxy-proxy"] {
-        //for sni in ["proxy-frontend-proxy"] {
-        for (path, content) in [
-            ("", "hello world"),
-            ("index.html", "hello world"),
-            ("something.txt", "the big brown etcetera"),
-            ("compressed.txt", "what's updog?"),
-        ] {
-            eprintln!("-------- Path with SNI {sni:?}: {path:?} -----");
-            let mut curl = Command::new("curl");
-            let curl = curl
-                .args([
-                    "-sS",
-                    "--cacert",
-                    dir.path().join("cert.crt").to_str().unwrap(),
-                    "--connect-to",
-                    &format!("{sni}:443:{router_addr}"),
-                    &format!("https://{sni}/{path}"),
-                ])
-                .output()?;
+        eprintln!("-------- Path with SNI {sni:?}: {path:?} -----");
+        let mut curl = Command::new("curl");
+        let curl = curl
+            .args([
+                "-sS",
+                "--cacert",
+                dir.path().join("cert.crt").to_str().unwrap(),
+                "--connect-to",
+                &format!("{sni}:443:{router_addr}"),
+                &format!("https://{sni}/{path}"),
+            ])
+            .output()?;
 
-            let stdout = String::from_utf8(curl.stdout)?;
-            let stderr = String::from_utf8(curl.stderr)?;
-            assert!(
-                curl.status.success(),
-                "curl failed. Stdout: \n{stdout:?}\nStderr:\n{stderr}"
-            );
-            assert_eq!(stdout, content);
-        }
+        let stdout = String::from_utf8(curl.stdout)?;
+        let stderr = String::from_utf8(curl.stderr)?;
+        assert!(
+            curl.status.success(),
+            "curl failed. Stdout: \n{stdout:?}\nStderr:\n{stderr}"
+        );
+        assert_eq!(stdout, content);
     }
     /*
     let (child, _stderr) = child_dropper.into()?;
