@@ -791,3 +791,106 @@ max_lifetime_ms: 10000
     logdump.set_success();
     Ok(())
 }
+
+#[test]
+fn e2e_no_clienthello_proxy() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let mut logdump = LogDump::new();
+    let (proxy_tarweb, addr) = start_server("tarweb plain proxy", dir.path(), false, false)?;
+    logdump.add(proxy_tarweb);
+    let config = format!(
+        r#"
+default_backend: <
+        proxy: <
+                addr: "{addr}"
+        >
+>
+max_lifetime_ms: 10000
+"#
+    );
+    e2e_plain_no_clienthello(dir.path(), &mut logdump, &config)?;
+    logdump.set_success();
+    Ok(())
+}
+
+#[test]
+fn e2e_no_clienthello_pass() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let mut logdump = LogDump::new();
+    let (proxy_tarweb, path) = start_server_pass("tarweb plain proxy", dir.path(), false, false)?;
+    logdump.add(proxy_tarweb);
+    let config = format!(
+        r#"
+default_backend: <
+        pass: <
+                path: "{}"
+        >
+>
+max_lifetime_ms: 10000
+"#,
+        path.display()
+    );
+    e2e_plain_no_clienthello(dir.path(), &mut logdump, &config)?;
+    logdump.set_success();
+    Ok(())
+}
+
+#[test]
+fn e2e_no_clienthello_proxy_line() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let mut logdump = LogDump::new();
+    let (proxy_tarweb, addr) = start_server("tarweb plain proxy", dir.path(), false, true)?;
+    logdump.add(proxy_tarweb);
+    let config = format!(
+        r#"
+default_backend: <
+        proxy: <
+                addr: "{addr}"
+                proxy_header: true
+        >
+>
+max_lifetime_ms: 10000
+"#
+    );
+    e2e_plain_no_clienthello(dir.path(), &mut logdump, &config)?;
+    logdump.set_success();
+    Ok(())
+}
+
+// If there's no ClientHello, then only default can be used.
+fn e2e_plain_no_clienthello(
+    dir: &std::path::Path,
+    logdump: &mut LogDump,
+    config: &str,
+) -> Result<()> {
+    // Set up config.
+    {
+        let mut f = std::fs::File::create(dir.join("config.cfg"))?;
+        f.write_all(config.as_bytes())?;
+        f.sync_all()?;
+    }
+    let (router, router_addr) = start_router("sni", &dir.join("config.cfg"))?;
+    logdump.add(router);
+
+    // Try a few URLs on what should work.
+    for (path, content) in [
+        ("", "hello world"),
+        ("index.html", "hello world"),
+        ("something.txt", "the big brown etcetera"),
+        ("compressed.txt", "what's updog?"),
+    ] {
+        eprintln!("-------- Path {path:?} -----");
+        let url = format!("http://{router_addr}/{path}");
+        let mut curl = Command::new("curl");
+        let curl = curl.args(["-sS", "-m5", &url]).output()?;
+
+        let stdout = String::from_utf8(curl.stdout)?;
+        let stderr = String::from_utf8(curl.stderr)?;
+        assert!(
+            curl.status.success(),
+            "curl to {url:?} failed. Stdout: \n{stdout:?}\nStderr:\n{stderr}"
+        );
+        assert_eq!(stdout, content);
+    }
+    Ok(())
+}

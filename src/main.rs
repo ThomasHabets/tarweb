@@ -640,6 +640,7 @@ impl Connection {
             }
         } else {
             self.state = State::Reading(fixed);
+            self.read_sync(data, ops);
             self.read(ops);
         }
         Ok(())
@@ -1572,7 +1573,10 @@ fn op_completion(
             ops.push(make_op_close_raw(raw_fd, hook.con.id));
             hook.con.outstanding += 1;
             hook.con.pre_read(fd, tls, &clienthello, ops)?;
-            trace!("Now in state {:?}", hook.con.state);
+            trace!(
+                "Now in state {:?} read_buf_pos={}",
+                hook.con.state, hook.con.read_buf_pos
+            );
         }
     }
 
@@ -1729,7 +1733,7 @@ fn mainloop(
                                         .as_ref()
                                         .map(|c| rustls::ServerConnection::new(c.clone()))
                                         .transpose()?;
-                                    new_conn.init_fd(fd, fixed, clienthello.clone(), tls, &mut ops);
+                                    new_conn.init_fd(fd, fixed, clienthello, tls, &mut ops);
                                 }
                                 Err(e) => error!("Receiving passed connection: {e}"),
                             }
@@ -2052,7 +2056,10 @@ fn main() -> Result<()> {
             set_nodelay(listen.as_raw_fd())?;
             Ok::<_, Error>(listen)
         })
-        .transpose()?;
+        .transpose()?
+        .inspect(|l| {
+            debug!("Listening on {:?}", l.local_addr());
+        });
 
     let passer = opt
         .passfd

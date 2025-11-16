@@ -215,9 +215,11 @@ fn load_config(filename: &str) -> Result<Config> {
 ///
 /// Return all bytes read, and clienthello bytes.
 ///
-/// This function is mostly AI coded. Seems to work, and reviewing it it seems
-/// safe.
-async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<(Vec<u8>, Vec<u8>)> {
+/// This function is mostly AI coded for the parsing parts. Seems to work, and
+/// reviewing it it seems safe.
+async fn read_tls_clienthello(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<(Vec<u8>, Result<Vec<u8>>)> {
     const REC_HDR_LEN: usize = 5;
     let mut hello = Vec::with_capacity(BUF_CAPACITY);
     let mut bytes = Vec::with_capacity(BUF_CAPACITY);
@@ -242,12 +244,15 @@ async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<(Vec
 
         // Confirm it's Handshake.
         if content_type != 22 {
-            return Err(anyhow!(
-                "unexpected TLS content_type {content_type}, want 22 (handshake)"
+            return Ok((
+                bytes,
+                Err(anyhow!(
+                    "unexpected TLS content_type {content_type}, want 22 (handshake)"
+                )),
             ));
         }
         if rec_len == 0 {
-            return Err(anyhow!("zero-length TLS record"));
+            return Ok((bytes, Err(anyhow!("zero-length TLS record"))));
         }
 
         // Read whole record.
@@ -269,8 +274,11 @@ async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<(Vec
             }
             let msg_type = hello[0];
             if msg_type != 1 {
-                return Err(anyhow!(
-                    "first handshake msg is type {msg_type}, expected 1 (ClientHello)"
+                return Ok((
+                    bytes,
+                    Err(anyhow!(
+                        "first handshake msg is type {msg_type}, expected 1 (ClientHello)"
+                    )),
                 ));
             }
             let body_len =
@@ -285,7 +293,7 @@ async fn read_tls_clienthello(stream: &mut tokio::net::TcpStream) -> Result<(Vec
     if hello.len() > n {
         hello.truncate(n);
     }
-    Ok((bytes, hello))
+    Ok((bytes, Ok(hello)))
 }
 
 /// Sends file descriptor and handshake data using `SCM_RIGHTS` on a Unix datagram.
@@ -754,25 +762,32 @@ fn is_full_match(re: &regex::Regex, text: &str) -> bool {
 async fn handle_conn(id: usize, mut stream: tokio::net::TcpStream, config: &Config) -> Result<()> {
     // Read and validate a full TLS ClientHello.
     let (bytes, clienthello) = read_tls_clienthello(&mut stream).await?;
-    debug!("id={id} ClientHello len={} bytes", clienthello.len());
-    match extract_sni(&clienthello)? {
-        Some(sni) => {
-            debug!("id={id} SNI: {sni:?}");
+    match clienthello {
+        Ok(clienthello) => {
+            debug!("id={id} ClientHello len={} bytes", clienthello.len());
+            match extract_sni(&clienthello)? {
+                Some(sni) => {
+                    debug!("id={id} SNI: {sni:?}");
 
-            for rule in &config.rules {
-                if is_full_match(&rule.re, &sni) {
-                    trace!("id={id} SNI {sni} matched rule {rule:?}");
-                    let fut = handle_conn_backend(id, stream, bytes, &rule.backend);
-                    return if let Some(timeout) = rule.timeout {
-                        tokio::time::timeout(timeout, fut).await?
-                    } else {
-                        fut.await
-                    };
+                    for rule in &config.rules {
+                        if is_full_match(&rule.re, &sni) {
+                            trace!("id={id} SNI {sni} matched rule {rule:?}");
+                            let fut = handle_conn_backend(id, stream, bytes, &rule.backend);
+                            return if let Some(timeout) = rule.timeout {
+                                tokio::time::timeout(timeout, fut).await?
+                            } else {
+                                fut.await
+                            };
+                        }
+                    }
+                }
+                None => {
+                    warn!("id={id} Failed to extract SNI");
                 }
             }
         }
-        None => {
-            warn!("id={id} Failed to extract SNI");
+        Err(e) => {
+            warn!("id={id} Using default backend because no clienthello: {e}");
         }
     }
     let fut = handle_conn_backend(id, stream, bytes, &config.default_backend);
@@ -848,6 +863,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&opt.listen)
         .await
         .context(format!("listening to {}", opt.listen))?;
+    debug!("Listening on {}", listener.local_addr()?);
     tarweb::privs::sni_drop(
         &opt.restrict_dirs
             .iter()
