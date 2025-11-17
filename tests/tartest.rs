@@ -793,6 +793,94 @@ max_lifetime_ms: 10000
 }
 
 #[test]
+fn oha_10s() -> Result<()> {
+    let mut logdump = LogDump::new();
+    let dir = tempfile::TempDir::new()?;
+
+    // create certs.
+    {
+        let subject_alt_names = vec![
+            // Pass FD.
+            "localhost".to_string(),
+            // Proxy.
+            "proxy".to_string(),
+        ];
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(subject_alt_names).unwrap();
+        let cert_der = cert.pem();
+        let key_der = signing_key.serialize_pem();
+        let mut f = std::fs::File::create(dir.path().join("cert.crt"))?;
+        f.write_all(cert_der.as_bytes())?;
+        f.sync_all()?;
+        let mut f = std::fs::File::create(dir.path().join("key.pem"))?;
+        f.write_all(key_der.as_bytes())?;
+        f.sync_all()?;
+    }
+
+    // Start tarweb.
+    let (plain_tarweb, plain_addr) = start_server("tarweb plain", dir.path(), false, false)?;
+    logdump.add(plain_tarweb);
+    let (tls_tarweb, tls_addr) = start_server_pass("tarweb TLS pass", dir.path(), true, false)?;
+    logdump.add(tls_tarweb);
+
+    // Set up config.
+    {
+        let mut f = std::fs::File::create(dir.path().join("config.cfg"))?;
+        f.write_all(
+            format!(
+                r#"
+rules: <
+        regex: "proxy-proxy"
+        backend: <
+                proxy: <
+                    addr: "{plain_addr}"
+                >
+                frontend_tls: <
+                    cert_file: "{cert}"
+                    key_file: "{key}"
+                >
+        >
+>
+default_backend: <
+        pass: <
+                path: "{tls_addr}"
+        >
+>
+max_lifetime_ms: 10000
+"#,
+                cert = dir.path().join("cert.crt").display(),
+                key = dir.path().join("key.pem").display(),
+                tls_addr = tls_addr.display(),
+            )
+            .as_bytes(),
+        )?;
+        f.sync_all()?;
+    }
+    let (router, router_addr) = start_router("sni", &dir.path().join("config.cfg"))?;
+    logdump.add(router);
+
+    let mut oha = Command::new("oha");
+    let oha = oha
+        .args([
+            "--insecure",
+            "--no-tui",
+            "-z",
+            "10s",
+            &format!("https://{router_addr}/"),
+        ])
+        .output()?;
+
+    let stdout = String::from_utf8(oha.stdout)?;
+    let stderr = String::from_utf8(oha.stderr)?;
+    assert!(
+        oha.status.success(),
+        "curl failed. Stdout: \n{stdout:?}\nStderr:\n{stderr}"
+    );
+    logdump.set_success();
+    Ok(())
+}
+
+#[test]
 fn e2e_no_clienthello_proxy() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
     let mut logdump = LogDump::new();
