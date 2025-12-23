@@ -34,7 +34,6 @@ nix = { version = "0.29", features = ["feature", "uio", "socket"] }
 rayon = "1"
 rtsan-standalone = "0.1"
 rustls = { version = "0.23", features = ["prefer-post-quantum"] }
-rustls-pemfile = "2"
 sha3 = "0.10"
 stderrlog = "0.6"
 tar = "0.4"
