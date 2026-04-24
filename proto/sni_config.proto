@@ -55,6 +55,8 @@ message SNIConfig {
         repeated Rule rules = 1;
         Backend default_backend = 2;
 
-        // See commend on field in Backend message.
+        // See comment on field in Backend message.
+        // But since this is top level, this applies to waiting for the
+        // ClientHello too.
         uint64 max_lifetime_ms = 3;
 }

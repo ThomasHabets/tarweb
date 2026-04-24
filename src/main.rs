@@ -32,6 +32,7 @@
 
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -2075,13 +2076,37 @@ fn main() -> Result<()> {
             if let Ok(meta) = std::fs::symlink_metadata(pass) {
                 use std::os::unix::fs::FileTypeExt; // for is_socket()
                 if meta.file_type().is_socket() {
-                    let _ = std::fs::remove_file(pass);
+                    if let Err(e) = std::fs::remove_file(pass) {
+                        warn!("Failed to remove old socket {}: {e}", pass.display());
+                    }
                 }
             }
             let sock = std::os::unix::net::UnixDatagram::bind(pass)
                 .context(format!("binding passfd {}", pass.display()))?;
             nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::PassCred, &true)
                 .context("setsockopt(PassCred)")?;
+            {
+                let mode = 0o660; // TODO: configurable.
+                let mut perms = std::fs::symlink_metadata(pass)?.permissions();
+                perms.set_mode(mode);
+                std::fs::set_permissions(pass, perms)
+                    .context(format!("chmod {mode} on {}", pass.display()))?;
+            }
+            {
+                let group_name = "sni-router"; // TODO: configurable.
+                let group = nix::unistd::Group::from_name(group_name)?
+                    .ok_or_else(|| anyhow::anyhow!("group not found: {group_name}"))?;
+                nix::unistd::chown(
+                    pass,
+                    None,
+                    Some(nix::unistd::Gid::from_raw(group.gid.as_raw())),
+                )
+                .context(format!(
+                    "chown {} with group {group_name} ({group:?})",
+                    pass.display()
+                ))?;
+            }
+
             Ok::<_, Error>(sock)
         })
         .transpose()?;
