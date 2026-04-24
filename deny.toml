@@ -16,7 +16,6 @@ allow = [
     "Unicode-3.0",
     "BSD-3-Clause",
     "ISC",
-    "OpenSSL",
     "Zlib",
 ]
 exceptions = [
