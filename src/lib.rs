@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -21,8 +22,8 @@ pub fn load_certs<P: AsRef<std::path::Path>>(
 /// # Errors
 ///
 /// Probably file not readable or parsable.
-pub fn load_private_key<P: AsRef<std::path::Path>>(
-    filename: P,
-) -> Result<PrivateKeyDer<'static>, rustls::pki_types::pem::Error> {
+pub fn load_private_key<P: AsRef<std::path::Path>>(filename: P) -> Result<PrivateKeyDer<'static>> {
+    let filename = filename.as_ref();
     PrivateKeyDer::from_pem_file(filename)
+        .context(format!("Loading private key from {}", filename.display()))
 }
