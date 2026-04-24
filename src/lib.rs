@@ -11,10 +11,12 @@ pub mod sock;
 /// # Errors
 ///
 /// Probably file not readable or parsable.
-pub fn load_certs<P: AsRef<std::path::Path>>(
-    filename: P,
-) -> Result<Vec<CertificateDer<'static>>, rustls::pki_types::pem::Error> {
-    CertificateDer::pem_file_iter(filename)?.collect()
+pub fn load_certs<P: AsRef<std::path::Path>>(filename: P) -> Result<Vec<CertificateDer<'static>>> {
+    let filename = filename.as_ref();
+    let pem = CertificateDer::pem_file_iter(filename)
+        .context(format!("Loading certs from {}", filename.display()))?;
+    let r: Result<_, rustls::pki_types::pem::Error> = pem.collect();
+    Ok(r?)
 }
 
 /// Load private key from file.
