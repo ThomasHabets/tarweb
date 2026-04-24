@@ -586,9 +586,10 @@ impl Connection {
     // Perform fake synchronous read. This will never be a syscall, because
     // rustls promises it already has the data.
     fn read_sync(&mut self, buf: &[u8], ops: &mut SQueue) {
+        trace!("Fake reading {} from buffer", buf.len());
         self.read_buf[self.read_buf_pos..(self.read_buf_pos + buf.len())].copy_from_slice(buf);
         self.read_buf_pos += buf.len();
-        if false {
+        if !buf.is_empty() {
             self.outstanding += 1;
             ops.push(
                 io_uring::opcode::Nop::new()
@@ -1697,6 +1698,7 @@ fn mainloop(
                     ops.push(make_op_timeout(timeout));
                     connections.cons.iter_mut().for_each(|con| {
                         if con.fd().is_some() && con.last_action.elapsed().as_millis() > MAX_IDLE {
+                            trace!("Connection {} timed out. Closing", con.id);
                             con.close(opt.async_cancel2, &mut ops);
                         }
                     });
@@ -1782,6 +1784,7 @@ fn mainloop(
         assert_eq!(sq.dropped(), 0);
         assert!(!sq.cq_overflow());
         let to_push = std::cmp::min(sq.capacity() - sq.len(), ops.len());
+        trace!("Queueing up {to_push} operations");
         if to_push > 0 {
             let res = unsafe { sq.push_multiple(&ops[..to_push]) };
             res.expect("Can't happen: no room, but we checked");
