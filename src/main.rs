@@ -1876,6 +1876,14 @@ struct Opt {
     #[arg(long)]
     passfd: Option<std::path::PathBuf>,
 
+    /// Set passfd socket group.
+    #[arg(long)]
+    passfd_group_name: Option<String>,
+
+    /// Set passfd socket perms.
+    #[arg(long, default_value_t = 0o666)]
+    passfd_perms: u32,
+
     #[arg(long, default_value = "", help = "Strip prefix before looking in tar")]
     prefix: String,
 
@@ -2090,15 +2098,16 @@ fn main() -> Result<()> {
             nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::PassCred, &true)
                 .context("setsockopt(PassCred)")?;
             {
-                let mode = 0o660; // TODO: configurable.
                 let mut perms = std::fs::symlink_metadata(pass)?.permissions();
-                perms.set_mode(mode);
-                std::fs::set_permissions(pass, perms)
-                    .context(format!("chmod {mode} on {}", pass.display()))?;
+                if opt.passfd_perms & !0xfff != 0 {
+                    return Err(anyhow!("Bad mode 0o{:o}", opt.passfd_perms));
+                }
+                perms.set_mode(opt.passfd_perms);
+                std::fs::set_permissions(pass, perms.clone())
+                    .context(format!("chmod {perms:?} on {}", pass.display()))?;
             }
-            {
-                let group_name = "sni-router"; // TODO: configurable.
-                let group = nix::unistd::Group::from_name(group_name)?
+            if let Some(group_name) = &opt.passfd_group_name {
+                let group = nix::unistd::Group::from_name(&group_name)?
                     .ok_or_else(|| anyhow::anyhow!("group not found: {group_name}"))?;
                 nix::unistd::chown(
                     pass,
