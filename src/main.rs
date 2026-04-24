@@ -2078,10 +2078,10 @@ fn main() -> Result<()> {
             // that.
             if let Ok(meta) = std::fs::symlink_metadata(pass) {
                 use std::os::unix::fs::FileTypeExt; // for is_socket()
-                if meta.file_type().is_socket() {
-                    if let Err(e) = std::fs::remove_file(pass) {
-                        warn!("Failed to remove old socket {}: {e}", pass.display());
-                    }
+                if meta.file_type().is_socket()
+                    && let Err(e) = std::fs::remove_file(pass)
+                {
+                    warn!("Failed to remove old socket {}: {e}", pass.display());
                 }
             }
             let sock = std::os::unix::net::UnixDatagram::bind(pass)
