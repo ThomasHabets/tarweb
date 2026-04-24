@@ -589,13 +589,10 @@ impl Connection {
         trace!("Fake reading {} from buffer", buf.len());
         self.read_buf[self.read_buf_pos..(self.read_buf_pos + buf.len())].copy_from_slice(buf);
         self.read_buf_pos += buf.len();
-        if !buf.is_empty() {
-            self.outstanding += 1;
-            ops.push(
-                io_uring::opcode::Nop::new()
-                    .build()
-                    .user_data((self.id as u64) | USER_DATA_OP_NOP),
-            );
+        if false {
+            if !buf.is_empty() {
+                self.issue_nop(ops);
+            }
         }
     }
 
@@ -643,7 +640,10 @@ impl Connection {
         } else {
             self.state = State::Reading(fixed);
             self.read_sync(data, ops);
-            self.read(ops);
+            // Issue nop because we may have the whole request already. If we
+            // issue a read and the client is preparing to pipeline, we get
+            // stuck.
+            self.issue_nop(ops);
         }
         Ok(())
     }
@@ -1249,6 +1249,7 @@ fn handle_connection(
             }
             let n: usize = hook.result.try_into().unwrap();
             hook.con.read_buf_pos += n;
+            //TODO: if let State::Reading(_) = hook.con.state {
             maybe_answer_req(hook, ops, archive)?;
         }
         UserDataOp::Write => {
@@ -1385,13 +1386,13 @@ fn op_completion(
                     );
                     trace!("Got {} post-proxyline bytes", rest.len());
                     if let Some(tls) = tls {
-                        trace!("Entering handshaking state");
+                        trace!("Entering handshaking state with {} bytes", rest.len());
                         hook.con.state = State::Handshaking(HandshakeData::new(fd, tls));
                         hook.con.read_buf_pos = 0;
                         // TODO: drain ..len instead.
                         hook.con.read_sync(rest, ops);
                     } else {
-                        trace!("Entering Reading state");
+                        trace!("Entering Reading state with {} more bytes", rest.len());
                         hook.con.state = State::Reading(fd);
                         hook.con.read_buf_pos = 0;
                         hook.con.read_sync(rest, ops);
@@ -1453,7 +1454,7 @@ fn op_completion(
         State::Handshaking(d) => {
             match &hook.op {
                 UserDataOp::Read | UserDataOp::Nop => {
-                    if false {
+                    if true {
                         trace!(
                             "Handshake data: {:?}",
                             &hook.con.read_buf[..hook.con.read_buf_pos]
