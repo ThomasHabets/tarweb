@@ -1803,6 +1803,10 @@ fn mainloop(
     }
 }
 
+fn parse_octal(s: &str) -> Result<u32, std::num::ParseIntError> {
+    u32::from_str_radix(s, 8)
+}
+
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Parser)]
 struct Opt {
@@ -1881,7 +1885,7 @@ struct Opt {
     passfd_group_name: Option<String>,
 
     /// Set passfd socket perms.
-    #[arg(long, default_value_t = 0o666)]
+    #[arg(long, value_parser=parse_octal, default_value="666")]
     passfd_perms: u32,
 
     #[arg(long, default_value = "", help = "Strip prefix before looking in tar")]
