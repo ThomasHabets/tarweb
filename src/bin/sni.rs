@@ -828,13 +828,13 @@ async fn mainloop(
             let res = if let Some(timeout) = config.max_lifetime {
                 match tokio::time::timeout(timeout, fut).await {
                     Ok(o) => o,
-                    Err(e) => Err(anyhow!("connection timeout: {e}")),
+                    Err(e) => Err(anyhow!("connection timeout for peer {peer}: {e}")),
                 }
             } else {
                 fut.await
             };
             if let Err(e) = res {
-                warn!("id={id} Handling connection: {e:#}");
+                warn!("id={id} Handling connection to {peer}: {e:#}");
             }
             debug!("id={id} Done");
         });
