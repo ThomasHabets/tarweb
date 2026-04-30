@@ -585,15 +585,15 @@ impl Connection {
 
     // Perform fake synchronous read. This will never be a syscall, because
     // rustls promises it already has the data.
-    fn read_sync(&mut self, buf: &[u8], ops: &mut SQueue) {
+    fn read_sync(&mut self, buf: &[u8], _ops: &mut SQueue) {
         trace!("Fake reading {} from buffer", buf.len());
         self.read_buf[self.read_buf_pos..(self.read_buf_pos + buf.len())].copy_from_slice(buf);
         self.read_buf_pos += buf.len();
-        if false {
-            if !buf.is_empty() {
+        /*
+        if !buf.is_empty() {
                 self.issue_nop(ops);
-            }
         }
+        */
     }
 
     fn issue_nop(&mut self, ops: &mut SQueue) {
@@ -2111,7 +2111,7 @@ fn main() -> Result<()> {
                     .context(format!("chmod {perms:?} on {}", pass.display()))?;
             }
             if let Some(group_name) = &opt.passfd_group_name {
-                let group = nix::unistd::Group::from_name(&group_name)?
+                let group = nix::unistd::Group::from_name(group_name)?
                     .ok_or_else(|| anyhow::anyhow!("group not found: {group_name}"))?;
                 nix::unistd::chown(
                     pass,
