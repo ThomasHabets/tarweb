@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -ueo pipefail
+exec tickbox --dir tickbox/pre-commit
