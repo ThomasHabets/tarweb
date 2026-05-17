@@ -362,8 +362,26 @@ impl Connection {
         if self.outstanding > 0 {
             self.outstanding += make_ops_cancel(fd, self.id as u64, modern, ops);
         }
-        self.outstanding += 1;
-        ops.push(make_op_close(fd, self.id));
+        self.outstanding += 2;
+
+        // It seems that merely issuing an `opcode::Close` doesn't fully close
+        // the connection. `recvfrom()` in the client instead returns `EAGAIN`
+        // for some reason.
+        //
+        // So we issue shutdown and then close, linked.
+        ops.push(
+            io_uring::opcode::Shutdown::new(fd, libc::SHUT_RDWR)
+                .build()
+                .flags(io_uring::squeue::Flags::IO_LINK)
+                // TODO: don't lie about this being a close, it's a shutdown.
+                .user_data((self.id as u64) | USER_DATA_OP_CLOSE),
+        );
+        ops.push(
+            io_uring::opcode::Close::new(fd)
+                .build()
+                .flags(io_uring::squeue::Flags::IO_LINK)
+                .user_data((self.id as u64) | USER_DATA_OP_CLOSE),
+        );
         self.state = State::Closing;
     }
 
@@ -882,12 +900,15 @@ fn receive_passed_connection(
     Ok((fd, clienthello.to_vec()))
 }
 
+/*
+ * Not used anymore. closing instead creates a few linked ops
 #[must_use]
 fn make_op_close(fd: FixedFile, con_id: usize) -> io_uring::squeue::Entry {
     io_uring::opcode::Close::new(fd)
         .build()
         .user_data((con_id as u64) | USER_DATA_OP_CLOSE)
 }
+ */
 
 #[must_use]
 fn make_op_close_raw(fd: libc::c_int, con_id: usize) -> io_uring::squeue::Entry {
@@ -905,6 +926,7 @@ fn make_ops_cancel(fd: FixedFile, id: u64, modern: bool, ops: &mut SQueue) -> us
         ops.push(
             io_uring::opcode::AsyncCancel2::new(io_uring::types::CancelBuilder::fd(fd))
                 .build()
+                .flags(io_uring::squeue::Flags::IO_LINK)
                 .user_data(id | USER_DATA_OP_CANCEL),
         );
     } else {
@@ -913,6 +935,7 @@ fn make_ops_cancel(fd: FixedFile, id: u64, modern: bool, ops: &mut SQueue) -> us
             ops.push(
                 io_uring::opcode::AsyncCancel::new(id | opname)
                     .build()
+                    .flags(io_uring::squeue::Flags::IO_LINK)
                     .user_data(id | USER_DATA_OP_CANCEL),
             );
         }

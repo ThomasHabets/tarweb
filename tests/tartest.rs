@@ -78,6 +78,12 @@ impl Child {
             .take()
             .unwrap()
             .join()
+            .inspect(|s| {
+                eprintln!(
+                    "Child stderr got {} bytes",
+                    s.as_ref().map(|s| s.len()).unwrap_or(1)
+                );
+            })
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         Ok((child, stderr))
     }
@@ -243,6 +249,7 @@ fn start_server_pass<S: Into<String>>(
     let thread = std::thread::spawn(move || {
         let mut v = Vec::new();
         stderr.read_to_end(&mut v)?;
+        eprintln!("Child captured {} bytes", v.len());
         Ok(v)
     });
     let mut ch = Child::new(name, child, thread);
@@ -367,6 +374,27 @@ fn curl_http() -> Result<()> {
 fn request_headers_too_large_returns_431_and_closes() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
     let (child_dropper, addr) = start_server("tarweb", dir.path(), false, false)?;
+
+    let res = std::panic::catch_unwind(|| {
+        wrapped_request_headers_too_large_returns_431_and_closes(&addr)
+    });
+
+    let (child, stderr) = child_dropper.shutdown()?;
+    let child = child.wait_with_output()?;
+    let res = match res {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
+            eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr?));
+            std::panic::resume_unwind(e);
+        }
+    };
+    res
+}
+
+fn wrapped_request_headers_too_large_returns_431_and_closes(
+    addr: &std::net::SocketAddr,
+) -> Result<()> {
     let mut stream = std::net::TcpStream::connect(addr)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
 
@@ -377,15 +405,15 @@ fn request_headers_too_large_returns_431_and_closes() -> Result<()> {
     )?;
     stream.flush()?;
 
-    let mut response = Vec::new();
-    let mut buf = [0; 1024];
-    while !response.windows(4).any(|w| w == b"\r\n\r\n") {
-        let n = stream.read(&mut buf)?;
-        assert_ne!(n, 0, "connection closed before response headers");
-        response.extend_from_slice(&buf[..n]);
-    }
+    let response = {
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        response
+    };
     let header_end = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     let headers = std::str::from_utf8(&response[..header_end])?;
+    let body = std::str::from_utf8(&response[header_end..]).unwrap();
+
     let content_length = headers
         .lines()
         .find_map(|line| {
@@ -393,27 +421,21 @@ fn request_headers_too_large_returns_431_and_closes() -> Result<()> {
                 .and_then(|v| v.parse::<usize>().ok())
         })
         .ok_or_else(|| anyhow::anyhow!("missing content-length in {headers:?}"))?;
-    while response.len() < header_end + content_length {
-        let n = stream.read(&mut buf)?;
-        assert_ne!(n, 0, "connection closed before full response body");
-        response.extend_from_slice(&buf[..n]);
-    }
-    let response = String::from_utf8(response)?;
+
     assert!(
-        response.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
+        headers.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
         "bad response: {response:?}"
     );
     assert!(
-        response.contains("\r\nConnection: close\r\n"),
+        headers.contains("\r\nConnection: close\r\n"),
         "missing close header: {response:?}"
     );
-    assert!(
-        response.ends_with("Request Header Fields Too Large\n"),
-        "bad response body: {response:?}"
+    assert_eq!(
+        body, "Request Header Fields Too Large\n",
+        "bad response body: {body:?}"
     );
+    assert_eq!(body.len(), content_length);
 
-    let child = child_dropper.shutdown()?.0.wait_with_output()?;
-    println!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
     Ok(())
 }
 
