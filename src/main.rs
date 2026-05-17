@@ -268,6 +268,9 @@ struct Connection {
     // TODO: merge these buffers. We're either reading or writing.
     write_buf: [u8; MAX_WRITE_BUF],
     header_buf: HeaderBuf,
+
+    // Close the connection after the in-flight response has been written.
+    close_after_response: bool,
     _pin: std::marker::PhantomPinned,
 }
 
@@ -283,6 +286,7 @@ impl Connection {
             read_buf_pos: 0,
             outstanding: 0,
             header_buf: HeaderBuf::default(),
+            close_after_response: false,
             last_action: std::time::Instant::now(),
             _pin: std::marker::PhantomPinned,
             tls_rx: None,
@@ -345,6 +349,7 @@ impl Connection {
         self.read_buf_pos = 0;
         self.header_buf.zeroize();
         self.header_buf.clear();
+        self.close_after_response = false;
         self.outstanding = 0;
     }
 
@@ -353,11 +358,12 @@ impl Connection {
         if self.closing() {
             return;
         }
+        let fd = self.fd().unwrap();
         if self.outstanding > 0 {
-            self.outstanding += make_ops_cancel(self.fd().unwrap(), self.id as u64, modern, ops);
+            self.outstanding += make_ops_cancel(fd, self.id as u64, modern, ops);
         }
         self.outstanding += 1;
-        ops.push(make_op_close(self.fd().unwrap(), self.id));
+        ops.push(make_op_close(fd, self.id));
         self.state = State::Closing;
     }
 
@@ -449,11 +455,17 @@ impl Connection {
                 let fd = *fd;
                 self.header_buf.drain(..wrote);
                 if self.header_buf.is_empty() {
-                    self.write_data(ops, archive, fd, *pos, *len);
+                    if *len == 0 {
+                        self.state = State::Reading(fd);
+                        true
+                    } else {
+                        self.write_data(ops, archive, fd, *pos, *len);
+                        false
+                    }
                 } else {
                     self.write_headers(ops, fd, *pos, *len);
+                    false
                 }
-                false
             }
             State::WritingData(fd, pos, len) => {
                 let fd = *fd as FixedFile;
@@ -1071,6 +1083,17 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
     trace!("Let's see if there's a request in {s:?}");
     let req = Request::parse(data)?;
     let Some(req) = req else {
+        if hook.con.read_buf_pos == hook.con.read_buf.len() {
+            debug!(
+                "Request headers exceeded {} bytes; returning 431",
+                hook.con.read_buf.len()
+            );
+            hook.con.header_buf.clear();
+            let (pos, len) = answer_request_header_fields_too_large(&mut hook.con.header_buf)?;
+            hook.con.close_after_response = true;
+            hook.con.write_header_bytes(ops, pos, len);
+            return Ok(());
+        }
         // No full request yet.
         hook.con.read(ops);
         return Ok(());
@@ -1112,6 +1135,20 @@ fn date_header(out: &mut HeaderBuf) -> Result<()> {
         "Date: {}\r\n",
         httpdate::fmt_http_date(std::time::SystemTime::now())
     )?)
+}
+
+// TODO: Maybe use some pos/len into the tarfile for custom 431.
+fn answer_request_header_fields_too_large(out: &mut HeaderBuf) -> Result<(usize, usize)> {
+    let msg = "Request Header Fields Too Large\n";
+    write!(
+        out,
+        "HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nServer: tarweb/{}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n",
+        env!("CARGO_PKG_VERSION"),
+        msg.len(),
+    )?;
+    date_header(out)?;
+    write!(out, "\r\n{msg}")?;
+    Ok((0, 0))
 }
 
 fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(usize, usize)> {
@@ -1263,8 +1300,13 @@ fn handle_connection(
                 .con
                 .write_done(ops, archive, hook.result.try_into().unwrap())
             {
-                // Process any further requests, or re-issue a read.
-                maybe_answer_req(hook, ops, archive)?;
+                if hook.con.close_after_response {
+                    hook.con.close_after_response = false;
+                    hook.con.close(modern, ops);
+                } else {
+                    // Process any further requests, or re-issue a read.
+                    maybe_answer_req(hook, ops, archive)?;
+                }
             }
         }
         UserDataOp::Close => {
