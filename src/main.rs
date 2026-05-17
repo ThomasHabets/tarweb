@@ -597,15 +597,20 @@ impl Connection {
 
     // Perform fake synchronous read. This will never be a syscall, because
     // rustls promises it already has the data.
-    fn read_sync(&mut self, buf: &[u8], _ops: &mut SQueue) {
+    fn read_sync(&mut self, buf: &[u8], _ops: &mut SQueue) -> Result<()> {
         trace!("Fake reading {} from buffer", buf.len());
-        self.read_buf[self.read_buf_pos..(self.read_buf_pos + buf.len())].copy_from_slice(buf);
+        let end = self.read_buf_pos + buf.len();
+        if end > self.read_buf.len() {
+            return Err(Error::msg("read_sync with too much data"));
+        }
+        self.read_buf[self.read_buf_pos..end].copy_from_slice(buf);
         self.read_buf_pos += buf.len();
         /*
         if !buf.is_empty() {
                 self.issue_nop(ops);
         }
         */
+        Ok(())
     }
 
     fn issue_nop(&mut self, ops: &mut SQueue) {
@@ -651,7 +656,7 @@ impl Connection {
             }
         } else {
             self.state = State::Reading(fixed);
-            self.read_sync(data, ops);
+            self.read_sync(data, ops)?;
             // Issue nop because we may have the whole request already. If we
             // issue a read and the client is preparing to pipeline, we get
             // stuck.
@@ -1432,12 +1437,12 @@ fn op_completion(
                         hook.con.state = State::Handshaking(HandshakeData::new(fd, tls));
                         hook.con.read_buf_pos = 0;
                         // TODO: drain ..len instead.
-                        hook.con.read_sync(rest, ops);
+                        hook.con.read_sync(rest, ops)?;
                     } else {
                         trace!("Entering Reading state with {} more bytes", rest.len());
                         hook.con.state = State::Reading(fd);
                         hook.con.read_buf_pos = 0;
-                        hook.con.read_sync(rest, ops);
+                        hook.con.read_sync(rest, ops)?;
                         hook.con.issue_nop(ops);
                         return Ok(());
                     }
@@ -1539,7 +1544,7 @@ fn op_completion(
                         hook.con.write(bytes_written, ops);
                     }
                     if bytes_read > 0 {
-                        hook.con.read_sync(&read_buf[..bytes_read], ops);
+                        hook.con.read_sync(&read_buf[..bytes_read], ops)?;
                     }
 
                     if bytes_to_write == 0 && !still_handshaking {
