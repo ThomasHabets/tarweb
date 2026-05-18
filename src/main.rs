@@ -1023,6 +1023,7 @@ impl std::fmt::Debug for Hook<'_> {
 struct Request<'a> {
     path: &'a str,
     len: usize,
+    head: bool,
     encoding_gzip: bool,
     encoding_brotli: bool,
     encoding_zstd: bool,
@@ -1100,9 +1101,13 @@ impl Request<'_> {
             }
         }
         let method = first.next().ok_or(Error::msg("no method"))?;
-        if method != "GET" {
-            return Err(Error::msg(format!("Invalid HTTP method {method}")));
-        }
+        let head = match method {
+            "GET" => false,
+            "HEAD" => true,
+            _ => {
+                return Err(Error::msg(format!("Invalid HTTP method {method}")));
+            }
+        };
         let path = first.next().ok_or(Error::msg("no path"))?;
         let _version = first.next().ok_or(Error::msg("no version"))?;
 
@@ -1110,6 +1115,7 @@ impl Request<'_> {
         Ok(Some(Request {
             path,
             len: end,
+            head,
             encoding_gzip,
             encoding_zstd,
             encoding_brotli,
@@ -1232,7 +1238,10 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
             "HTTP/1.1 404 Not Found\r\n{common}Connection: keep-alive\r\nContent-Length: {len404}\r\n"
         )?;
         date_header(out)?;
-        write!(out, "\r\n{msg404}")?;
+        write!(out, "\r\n")?;
+        if !req.head {
+            write!(out, "{msg404}")?;
+        }
         return Ok((0, 0));
     };
 
@@ -1304,7 +1313,7 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
         "{common}{}{encoding}Content-Length: {len}\r\n\r\n",
         entry.headers()
     )?;
-    Ok((pos, len))
+    Ok((pos, if req.head { 0 } else { len }))
 }
 
 fn handle_connection(
