@@ -507,6 +507,110 @@ fn wrapped_request_body_headers_close_after_response(addr: &std::net::SocketAddr
     Ok(())
 }
 
+#[test]
+fn head_requests_send_headers_without_body() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let (child_dropper, addr) = start_server("tarweb head", dir.path(), false, false)?;
+
+    let res = std::panic::catch_unwind(|| wrapped_head_requests_send_headers_without_body(&addr));
+
+    let (child, stderr) = child_dropper.shutdown()?;
+    let child = child.wait_with_output()?;
+    match res {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
+            eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr?));
+            std::panic::resume_unwind(e);
+        }
+    }
+}
+
+fn wrapped_head_requests_send_headers_without_body(addr: &std::net::SocketAddr) -> Result<()> {
+    let mut stream = std::net::TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut reader = BufferedHttpReader::default();
+
+    write!(stream, "HEAD / HTTP/1.1\r\nHost: {addr}\r\n\r\n")?;
+    stream.flush()?;
+    let (headers, body) = reader.read_response(&mut stream, false)?;
+    assert!(
+        headers.starts_with("HTTP/1.1 200 OK\r\n"),
+        "bad HEAD response: {headers:?}"
+    );
+    assert_response_header(&headers, "Content-Length", "11");
+    assert!(body.is_empty(), "HEAD response included a body: {body:?}");
+
+    write!(
+        stream,
+        "GET /something.txt HTTP/1.1\r\nHost: {addr}\r\n\r\n"
+    )?;
+    stream.flush()?;
+    let (headers, body) = reader.read_response(&mut stream, true)?;
+    assert!(
+        headers.starts_with("HTTP/1.1 200 OK\r\n"),
+        "bad response after HEAD: {headers:?}"
+    );
+    assert_eq!(std::str::from_utf8(&body)?, "the big brown etcetera");
+
+    let mut stream = std::net::TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut reader = BufferedHttpReader::default();
+    write!(
+        stream,
+        "HEAD /does-not-exist HTTP/1.1\r\nHost: {addr}\r\n\r\n"
+    )?;
+    stream.flush()?;
+    let (headers, body) = reader.read_response(&mut stream, false)?;
+    assert!(
+        headers.starts_with("HTTP/1.1 404 Not Found\r\n"),
+        "bad HEAD 404 response: {headers:?}"
+    );
+    assert_response_header(&headers, "Content-Length", "10");
+    assert!(
+        body.is_empty(),
+        "HEAD 404 response included a body: {body:?}"
+    );
+    write!(stream, "GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n")?;
+    stream.flush()?;
+    let (headers, body) = reader.read_response(&mut stream, true)?;
+    assert!(
+        headers.starts_with("HTTP/1.1 200 OK\r\n"),
+        "bad response after HEAD 404: {headers:?}"
+    );
+    assert_eq!(std::str::from_utf8(&body)?, "hello world");
+
+    let mut stream = std::net::TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut reader = BufferedHttpReader::default();
+    write!(
+        stream,
+        "HEAD / HTTP/1.1\r\nHost: {addr}\r\nRange: bytes=0-1\r\n\r\n"
+    )?;
+    stream.flush()?;
+    let (headers, body) = reader.read_response(&mut stream, false)?;
+    assert!(
+        headers.starts_with("HTTP/1.1 206 Partial Content\r\n"),
+        "bad HEAD range response: {headers:?}"
+    );
+    assert_response_header(&headers, "Content-Length", "2");
+    assert_response_header(&headers, "Content-Range", "bytes 0-1/11");
+    assert!(
+        body.is_empty(),
+        "HEAD range response included a body: {body:?}"
+    );
+    write!(stream, "GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n")?;
+    stream.flush()?;
+    let (headers, body) = reader.read_response(&mut stream, true)?;
+    assert!(
+        headers.starts_with("HTTP/1.1 200 OK\r\n"),
+        "bad response after HEAD range: {headers:?}"
+    );
+    assert_eq!(std::str::from_utf8(&body)?, "hello world");
+
+    Ok(())
+}
+
 fn read_one_http_body(stream: &mut std::net::TcpStream) -> Result<String> {
     let mut response = Vec::new();
     let header_end = loop {
@@ -541,6 +645,65 @@ fn read_one_http_body(stream: &mut std::net::TcpStream) -> Result<String> {
         response.extend_from_slice(&buf[..n]);
     }
     Ok(std::str::from_utf8(&response[header_end..header_end + content_length])?.to_string())
+}
+
+#[derive(Default)]
+struct BufferedHttpReader {
+    buf: Vec<u8>,
+}
+
+impl BufferedHttpReader {
+    fn read_response(
+        &mut self,
+        stream: &mut std::net::TcpStream,
+        read_body: bool,
+    ) -> Result<(String, Vec<u8>)> {
+        let header_end = loop {
+            if let Some(end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end + 4;
+            }
+            self.read_more(stream, "response headers")?;
+        };
+        let headers = std::str::from_utf8(&self.buf[..header_end])?.to_string();
+        let content_length = response_header(&headers, "Content-Length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .ok_or_else(|| anyhow::anyhow!("missing content-length in {headers:?}"))?;
+        let body_len = if read_body { content_length } else { 0 };
+        while self.buf.len() - header_end < body_len {
+            self.read_more(stream, "response body")?;
+        }
+        let body = self.buf[header_end..header_end + body_len].to_vec();
+        self.buf.drain(..header_end + body_len);
+        Ok((headers, body))
+    }
+
+    fn read_more(&mut self, stream: &mut std::net::TcpStream, part: &str) -> Result<()> {
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(anyhow::anyhow!(
+                "connection closed before reading {part}: {:?}",
+                self.buf
+            ));
+        }
+        self.buf.extend_from_slice(&buf[..n]);
+        Ok(())
+    }
+}
+
+fn response_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    headers.lines().find_map(|line| {
+        let (k, v) = line.split_once(": ")?;
+        k.eq_ignore_ascii_case(name).then_some(v)
+    })
+}
+
+fn assert_response_header(headers: &str, name: &str, want: &str) {
+    assert_eq!(
+        response_header(headers, name),
+        Some(want),
+        "bad {name} header in {headers:?}"
+    );
 }
 
 #[test]
