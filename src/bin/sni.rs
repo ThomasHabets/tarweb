@@ -987,7 +987,7 @@ async fn mainloop(
     }
 }
 
-const PROTO_DESCRIPTOR: &[u8] = include_bytes!("../../descriptor.bin");
+const PROTO_DESCRIPTOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descriptor.bin"));
 
 #[tokio::main]
 async fn main() -> Result<()> {
