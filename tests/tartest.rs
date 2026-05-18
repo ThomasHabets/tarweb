@@ -807,7 +807,8 @@ fn some_requests() -> Result<()> {
                 assert_eq!(resp.status(), code);
                 eprintln!("{:?}", resp.headers());
                 for (k, v) in [
-                    ("server", "tarweb/0.1.0"),
+                    // TODO: confirm against pattern instead.
+                    ("server", "tarweb/0.1.1"),
                     ("cache-control", "public, max-age=300"),
                     ("connection", "keep-alive"),
                     ("vary", "accept-encoding"),

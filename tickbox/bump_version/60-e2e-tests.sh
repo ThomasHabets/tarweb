@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-exec cargo test --workspace --release -- --ignored
+exec cargo test --workspace -- --ignored
