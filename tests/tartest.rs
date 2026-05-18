@@ -439,6 +439,110 @@ fn wrapped_request_headers_too_large_returns_431_and_closes(
 }
 
 #[test]
+fn request_body_headers_close_after_response() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let (child_dropper, addr) = start_server("tarweb body header close", dir.path(), false, false)?;
+
+    let res = std::panic::catch_unwind(|| wrapped_request_body_headers_close_after_response(&addr));
+
+    let (child, stderr) = child_dropper.shutdown()?;
+    let child = child.wait_with_output()?;
+    match res {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
+            eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr?));
+            std::panic::resume_unwind(e);
+        }
+    }
+}
+
+fn wrapped_request_body_headers_close_after_response(addr: &std::net::SocketAddr) -> Result<()> {
+    for extra in [
+        "Content-Length: 4\r\n\r\nbody",
+        "Content-Length: nope\r\n\r\n",
+        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    ] {
+        let mut stream = std::net::TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        write!(stream, "GET / HTTP/1.1\r\nHost: {addr}\r\n{extra}")?;
+        stream.flush()?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        let header_end = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| anyhow::anyhow!("missing response header terminator: {response:?}"))?
+            + 4;
+        let headers = std::str::from_utf8(&response[..header_end])?;
+        let body = std::str::from_utf8(&response[header_end..])?;
+
+        assert!(
+            headers.starts_with("HTTP/1.1 200 OK\r\n"),
+            "bad response for {extra:?}: {response:?}"
+        );
+        assert_eq!(body, "hello world");
+    }
+
+    let mut stream = std::net::TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    write!(
+        stream,
+        "GET / HTTP/1.1\r\nHost: {addr}\r\nContent-Length:0\r\n\r\n"
+    )?;
+    stream.flush()?;
+    let body = read_one_http_body(&mut stream)?;
+    assert_eq!(body, "hello world");
+
+    write!(
+        stream,
+        "GET /something.txt HTTP/1.1\r\nHost: {addr}\r\n\r\n"
+    )?;
+    stream.flush()?;
+    let body = read_one_http_body(&mut stream)?;
+    assert_eq!(body, "the big brown etcetera");
+
+    Ok(())
+}
+
+fn read_one_http_body(stream: &mut std::net::TcpStream) -> Result<String> {
+    let mut response = Vec::new();
+    let header_end = loop {
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(anyhow::anyhow!(
+                "connection closed before response headers: {response:?}"
+            ));
+        }
+        response.extend_from_slice(&buf[..n]);
+        if let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+            break end + 4;
+        }
+    };
+    let headers = std::str::from_utf8(&response[..header_end])?.to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Content-Length: ")
+                .and_then(|v| v.parse::<usize>().ok())
+        })
+        .ok_or_else(|| anyhow::anyhow!("missing content-length in {headers:?}"))?;
+    while response.len() - header_end < content_length {
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(anyhow::anyhow!(
+                "connection closed before response body: {response:?}"
+            ));
+        }
+        response.extend_from_slice(&buf[..n]);
+    }
+    Ok(std::str::from_utf8(&response[header_end..header_end + content_length])?.to_string())
+}
+
+#[test]
 fn proxy_protocol_line_can_arrive_in_chunks() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
     let (child_dropper, addr) = start_server("tarweb proxy protocol", dir.path(), false, true)?;

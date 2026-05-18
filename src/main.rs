@@ -1029,6 +1029,10 @@ struct Request<'a> {
     if_modified_since: Option<std::time::SystemTime>,
     if_none_match: Option<std::str::Split<'a, char>>,
     range: Option<(usize, usize)>,
+
+    // If the request has a body, close the connection before we start reading
+    // body bytes as further requests.
+    has_body_header: bool,
 }
 
 impl Request<'_> {
@@ -1052,12 +1056,19 @@ impl Request<'_> {
         let mut if_modified_since = None;
         let mut if_none_match = None;
         let mut range = None;
+        let mut has_body_header = false;
         for header in lines {
-            let mut kv = header.splitn(2, ' ');
+            let mut kv = header.splitn(2, ':');
             let k = kv.next().unwrap_or("").to_lowercase();
-            let v = kv.next().unwrap_or("");
+            let v = kv.next().unwrap_or("").trim();
             match k.as_str() {
-                "accept-encoding:" => {
+                "content-length" => {
+                    // If non-zero content length, assume request body causing close
+                    // after response sent.
+                    has_body_header |= v.parse::<u64>().map_or(true, |len| len > 0);
+                }
+                "transfer-encoding" => has_body_header = true,
+                "accept-encoding" => {
                     for enc in v.split(", ") {
                         match enc {
                             "gzip" => encoding_gzip = true,
@@ -1067,16 +1078,16 @@ impl Request<'_> {
                         }
                     }
                 }
-                "if-modified-since:" => {
+                "if-modified-since" => {
                     if let Ok(ims) = httpdate::parse_http_date(v) {
                         debug!("If modified since: {ims:?}");
                         if_modified_since = Some(ims);
                     }
                 }
-                "if-none-match:" => {
+                "if-none-match" => {
                     if_none_match = Some(v.split(','));
                 }
-                "range:" => {
+                "range" => {
                     if let Some(m) = RE_RANGE.captures(v) {
                         if let (Ok(start), Ok(end)) = (m[1].parse(), m[2].parse()) {
                             range = Some((start, end));
@@ -1105,6 +1116,7 @@ impl Request<'_> {
             if_modified_since,
             if_none_match,
             range,
+            has_body_header,
         }))
     }
 }
@@ -1154,6 +1166,9 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
         return Ok(());
     };
     debug!("Got request for path {}", req.path);
+    if req.has_body_header {
+        hook.con.close_after_response = true;
+    }
     let reqlen = req.len + 4;
     let (pos, len) = answer_req(&mut hook.con.header_buf, &req, archive)
         .context("failed to populate response headers")?;
