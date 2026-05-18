@@ -71,8 +71,8 @@ struct Opt {
     config: String,
 }
 
+/// Load TLS data from files as specified in the proto part.
 #[allow(clippy::unnecessary_wraps)]
-// TODO: actually load the configs.
 fn load_tls(cfg: Option<&protos::backend::Tls>) -> Result<Option<Arc<rustls::ServerConfig>>> {
     let Some(cfg) = cfg else {
         return Ok(None);
@@ -91,6 +91,10 @@ fn load_tls(cfg: Option<&protos::backend::Tls>) -> Result<Option<Arc<rustls::Ser
     })))
 }
 
+/// Load backend config from the parsed proto.
+///
+/// This includes loading the TLS cert/key, so it's not just proto data
+/// transformation.
 fn load_backend(
     be: &protos::backend::BackendType,
     frontend_tls: Option<&protos::backend::Tls>,
@@ -130,6 +134,8 @@ fn load_backend(
     })
 }
 
+/// Attempt to load the config from file. This transitively loads any TLS
+/// cert/key too.
 fn load_config(filename: &str) -> Result<Config> {
     let pool = prost_reflect::DescriptorPool::decode(PROTO_DESCRIPTOR)?;
     let md = pool
@@ -147,6 +153,13 @@ fn load_config(filename: &str) -> Result<Config> {
     let mut config = Config {
         max_lifetime: if protocfg.max_lifetime_ms > 0 {
             Some(tokio::time::Duration::from_millis(protocfg.max_lifetime_ms))
+        } else {
+            None
+        },
+        handshake_timeout: if protocfg.handshake_timeout_ms > 0 {
+            Some(tokio::time::Duration::from_millis(
+                protocfg.handshake_timeout_ms,
+            ))
         } else {
             None
         },
@@ -296,7 +309,7 @@ async fn read_tls_clienthello(
     Ok((bytes, Ok(hello)))
 }
 
-/// Sends file descriptor and handshake data using `SCM_RIGHTS` on a Unix datagram.
+/// Send file descriptor and handshake data using `SCM_RIGHTS` on a Unix datagram.
 async fn pass_fd_over_uds(
     stream: tokio::net::TcpStream,
     sock: UnixDatagram,
@@ -446,6 +459,10 @@ fn extract_sni(clienthello: &[u8]) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// In process backend config.
+///
+/// This is not just the proto because TLS configs are loaded too, and it
+/// includes other TLS server configs set.
 #[derive(Debug)]
 enum Backend {
     // Just close the connection.
@@ -478,13 +495,44 @@ struct Rule {
     timeout: Option<tokio::time::Duration>,
 }
 
-// TODO: this should probably become a protobuf.
 #[derive(Debug)]
 struct Config {
     max_lifetime: Option<tokio::time::Duration>,
+    handshake_timeout: Option<tokio::time::Duration>,
     rules: Vec<Rule>,
     default_backend: Backend,
     default_backend_timeout: Option<tokio::time::Duration>,
+}
+
+/// After going through rules, sorries and backups, we have finally found and
+/// connected to the backend we're going to use.
+///
+/// The timeout is either the global config max lifetime or a per rule maximum.
+///
+/// The thing that actually connects to a backend doesn't know what the timeout
+/// is, nor does the connection loop need to know, so `ConnectedBackend` doesn't
+/// contain the timeout.
+struct RoutedConnection {
+    backend: ConnectedBackend,
+    timeout: Option<tokio::time::Duration>,
+}
+
+/// A successfull connect has happened, and just needs to do its thing.
+enum ConnectedBackend {
+    /// File descriptor passed to another process. Nothing more to do.
+    Done,
+
+    /// All the data needed to handshake with the backend and proxy the
+    /// connection.
+    ///
+    /// Timeout is already applied to the reader of this at call time.
+    Proxy {
+        stream: tokio::net::TcpStream,
+        bytes: Vec<u8>,
+        conn: tokio::net::TcpStream,
+        proxy_header: bool,
+        frontend_tls: Option<Arc<rustls::ServerConfig>>,
+    },
 }
 
 /// Perform TLS handshake and setsockopt with kTLS.
@@ -594,6 +642,10 @@ async fn tls_handshake(
     }
 }
 
+/// Do a connect for proxied connections.
+///
+/// This is called under handshake timeout, and failure will fall back to sorry
+/// server.
 async fn connect_for_proxy(id: usize, addr: &str) -> Result<tokio::net::TcpStream> {
     let addrs = addr.to_socket_addrs()?;
     let mut conn = None;
@@ -614,26 +666,38 @@ async fn connect_for_proxy(id: usize, addr: &str) -> Result<tokio::net::TcpStrea
     ))
 }
 
-async fn handle_conn_backend_proxy(
+/// After fully connected, and handshake timeout no longer relevant, run the
+/// remaining proxying.
+///
+/// Any failure here will NOT fall back to sorry servers, as we're already
+/// connected.
+async fn handle_connected_backend(id: usize, backend: ConnectedBackend) -> Result<()> {
+    match backend {
+        // No proxying needed if fd was passed.
+        ConnectedBackend::Done => Ok(()),
+
+        ConnectedBackend::Proxy {
+            stream,
+            bytes,
+            conn,
+            proxy_header,
+            frontend_tls,
+        } => handle_connected_proxy(id, stream, bytes, conn, proxy_header, frontend_tls).await,
+    }
+}
+
+/// Do any frontend TLS and work with the already connected backend proxy.
+///
+/// Any failure here will NOT fall back to sorry servers, as we're already
+/// connected.
+async fn handle_connected_proxy(
     id: usize,
     stream: tokio::net::TcpStream,
     bytes: Vec<u8>,
-    addr: &str,
-    sorry: Option<&Backend>,
+    mut conn: tokio::net::TcpStream,
     proxy_header: bool,
     tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
-    let mut conn = match connect_for_proxy(id, addr).await {
-        Ok(c) => c,
-        Err(e) => {
-            info!("Primary backend connect failure: {e}");
-            return match sorry {
-                None => Err(e),
-                Some(s) => handle_conn_backend(id, stream, bytes, s).await,
-            };
-        }
-    };
-
     let (mut stream, bytes) = if let Some(tls) = tls {
         tls_handshake(stream, bytes, tls).await?
     } else {
@@ -678,22 +742,22 @@ async fn handle_conn_backend_proxy(
     Ok(())
 }
 
-/// A backend has been selected. Deal with the stream and its backend as
-/// appropriate.
+/// Having found a matching backend config (incl sorry server fallback), we try
+/// to connect to it.
 ///
-/// This function recurses for the sorry server, and therefore needs the
-/// asyncness to be boxed.
-fn handle_conn_backend<'a>(
+/// TODO: Document why this creates a box pinned future instead of just being
+/// async. IIRC it had something to do with circular references or something.
+fn connect_or_handoff_backend<'a>(
     id: usize,
     stream: tokio::net::TcpStream,
     bytes: Vec<u8>,
     backend: &'a Backend,
-) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+) -> Pin<Box<dyn std::future::Future<Output = Result<ConnectedBackend>> + Send + 'a>> {
     Box::pin(async move {
         match backend {
             Backend::Null => {
                 trace!("id={id} Null backend. Closing");
-                Ok(())
+                Ok(ConnectedBackend::Done)
             }
             Backend::Pass {
                 path,
@@ -704,6 +768,9 @@ fn handle_conn_backend<'a>(
                 // visible to the backend. It's only when we SendMsg that it can
                 // cause any load. So we first do this connect, so that we don't
                 // needlessly do a handshake only to then never connect to anything.
+                //
+                // Besides, perhaps the sorry server doesn't have frontend TLS
+                // enabled.
                 let sock = tokio::net::UnixDatagram::unbound().context("create UnixDatagram")?;
                 if let Err(e) = sock
                     .connect(path)
@@ -711,7 +778,7 @@ fn handle_conn_backend<'a>(
                 {
                     info!("Primary backend connect failure: {e}");
                     if let Some(s) = sorry {
-                        return handle_conn_backend(id, stream, bytes, s).await;
+                        return connect_or_handoff_backend(id, stream, bytes, s).await;
                     }
                     return Err(e);
                 }
@@ -736,7 +803,8 @@ fn handle_conn_backend<'a>(
                 } else {
                     (stream, bytes)
                 };
-                pass_fd_over_uds(stream, sock, bytes).await
+                pass_fd_over_uds(stream, sock, bytes).await?;
+                Ok(ConnectedBackend::Done)
             }
             Backend::Proxy {
                 addr,
@@ -744,21 +812,51 @@ fn handle_conn_backend<'a>(
                 frontend_tls,
                 sorry,
             } => {
-                handle_conn_backend_proxy(
-                    id,
+                let conn = match connect_for_proxy(id, addr).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        info!("Primary backend connect failure: {e}");
+                        return match sorry {
+                            None => Err(e),
+                            Some(s) => connect_or_handoff_backend(id, stream, bytes, s).await,
+                        };
+                    }
+                };
+                Ok(ConnectedBackend::Proxy {
                     stream,
                     bytes,
-                    addr,
-                    sorry.as_deref(),
-                    *proxy_header,
-                    frontend_tls.clone(),
-                )
-                .await
+                    conn,
+                    proxy_header: *proxy_header,
+                    frontend_tls: frontend_tls.clone(),
+                })
             }
         }
     })
 }
 
+/// Same as `connect_or_handoff_backend`, but with the per rule timeout when
+/// trying to connect to that backend.
+///
+/// It's also running under the global `max_lifetime_ms`, like everything else.
+async fn connect_or_handoff_backend_with_timeout(
+    id: usize,
+    stream: tokio::net::TcpStream,
+    bytes: Vec<u8>,
+    backend: &Backend,
+    timeout: Option<tokio::time::Duration>,
+) -> Result<ConnectedBackend> {
+    let fut = connect_or_handoff_backend(id, stream, bytes, backend);
+    if let Some(timeout) = timeout {
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(r) => r,
+            Err(e) => Err(anyhow!("backend connect/handoff timeout: {e}")),
+        }
+    } else {
+        fut.await
+    }
+}
+
+/// Regex fullmatch wrapper.
 fn is_full_match(re: &regex::Regex, text: &str) -> bool {
     match re.find(text) {
         Some(m) => m.start() == 0 && m.end() == text.len(),
@@ -766,7 +864,15 @@ fn is_full_match(re: &regex::Regex, text: &str) -> bool {
     }
 }
 
-async fn handle_conn(id: usize, mut stream: tokio::net::TcpStream, config: &Config) -> Result<()> {
+/// Find correct rule and connect to backend.
+///
+/// This is called under global `max_lifetime_ms` and `handshake_timeout_ms`
+/// timeout.
+async fn route_and_connect(
+    id: usize,
+    mut stream: tokio::net::TcpStream,
+    config: &Config,
+) -> Result<RoutedConnection> {
     // Read and validate a full TLS ClientHello.
     let (bytes, clienthello) = read_tls_clienthello(&mut stream).await?;
     match clienthello {
@@ -779,12 +885,17 @@ async fn handle_conn(id: usize, mut stream: tokio::net::TcpStream, config: &Conf
                     for rule in &config.rules {
                         if is_full_match(&rule.re, &sni) {
                             trace!("id={id} SNI {sni} matched rule {rule:?}");
-                            let fut = handle_conn_backend(id, stream, bytes, &rule.backend);
-                            return if let Some(timeout) = rule.timeout {
-                                tokio::time::timeout(timeout, fut).await?
-                            } else {
-                                fut.await
-                            };
+                            return Ok(RoutedConnection {
+                                backend: connect_or_handoff_backend_with_timeout(
+                                    id,
+                                    stream,
+                                    bytes,
+                                    &rule.backend,
+                                    rule.timeout,
+                                )
+                                .await?,
+                                timeout: rule.timeout,
+                            });
                         }
                     }
                 }
@@ -797,8 +908,35 @@ async fn handle_conn(id: usize, mut stream: tokio::net::TcpStream, config: &Conf
             warn!("id={id} Using default backend because no clienthello: {e}");
         }
     }
-    let fut = handle_conn_backend(id, stream, bytes, &config.default_backend);
-    if let Some(timeout) = config.default_backend_timeout {
+    Ok(RoutedConnection {
+        backend: connect_or_handoff_backend_with_timeout(
+            id,
+            stream,
+            bytes,
+            &config.default_backend,
+            config.default_backend_timeout,
+        )
+        .await?,
+        timeout: config.default_backend_timeout,
+    })
+}
+
+/// Handle connection.
+///
+/// Called under `max_lifetime_ms` timeout.
+async fn handle_conn(id: usize, stream: tokio::net::TcpStream, config: &Config) -> Result<()> {
+    let fut = route_and_connect(id, stream, config);
+    let routed = if let Some(timeout) = config.handshake_timeout {
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(r) => r?,
+            Err(e) => return Err(anyhow!("handshake timeout: {e}")),
+        }
+    } else {
+        fut.await?
+    };
+
+    let fut = handle_connected_backend(id, routed.backend);
+    if let Some(timeout) = routed.timeout {
         tokio::time::timeout(timeout, fut).await?
     } else {
         fut.await
@@ -892,6 +1030,28 @@ mod tests {
 
     const MAX_TEST_CONNECTION_TIME: tokio::time::Duration = tokio::time::Duration::from_secs(5);
 
+    #[test]
+    fn config_loads_handshake_timeout() -> Result<()> {
+        let tmp_dir = tempfile::TempDir::new()?;
+        let config_file = tmp_dir.path().join("config.cfg");
+        std::fs::write(
+            &config_file,
+            r#"
+default_backend: <
+        null: <>
+>
+handshake_timeout_ms: 1234
+"#,
+        )?;
+
+        let config = load_config(config_file.to_str().unwrap())?;
+        assert_eq!(
+            config.handshake_timeout,
+            Some(tokio::time::Duration::from_millis(1234))
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn default_client() -> Result<()> {
         if false {
@@ -925,6 +1085,7 @@ mod tests {
                 #[allow(clippy::regex_creation_in_loops)]
                 let config = Config {
                     max_lifetime: Some(MAX_TEST_CONNECTION_TIME),
+                    handshake_timeout: None,
                     rules: vec![
                         Rule {
                             re: regex::Regex::new("foo")?,
@@ -1040,6 +1201,78 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handshake_timeout_closes_idle_preroute_client() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
+        let listener_port = listener.local_addr()?.port();
+        let config = Config {
+            max_lifetime: Some(MAX_TEST_CONNECTION_TIME),
+            handshake_timeout: Some(tokio::time::Duration::from_millis(50)),
+            rules: vec![],
+            default_backend: Backend::Null,
+            default_backend_timeout: None,
+        };
+        let _main =
+            tokio::task::spawn(async move { mainloop(Arc::new(config), "", listener).await });
+
+        let mut stream = tokio::net::TcpStream::connect(format!("[::1]:{listener_port}")).await?;
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(MAX_TEST_CONNECTION_TIME, stream.read(&mut buf)).await?;
+        match read {
+            Ok(0) => Ok(()),
+            Ok(n) => Err(anyhow!("idle preroute client read unexpected {n} bytes")),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_timeout_stops_after_proxy_backend_connects() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
+        let listener_port = listener.local_addr()?.port();
+        let backend = tokio::net::TcpListener::bind("[::1]:0".parse::<SocketAddr>()?).await?;
+        let backend_port = backend.local_addr()?.port();
+        let config = Config {
+            max_lifetime: Some(MAX_TEST_CONNECTION_TIME),
+            handshake_timeout: Some(tokio::time::Duration::from_millis(50)),
+            rules: vec![],
+            default_backend: Backend::Proxy {
+                addr: format!("[::1]:{backend_port}"),
+                proxy_header: false,
+                frontend_tls: None,
+                sorry: None,
+            },
+            default_backend_timeout: None,
+        };
+        let _main =
+            tokio::task::spawn(async move { mainloop(Arc::new(config), "", listener).await });
+
+        let backend = tokio::spawn(async move {
+            let (mut stream, _) = backend.accept().await?;
+            let mut got = [0u8; 5];
+            stream.read_exact(&mut got).await?;
+            if got != *b"abcde" {
+                return Err(anyhow!("backend got unexpected bytes: {got:?}"));
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+            stream.write_all(b"ok").await?;
+            stream.shutdown().await?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(format!("[::1]:{listener_port}")).await?;
+
+        // Write invalid TLS records, forcing router to pick the default
+        // backend.
+        stream.write_all(b"abcde").await?;
+
+        let mut got = Vec::new();
+        tokio::time::timeout(MAX_TEST_CONNECTION_TIME, stream.read_to_end(&mut got)).await??;
+        backend.await??;
+        assert_eq!(got, b"ok");
         Ok(())
     }
 }

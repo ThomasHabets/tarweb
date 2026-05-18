@@ -59,4 +59,15 @@ message SNIConfig {
         // But since this is top level, this applies to waiting for the
         // ClientHello too.
         uint64 max_lifetime_ms = 3;
+
+        // Timeout for the pre-backend phase: reading enough of the TLS
+        // ClientHello to route the connection, then connecting to or handing
+        // off to the selected backend.
+        //
+        // This timeout stops applying once a proxy backend has been connected
+        // to, or a pass backend has received the file descriptor.
+        //
+        // This timeout therefore does NOT include any handshake with the
+        // backend. That's covered by the global and per rule max_lifetime_ms.
+        uint64 handshake_timeout_ms = 4;
 }
