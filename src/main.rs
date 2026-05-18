@@ -1963,7 +1963,7 @@ struct Opt {
     passfd_group_name: Option<String>,
 
     /// Set passfd socket perms.
-    #[arg(long, value_parser=parse_octal, default_value="666")]
+    #[arg(long, value_parser=parse_octal, default_value="660")]
     passfd_perms: u32,
 
     #[arg(long, default_value = "", help = "Strip prefix before looking in tar")]
