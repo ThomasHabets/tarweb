@@ -830,9 +830,18 @@ fn find_cmsg(msghdr: &libc::msghdr) -> (Option<libc::ucred>, Vec<OwnedFd>) {
             }
 
             (libc::SOL_SOCKET, libc::SCM_RIGHTS) => {
-                assert_eq!(data.len(), std::mem::size_of::<libc::c_int>());
-                let raw_fd = libc::c_int::from_ne_bytes(data.try_into().unwrap());
-                rights.push(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+                let int_size = std::mem::size_of::<libc::c_int>();
+                assert!(
+                    data.len().is_multiple_of(int_size),
+                    "SCM_RIGHTS received with non-integer number of fds. Data len {}",
+                    data.len(),
+                );
+                // Even though we will later error if we get more than one fd,
+                // we need to parse them so we can close them.
+                for chunk in data.chunks(int_size) {
+                    let raw_fd = libc::c_int::from_ne_bytes(chunk.try_into().unwrap());
+                    rights.push(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+                }
             }
             (level, typ) => {
                 warn!("Found unknnown cmsg header {level} {typ}. Ignoring.");
@@ -854,23 +863,52 @@ fn receive_passed_connection(
     passfd_msghdr: &libc::msghdr,
     nbytes: usize,
 ) -> Result<(OwnedFd, Vec<u8>)> {
-    // Check for passed credentials.
+    // Extract metadata from control message.
     let (creds, fds) = find_cmsg(passfd_msghdr);
+
+    // Check for passed credentials first. Useful in case something else failed.
     if let Some(creds) = creds {
         debug!(
             "Peer creds: pid={} uid={} gid={}",
             creds.pid, creds.uid, creds.gid
         );
     }
+
+    // Get file descriptor.
+    if fds.is_empty() {
+        return Err(anyhow!(
+            "Failed to extract file descriptor in passfd from creds={creds:?}. Fd leak or bad client"
+        ));
+    }
+
+    // Sanity check for receiving multiple file descriptors.
+    //
+    // Since there's also potentially payload, we inherently can't deal with
+    // that.
+    //
+    // In theory we could accept multiple fds iff there's no data.
+    if fds.len() > 1 {
+        return Err(anyhow!(
+            "Received more than one ({}) fds via recvmsg from creds={creds:?}. Closing all",
+            fds.len()
+        ));
+    }
+
     // We didn't ask for trunc, so reject that.
     if passfd_msghdr.msg_flags & libc::MSG_TRUNC != 0 {
         return Err(anyhow!(
             "Passfd data from creds={creds:?} was truncated. That should not be possible, since we didn't ask for it",
         ));
     }
+    if passfd_msghdr.msg_flags & libc::MSG_CTRUNC != 0 {
+        return Err(anyhow!(
+            "Passfd control data from creds={creds:?} was truncated. It should only be a single fd",
+        ));
+    }
 
     // We only provided one buffer, so has to be one.
     assert_eq!(passfd_msghdr.msg_iovlen, 1);
+
     let iov = passfd_msghdr.msg_iov;
     // Despite checking for TRUNC, did we get more than the buffer size?
     {
@@ -880,31 +918,12 @@ fn receive_passed_connection(
             "recvmsg somehow returned more data than the buffer. {nbytes} not le {buflen}"
         );
     }
+
     let clienthello: &[u8] =
         unsafe { std::slice::from_raw_parts((*iov).iov_base as *const u8, nbytes) };
 
-    // Get file descriptor.
-    if fds.is_empty() {
-        return Err(anyhow!(
-            "Failed to extract file descriptor in passfd from creds={creds:?}. Possible fd leak"
-        ));
-    }
-
-    // Sanity check for receiving multiple file descriptors.
-    if fds.len() > 1 {
-        return Err(anyhow!(
-            "Received more than one ({}) fds via recvmsg from creds={creds:?}. Dropping all",
-            fds.len()
-        ));
-    }
+    // Roundabout way to get first entry without making `fds` mut.
     let fd = fds.into_iter().next().unwrap();
-
-    if passfd_msghdr.msg_flags & libc::MSG_CTRUNC != 0 {
-        return Err(anyhow!(
-            "Passfd control data from creds={creds:?} was truncated. Must have been more than {} bytes",
-            passfd_msghdr.msg_controllen
-        ));
-    }
     Ok((fd, clienthello.to_vec()))
 }
 
