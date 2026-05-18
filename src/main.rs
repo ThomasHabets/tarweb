@@ -854,20 +854,34 @@ fn receive_passed_connection(
     passfd_msghdr: &libc::msghdr,
     nbytes: usize,
 ) -> Result<(OwnedFd, Vec<u8>)> {
-    assert_eq!(passfd_msghdr.msg_iovlen, 1);
-    let iov = passfd_msghdr.msg_iov;
-    let clienthello: &[u8] =
-        unsafe { std::slice::from_raw_parts((*iov).iov_base as *const u8, nbytes) };
-
-    let (creds, fds) = find_cmsg(passfd_msghdr);
-
     // Check for passed credentials.
+    let (creds, fds) = find_cmsg(passfd_msghdr);
     if let Some(creds) = creds {
         debug!(
             "Peer creds: pid={} uid={} gid={}",
             creds.pid, creds.uid, creds.gid
         );
     }
+    // We didn't ask for trunc, so reject that.
+    if passfd_msghdr.msg_flags & libc::MSG_TRUNC != 0 {
+        return Err(anyhow!(
+            "Passfd data from creds={creds:?} was truncated. That should not be possible, since we didn't ask for it",
+        ));
+    }
+
+    // We only provided one buffer, so has to be one.
+    assert_eq!(passfd_msghdr.msg_iovlen, 1);
+    let iov = passfd_msghdr.msg_iov;
+    // Despite checking for TRUNC, did we get more than the buffer size?
+    {
+        let buflen = unsafe { (*iov).iov_len };
+        assert!(
+            nbytes <= buflen,
+            "recvmsg somehow returned more data than the buffer. {nbytes} not le {buflen}"
+        );
+    }
+    let clienthello: &[u8] =
+        unsafe { std::slice::from_raw_parts((*iov).iov_base as *const u8, nbytes) };
 
     // Get file descriptor.
     if fds.is_empty() {
@@ -885,12 +899,6 @@ fn receive_passed_connection(
     }
     let fd = fds.into_iter().next().unwrap();
 
-    if passfd_msghdr.msg_flags & libc::MSG_TRUNC != 0 {
-        return Err(anyhow!(
-            "Passfd data from creds={creds:?} was truncated. Must have been more than {} bytes",
-            clienthello.len()
-        ));
-    }
     if passfd_msghdr.msg_flags & libc::MSG_CTRUNC != 0 {
         return Err(anyhow!(
             "Passfd control data from creds={creds:?} was truncated. Must have been more than {} bytes",
