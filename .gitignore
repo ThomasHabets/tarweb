@@ -24,3 +24,8 @@ tarweb_test.trs
 test-suite.log
 /target
 *.swp
+descriptor.bin
+*.tar
+*.pem
+*.crt
+attic/
