@@ -2299,7 +2299,8 @@ fn main() -> Result<()> {
                             }
                             ops
                         };
-                        let mut registered = vec![-1i32; opt.max_connections];
+                        let mut registered =
+                            vec![-1i32; opt.max_connections + RESERVED_FIXED_SLOTS];
                         if let Some(ref l) = listener {
                             registered[LISTEN_FIXED_FILE.0 as usize] = l.as_raw_fd();
                         }
