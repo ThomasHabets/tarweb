@@ -1054,7 +1054,17 @@ max_lifetime_ms: 10000
 }
 
 #[test]
+fn oha_2s() -> Result<()> {
+    oha(2)
+}
+
+#[test]
+#[ignore = "too heavy to run on every commit"]
 fn oha_10s() -> Result<()> {
+    oha(10)
+}
+
+fn oha(secs: u32) -> Result<()> {
     let mut logdump = LogDump::new();
     let dir = tempfile::TempDir::new()?;
 
@@ -1126,7 +1136,7 @@ max_lifetime_ms: 10000
             "--insecure",
             "--no-tui",
             "-z",
-            "10s",
+            &format!("{secs}s"),
             &format!("https://{router_addr}/"),
         ])
         .output()?;
