@@ -807,8 +807,7 @@ fn some_requests() -> Result<()> {
                 assert_eq!(resp.status(), code);
                 eprintln!("{:?}", resp.headers());
                 for (k, v) in [
-                    // TODO: confirm against pattern instead.
-                    ("server", "tarweb/0.1.1"),
+                    ("server", r"tarweb/\d+[.]\d+[.]\d+"),
                     ("cache-control", "public, max-age=300"),
                     ("connection", "keep-alive"),
                     ("vary", "accept-encoding"),
@@ -833,9 +832,17 @@ fn some_requests() -> Result<()> {
                         continue;
                     }
 
+                    let val_re = regex::Regex::new(&("^".to_owned() + v + "$"))?;
                     #[allow(clippy::expect_fun_call)]
                     {
-                        assert_eq!(resp.headers().get(k).expect(&format!("no {k:?} header")), v);
+                        assert!(
+                            val_re.is_match(str::from_utf8(
+                                resp.headers()
+                                    .get(k)
+                                    .expect(&format!("no {k:?} header"))
+                                    .as_bytes()
+                            )?)
+                        );
                     }
                 }
                 if compressed && !auto_decompress && has_compressed {
