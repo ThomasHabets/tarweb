@@ -1454,7 +1454,6 @@ fn op_completion(
             }
 
             State::ProxyLine(..) => {
-                assert_eq!(hook.con.read_buf_pos, 0);
                 let State::ProxyLine(fd, tls) = std::mem::replace(&mut hook.con.state, State::Idle)
                 else {
                     unreachable!();
@@ -1473,7 +1472,9 @@ fn op_completion(
                     hook.con.close(opt.async_cancel2, ops);
                     return Ok(());
                 }
-                let data = &hook.con.read_buf[..hook.result.try_into().unwrap()];
+                let read_len = usize::try_from(hook.result).unwrap();
+                let new_read_buf_pos = hook.con.read_buf_pos + read_len;
+                let data = &hook.con.read_buf[..new_read_buf_pos];
                 if let Some(end) = find_crlf(data) {
                     let proxyline = &data[..end];
                     let rest = &data[(end + 2)..].to_vec();
@@ -1497,7 +1498,13 @@ fn op_completion(
                         return Ok(());
                     }
                 } else {
-                    unimplemented!("handle case of partial proxy line")
+                    hook.con.state = State::ProxyLine(fd, tls);
+                    hook.con.read_buf_pos = new_read_buf_pos;
+                    if hook.con.read_buf_pos == hook.con.read_buf.len() {
+                        return Err(Error::msg("PROXY protocol line exceeded read buffer"));
+                    }
+                    hook.con.read(ops);
+                    return Ok(());
                 }
             }
             // Reading state is handled in handle_connection, not here.

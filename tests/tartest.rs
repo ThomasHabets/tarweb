@@ -381,15 +381,14 @@ fn request_headers_too_large_returns_431_and_closes() -> Result<()> {
 
     let (child, stderr) = child_dropper.shutdown()?;
     let child = child.wait_with_output()?;
-    let res = match res {
+    match res {
         Ok(o) => o,
         Err(e) => {
             eprintln!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
             eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr?));
             std::panic::resume_unwind(e);
         }
-    };
-    res
+    }
 }
 
 fn wrapped_request_headers_too_large_returns_431_and_closes(
@@ -435,6 +434,80 @@ fn wrapped_request_headers_too_large_returns_431_and_closes(
         "bad response body: {body:?}"
     );
     assert_eq!(body.len(), content_length);
+
+    Ok(())
+}
+
+#[test]
+fn proxy_protocol_line_can_arrive_in_chunks() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let (child_dropper, addr) = start_server("tarweb proxy protocol", dir.path(), false, true)?;
+
+    let res = std::panic::catch_unwind(|| wrapped_proxy_protocol_line_can_arrive_in_chunks(&addr));
+
+    let (child, stderr) = child_dropper.shutdown()?;
+    let child = child.wait_with_output()?;
+    match res {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
+            eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr?));
+            std::panic::resume_unwind(e);
+        }
+    }
+}
+
+fn wrapped_proxy_protocol_line_can_arrive_in_chunks(addr: &std::net::SocketAddr) -> Result<()> {
+    let mut stream = std::net::TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+
+    for chunk in ["PROXY TCP4 ", "192.0.2.10 198.51.100.20 ", "12345 80\r\n"] {
+        stream.write_all(chunk.as_bytes())?;
+        stream.flush()?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    write!(stream, "GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n")?;
+    stream.flush()?;
+
+    let mut response = Vec::new();
+    let header_end = loop {
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(anyhow::anyhow!(
+                "connection closed before response headers: {response:?}"
+            ));
+        }
+        response.extend_from_slice(&buf[..n]);
+        if let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+            break end + 4;
+        }
+    };
+    let headers = std::str::from_utf8(&response[..header_end])?.to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Content-Length: ")
+                .and_then(|v| v.parse::<usize>().ok())
+        })
+        .ok_or_else(|| anyhow::anyhow!("missing content-length in {headers:?}"))?;
+    while response.len() - header_end < content_length {
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(anyhow::anyhow!(
+                "connection closed before response body: {response:?}"
+            ));
+        }
+        response.extend_from_slice(&buf[..n]);
+    }
+    let body = std::str::from_utf8(&response[header_end..header_end + content_length])?;
+
+    assert!(
+        headers.starts_with("HTTP/1.1 200 OK\r\n"),
+        "bad response: {response:?}"
+    );
+    assert_eq!(body, "hello world");
 
     Ok(())
 }
