@@ -87,10 +87,12 @@ fn load_tls(
     let certs = tarweb::load_certs(&cfg.cert_file)?;
     let key = tarweb::load_private_key(&cfg.key_file)?;
     Ok(Some(Arc::new({
-        let mut cfg =
-            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-                .with_no_client_auth()
-                .with_single_cert(certs, key)?;
+        let mut cfg = rustls::ServerConfig::builder_with_protocol_versions(&[
+            &rustls::version::TLS12,
+            &rustls::version::TLS13,
+        ])
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
         cfg.enable_secret_extraction = true;
         // Enable key log file to file named from env SSLKEYLOGFILE.
         if allow_keylogging {
@@ -571,26 +573,34 @@ async fn tls_handshake(
         // Give bytes we have to rustls.
         {
             let mut cur = std::io::Cursor::new(&bytes);
-            let n = tls.read_tls(&mut cur)?;
+            let n = tls.read_tls(&mut cur).context("reading TLS")?;
             bytes.drain(0..n);
         }
-        let io = tls.process_new_packets()?;
+        let io = tls
+            .process_new_packets()
+            .context("processing TLS packets")?;
 
         // Send rustls bytes to the peer.
         let bytes_to_write = io.tls_bytes_to_write();
         if bytes_to_write > 0 {
             let mut buf = vec![0u8; bytes_to_write];
             let mut cur = std::io::Cursor::new(&mut buf);
-            let n = tls.write_tls(&mut cur)?;
+            let n = tls.write_tls(&mut cur).context("writing TLS")?;
             // TODO: can we assume remote side will not be overwhelmed?
             // If it is, and insists on writing, then we deadlock (time out).
-            stream.write_all(&buf[..n]).await?;
+            stream
+                .write_all(&buf[..n])
+                .await
+                .context("writing as part of handshake")?;
         }
         let still_handshaking = tls.is_handshaking();
         if !still_handshaking {
             let plain_n = io.plaintext_bytes_to_read();
             let mut buf = vec![0u8; plain_n];
-            let n = tls.reader().read(&mut buf[..plain_n])?;
+            let n = tls
+                .reader()
+                .read(&mut buf[..plain_n])
+                .context("reading when handshake done")?;
             assert_eq!(plain_n, n);
 
             // Enable initial TLS option.
@@ -605,17 +615,19 @@ async fn tls_handshake(
                 )
             };
             if rc < 0 {
-                return Err(anyhow!(
-                    "setsockopt()=>{rc}: {}",
-                    std::io::Error::from_raw_os_error(rc.abs())
-                ));
+                let err = std::io::Error::last_os_error();
+                return Err(anyhow!("setsockopt(SOL_TCP/TCP_ULP)=>{rc}: {err}"));
             }
 
             // Hand over keys.
-            let suite = tls.negotiated_cipher_suite().ok_or(anyhow!("bleh"))?;
-            let keys = tls.dangerous_extract_secrets()?;
-            let tls_rx = ktls::CryptoInfo::from_rustls(suite, keys.rx)?;
-            let tls_tx = ktls::CryptoInfo::from_rustls(suite, keys.tx)?;
+            let suite = tls
+                .negotiated_cipher_suite()
+                .ok_or(anyhow!("failed to get negotiated cipher suite"))?;
+            let keys = tls.dangerous_extract_secrets().context("extracting keys")?;
+            let tls_rx =
+                ktls::CryptoInfo::from_rustls(suite, keys.rx).context("extracting rx keys")?;
+            let tls_tx =
+                ktls::CryptoInfo::from_rustls(suite, keys.tx).context("extracting tx keys")?;
             for (name, s) in [(libc::TLS_RX, tls_rx), (libc::TLS_TX, tls_tx)] {
                 let rc = unsafe {
                     libc::setsockopt(
@@ -627,10 +639,8 @@ async fn tls_handshake(
                     )
                 };
                 if rc < 0 {
-                    return Err(anyhow!(
-                        "setsockopt()=>{rc}: {}",
-                        std::io::Error::from_raw_os_error(rc.abs())
-                    ));
+                    let err = std::io::Error::last_os_error();
+                    return Err(anyhow!("setsockopt(SOL_TLS)=>{rc}: {err}"));
                 }
             }
             return Ok((stream, buf));
