@@ -19,7 +19,7 @@ jobs:
     - name: Install clippy
       run: rustup component add --toolchain nightly clippy
     - name: Cargo install
-      run: cargo install cargo-deny oha tickbox
+      run: cargo install cargo-deny oha tickbox sni-router
     - name: apt-get update
       run: sudo apt-get update
     - name: Install stuff

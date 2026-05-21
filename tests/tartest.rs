@@ -3,7 +3,7 @@
 use std::io::{Read, Write};
 use std::process::Command;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 // Dump stderr from all processes on Drop unless success is set.
 struct LogDump {
@@ -314,11 +314,12 @@ fn start_router<S: Into<String>>(
 
     // TODO: depends on this port being free. Find a free port instead.
     let addr = format!("[::1]:{port}");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sni_router"))
+    let mut child = Command::new("sni-router")
         .args(["-v", "trace", "-l", &addr, "-c", config.to_str().unwrap()])
         //.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()?;
+        .spawn()
+        .context("spawning sni-router")?;
     let mut stderr = child.stderr.take().unwrap();
     let thread = std::thread::spawn(move || {
         let mut v = Vec::new();

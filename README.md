@@ -99,7 +99,6 @@ a 10Gbps link at least, with small requests.
 
 * use `writev` to reduce queue roundtrips.
 * `TCP_CORK`?
-* SNI router: Per SNI ACL.
 
 ## Random notes
 

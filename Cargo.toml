@@ -6,7 +6,7 @@ license = "MIT"
 authors = ["Thomas Habets <thomas@habets.se>"]
 readme = "README.md"
 repository = "https://github.com/ThomasHabets/tarweb"
-description = "io-uring based static file web server, with SNI router"
+description = "io-uring based static file web server"
 keywords = ["webserver"]
 default-run = "tarweb"
 
@@ -64,10 +64,6 @@ rcgen = "0.14.5"
 
 [profile.release]
 debug = true
-
-[[bin]]
-name = "sni_router"
-path = "src/bin/sni.rs"
 
 [lib]
 name = "tarweb"
