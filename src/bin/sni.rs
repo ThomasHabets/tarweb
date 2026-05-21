@@ -66,6 +66,10 @@ struct Opt {
     #[arg(long, default_value = "/")]
     restrict_dirs: Vec<std::path::PathBuf>,
 
+    /// Allow keylogging.
+    #[arg(long)]
+    allow_keylogging: bool,
+
     /// Asciiproto config.
     #[arg(long, short)]
     config: String,
@@ -73,7 +77,10 @@ struct Opt {
 
 /// Load TLS data from files as specified in the proto part.
 #[allow(clippy::unnecessary_wraps)]
-fn load_tls(cfg: Option<&protos::backend::Tls>) -> Result<Option<Arc<rustls::ServerConfig>>> {
+fn load_tls(
+    cfg: Option<&protos::backend::Tls>,
+    allow_keylogging: bool,
+) -> Result<Option<Arc<rustls::ServerConfig>>> {
     let Some(cfg) = cfg else {
         return Ok(None);
     };
@@ -86,7 +93,9 @@ fn load_tls(cfg: Option<&protos::backend::Tls>) -> Result<Option<Arc<rustls::Ser
                 .with_single_cert(certs, key)?;
         cfg.enable_secret_extraction = true;
         // Enable key log file to file named from env SSLKEYLOGFILE.
-        // cfg.key_log = Arc::new(rustls::KeyLogFile::new());
+        if allow_keylogging {
+            cfg.key_log = Arc::new(rustls::KeyLogFile::new());
+        }
         cfg
     })))
 }
@@ -99,6 +108,7 @@ fn load_backend(
     be: &protos::backend::BackendType,
     frontend_tls: Option<&protos::backend::Tls>,
     sorry: Option<&protos::Backend>,
+    allow_keylogging: bool,
 ) -> Result<Backend> {
     if sorry.is_some_and(|s| s.sorry.is_some()) {
         return Err(anyhow!("sorry servers can't have sorry servers"));
@@ -109,6 +119,7 @@ fn load_backend(
                 s.backend_type.as_ref().unwrap(),
                 s.frontend_tls.as_ref(),
                 None,
+                allow_keylogging,
             )
         })
         .transpose()?
@@ -123,12 +134,12 @@ fn load_backend(
         protos::backend::BackendType::Proxy(p) => Backend::Proxy {
             addr: p.addr.clone(),
             proxy_header: p.proxy_header,
-            frontend_tls: load_tls(frontend_tls)?,
+            frontend_tls: load_tls(frontend_tls, allow_keylogging)?,
             sorry,
         },
         protos::backend::BackendType::Pass(p) => Backend::Pass {
             path: p.path.clone().into(),
-            frontend_tls: load_tls(frontend_tls)?,
+            frontend_tls: load_tls(frontend_tls, allow_keylogging)?,
             sorry,
         },
     })
@@ -136,7 +147,7 @@ fn load_backend(
 
 /// Attempt to load the config from file. This transitively loads any TLS
 /// cert/key too.
-fn load_config(filename: &str) -> Result<Config> {
+fn load_config(filename: &str, allow_keylogging: bool) -> Result<Config> {
     let pool = prost_reflect::DescriptorPool::decode(PROTO_DESCRIPTOR)?;
     let md = pool
         .get_message_by_name("tarweb.SNIConfig")
@@ -175,6 +186,7 @@ fn load_config(filename: &str) -> Result<Config> {
                     .ok_or(anyhow!("default backend missing an actual backend"))?,
                 frontend_tls,
                 sorry,
+                allow_keylogging,
             )?
         },
         default_backend_timeout: protocfg.default_backend.and_then(|b| {
@@ -208,6 +220,7 @@ fn load_config(filename: &str) -> Result<Config> {
                         .ok_or(anyhow!("backend missing actual backend"))?,
                     frontend_tls,
                     sorry,
+                    allow_keylogging,
                 )?
             },
         });
@@ -947,6 +960,7 @@ async fn mainloop(
     mut config: Arc<Config>,
     config_filename: &str,
     listener: tokio::net::TcpListener,
+    allow_keylogging: bool,
 ) -> Result<()> {
     let mut id = 0;
     let mut hups = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
@@ -957,7 +971,7 @@ async fn mainloop(
             _ = hups.recv() => {
                 let cwd = std::env::current_dir().map(|c|c.display().to_string()).unwrap_or("<unknown>".to_string());
                 info!("Got SIGHUP. Loading new config {config_filename:?} in cwd {cwd:?}");
-                match load_config(config_filename) {
+                match load_config(config_filename, allow_keylogging) {
                     Ok(c) => config = Arc::new(c),
                     Err(e) => error!(
                         "Failed to load config {config_filename:?}, staying with old config: {e}"
@@ -1017,8 +1031,15 @@ async fn main() -> Result<()> {
     )?;
     sock::set_nodelay(listener.as_raw_fd())?;
     // Config.
-    let config = load_config(&opt.config).context(format!("Loading config {:?}", opt.config))?;
-    mainloop(Arc::new(config), &opt.config, listener).await
+    let config = load_config(&opt.config, opt.allow_keylogging)
+        .context(format!("Loading config {:?}", opt.config))?;
+    mainloop(
+        Arc::new(config),
+        &opt.config,
+        listener,
+        opt.allow_keylogging,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1044,7 +1065,7 @@ handshake_timeout_ms: 1234
 "#,
         )?;
 
-        let config = load_config(config_file.to_str().unwrap())?;
+        let config = load_config(config_file.to_str().unwrap(), false)?;
         assert_eq!(
             config.handshake_timeout,
             Some(tokio::time::Duration::from_millis(1234))
@@ -1120,10 +1141,9 @@ handshake_timeout_ms: 1234
                     },
                     default_backend_timeout: None,
                 };
-                let _main =
-                    tokio::task::spawn(
-                        async move { mainloop(Arc::new(config), "", listener).await },
-                    );
+                let _main = tokio::task::spawn(async move {
+                    mainloop(Arc::new(config), "", listener, false).await
+                });
 
                 let (done_tx1, mut done_rx_bar) = tokio::sync::mpsc::channel::<()>(1);
                 let (done_tx2, mut done_rx_baz) = tokio::sync::mpsc::channel::<()>(1);
@@ -1216,7 +1236,9 @@ handshake_timeout_ms: 1234
             default_backend_timeout: None,
         };
         let _main =
-            tokio::task::spawn(async move { mainloop(Arc::new(config), "", listener).await });
+            tokio::task::spawn(
+                async move { mainloop(Arc::new(config), "", listener, false).await },
+            );
 
         let mut stream = tokio::net::TcpStream::connect(format!("[::1]:{listener_port}")).await?;
         let mut buf = [0u8; 1];
@@ -1248,7 +1270,9 @@ handshake_timeout_ms: 1234
             default_backend_timeout: None,
         };
         let _main =
-            tokio::task::spawn(async move { mainloop(Arc::new(config), "", listener).await });
+            tokio::task::spawn(
+                async move { mainloop(Arc::new(config), "", listener, false).await },
+            );
 
         let backend = tokio::spawn(async move {
             let (mut stream, _) = backend.accept().await?;
