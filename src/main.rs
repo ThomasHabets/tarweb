@@ -1274,10 +1274,7 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
                 .zip(entry.modified())
                 .is_some_and(|(h, e)| *e <= h))
     {
-        write!(
-            out,
-            "HTTP/1.1 304 Not Modified\r\n{common}Content-Length: 0\r\n"
-        )?;
+        write!(out, "HTTP/1.1 304 Not Modified\r\n{common}")?;
         date_header(out)?;
         write!(out, "\r\n")?;
         return Ok((0, 0));
