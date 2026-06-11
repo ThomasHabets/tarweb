@@ -1041,12 +1041,10 @@ impl Request<'_> {
     // Some(req) if it's a good request.
     // None if more data is needed.
     fn parse(heads: &[u8]) -> Result<Option<Request<'_>>> {
-        let s = std::str::from_utf8(heads)?;
-
-        let Some(end) = s.find("\r\n\r\n") else {
+        let Some(end) = heads.windows(4).position(|w| w == b"\r\n\r\n") else {
             return Ok(None);
         };
-        let s = &s[..end];
+        let s = std::str::from_utf8(&heads[..end])?;
         debug!("Found req len {end}: {s:?}");
 
         let mut lines = s.split("\r\n");
