@@ -483,6 +483,7 @@ fn wrapped_request_body_headers_close_after_response(addr: &std::net::SocketAddr
             headers.starts_with("HTTP/1.1 200 OK\r\n"),
             "bad response for {extra:?}: {response:?}"
         );
+        assert_response_header(headers, "Connection", "close");
         assert_eq!(body, "hello world");
     }
 

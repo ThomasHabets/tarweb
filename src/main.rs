@@ -1203,34 +1203,36 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
         hook.con.close_after_response = true;
     }
     let reqlen = req.len + 4;
-    let (pos, len) = answer_req(&mut hook.con.header_buf, &req, archive)
-        .context("failed to populate response headers")?;
+    let (pos, len) = answer_req(
+        &mut hook.con.header_buf,
+        &req,
+        archive,
+        hook.con.close_after_response,
+    )
+    .context("failed to populate response headers")?;
     hook.con.write_header_bytes(ops, pos, len);
     hook.con.read_buf.copy_within(reqlen.., 0);
     hook.con.read_buf_pos -= reqlen;
     Ok(())
 }
 
-static COMMON_HEADERS: LazyLock<String> = LazyLock::new(|| {
-    use std::fmt::Write;
-
-    let mut s = String::new();
+fn common_headers(out: &mut HeaderBuf, close_after_response: bool) -> Result<()> {
     if CACHE_AGE_SECS > 0 {
         // Expires header is ignored when providing max-age.
-        write!(
-            &mut s,
-            "Cache-Control: public, max-age={CACHE_AGE_SECS}\r\n"
-        )
-        .unwrap();
+        write!(out, "Cache-Control: public, max-age={CACHE_AGE_SECS}\r\n")?;
     }
+    let connection = if close_after_response {
+        "close"
+    } else {
+        "keep-alive"
+    };
     write!(
-        &mut s,
-        "Connection: keep-alive\r\nVary: accept-encoding\r\nServer: tarweb/{}\r\n",
+        out,
+        "Connection: {connection}\r\nVary: accept-encoding\r\nServer: tarweb/{}\r\n",
         env!("CARGO_PKG_VERSION"),
-    )
-    .unwrap();
-    s
-});
+    )?;
+    Ok(())
+}
 
 fn date_header(out: &mut HeaderBuf) -> Result<()> {
     Ok(write!(
@@ -1254,16 +1256,18 @@ fn answer_request_header_fields_too_large(out: &mut HeaderBuf) -> Result<(usize,
     Ok((0, 0))
 }
 
-fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(usize, usize)> {
-    let common = &COMMON_HEADERS;
-    let common = common.as_str();
+fn answer_req(
+    out: &mut HeaderBuf,
+    req: &Request,
+    archive: &Archive,
+    close_after_response: bool,
+) -> Result<(usize, usize)> {
     let Some(entry) = archive.entry(req.path) else {
         let msg404 = "Not found\n";
         let len404 = msg404.len();
-        write!(
-            out,
-            "HTTP/1.1 404 Not Found\r\n{common}Content-Length: {len404}\r\n"
-        )?;
+        write!(out, "HTTP/1.1 404 Not Found\r\n")?;
+        common_headers(out, close_after_response)?;
+        write!(out, "Content-Length: {len404}\r\n")?;
         date_header(out)?;
         write!(out, "\r\n")?;
         if !req.head {
@@ -1289,7 +1293,9 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
                 .zip(entry.modified())
                 .is_some_and(|(h, e)| *e <= h))
     {
-        write!(out, "HTTP/1.1 304 Not Modified\r\n{common}")?;
+        write!(out, "HTTP/1.1 304 Not Modified\r\n")?;
+        common_headers(out, close_after_response)?;
+        write!(out, "{}", entry.headers())?;
         date_header(out)?;
         write!(out, "\r\n")?;
         return Ok((0, 0));
@@ -1340,9 +1346,10 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
         write!(out, "HTTP/1.1 200 OK\r\n")?;
     }
     date_header(out)?;
+    common_headers(out, close_after_response)?;
     write!(
         out,
-        "{common}{}{encoding}Content-Length: {len}\r\n\r\n",
+        "{}{encoding}Content-Length: {len}\r\n\r\n",
         entry.headers()
     )?;
     Ok((pos, if req.head { 0 } else { len }))
