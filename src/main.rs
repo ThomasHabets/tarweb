@@ -1113,6 +1113,7 @@ impl Request<'_> {
             }
         };
         let path = first.next().ok_or(Error::msg("no path"))?;
+        let path = path.split_once('?').map_or(path, |(path, _)| path);
         let _version = first.next().ok_or(Error::msg("no version"))?;
 
         // Headers ignored.
