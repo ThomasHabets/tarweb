@@ -1141,10 +1141,12 @@ rules: <
                 >
         >
 >
-default_backend: <
-        # For localhost SNI, let tarweb deal with the handshaking.
-        pass: <
-                path: "{tls_addr}"
+default: <
+        backend: <
+                # For localhost SNI, let tarweb deal with the handshaking.
+                pass: <
+                        path: "{tls_addr}"
+                >
         >
 >
 max_lifetime_ms: 10000
@@ -1276,9 +1278,11 @@ rules: <
                 >
         >
 >
-default_backend: <
-        pass: <
-                path: "{tls_addr}"
+default: <
+        backend: <
+                pass: <
+                        path: "{tls_addr}"
+                >
         >
 >
 max_lifetime_ms: 10000
@@ -1323,9 +1327,11 @@ fn e2e_no_clienthello_proxy() -> Result<()> {
     logdump.add(proxy_tarweb);
     let config = format!(
         r#"
-default_backend: <
-        proxy: <
-                addr: "{addr}"
+default: <
+        backend: <
+                proxy: <
+                        addr: "{addr}"
+                >
         >
 >
 max_lifetime_ms: 10000
@@ -1344,9 +1350,11 @@ fn e2e_no_clienthello_pass() -> Result<()> {
     logdump.add(proxy_tarweb);
     let config = format!(
         r#"
-default_backend: <
-        pass: <
-                path: "{}"
+default: <
+        backend: <
+                pass: <
+                        path: "{}"
+                >
         >
 >
 max_lifetime_ms: 10000
@@ -1366,10 +1374,12 @@ fn e2e_no_clienthello_proxy_line() -> Result<()> {
     logdump.add(proxy_tarweb);
     let config = format!(
         r#"
-default_backend: <
-        proxy: <
-                addr: "{addr}"
-                proxy_header: true
+default: <
+        backend: <
+                proxy: <
+                        addr: "{addr}"
+                        proxy_header: true
+                >
         >
 >
 max_lifetime_ms: 10000
