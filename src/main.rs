@@ -350,6 +350,8 @@ impl Connection {
         self.read_buf_pos = 0;
         self.header_buf.zeroize();
         self.header_buf.clear();
+        self.tls_rx = None;
+        self.tls_tx = None;
         self.close_after_response = false;
         self.outstanding = 0;
     }
