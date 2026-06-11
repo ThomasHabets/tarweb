@@ -2205,7 +2205,8 @@ fn is_ktls_loaded() -> Result<bool> {
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     println!(
-        "tarweb {} built with {} ({})",
+        "tarweb {} ({}) built with {} ({})",
+        env!("CARGO_PKG_VERSION"),
         env!("GIT_VERSION"),
         env!("RUSTC_VERSION"),
         env!("BUILD_PROFILE")
