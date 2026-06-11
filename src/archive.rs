@@ -12,7 +12,7 @@ fn calculate_etag(bytes: &[u8]) -> String {
     use sha3::Digest;
     let mut h = sha3::Sha3_256::new();
     h.update(bytes);
-    format!("{:#x}", h.finalize()).to_string()
+    format!("\"{:x}\"", h.finalize())
 }
 
 /// Archive consists of the entire index and the memory mapped data.
