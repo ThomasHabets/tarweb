@@ -1808,6 +1808,15 @@ fn mainloop(
             match user_data {
                 USER_DATA_LISTENER => {
                     if opt.accept_multi {
+                        // This should only happen if there was an error
+                        // accepting the connection. This is very unexpected, so
+                        // we should probably restart the webserver.
+                        //
+                        // What could be the reason?
+                        // * Running out of file descriptors? (`ENFILE`).
+                        // * `ECONNECTIONABORTED`? Is this client triggerable?
+                        // * `ENOBUFS/ENOMEM`? May be a memory leak. Restart is
+                        //   good?
                         assert!(io_uring::cqueue::more(cqe.flags()));
                     } else if pooltracker.free() > 1 {
                         ops.push(make_op_accept(opt.accept_multi));
