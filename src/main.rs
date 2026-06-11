@@ -1233,7 +1233,7 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
         let len404 = msg404.len();
         write!(
             out,
-            "HTTP/1.1 404 Not Found\r\n{common}Connection: keep-alive\r\nContent-Length: {len404}\r\n"
+            "HTTP/1.1 404 Not Found\r\n{common}Content-Length: {len404}\r\n"
         )?;
         date_header(out)?;
         write!(out, "\r\n")?;
@@ -1295,7 +1295,7 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
             len = end - start + 1;
             write!(
                 out,
-                "HTTP/1.1 206 Partial Content\r\n{common}Content-Range: bytes {start}-{end}/{}\r\n",
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\n",
                 subentry.len
             )?;
         } else {
