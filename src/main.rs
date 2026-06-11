@@ -1157,8 +1157,10 @@ fn decode_user_data(user_data: u64, result: i32, cons: &mut Connections) -> Hook
 // This function ends with an error, or a submitted read() or write().
 fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Result<()> {
     let data = &hook.con.read_buf[..hook.con.read_buf_pos];
-    let s = std::str::from_utf8(data)?;
-    trace!("Let's see if there's a request in {s:?}");
+    {
+        let s = String::from_utf8_lossy(data);
+        trace!("Let's see if there's a request in {s:?}");
+    }
     let req = Request::parse(data)?;
     let Some(req) = req else {
         if hook.con.read_buf_pos == hook.con.read_buf.len() {
