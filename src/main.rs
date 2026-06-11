@@ -1455,6 +1455,7 @@ fn handle_connection(
 fn make_op_accept(multi: bool) -> io_uring::squeue::Entry {
     if multi {
         io_uring::opcode::AcceptMulti::new(LISTEN_FIXED_FILE)
+            .allocate_file_index(true)
             .build()
             .user_data(USER_DATA_LISTENER)
     } else {
@@ -1838,16 +1839,10 @@ fn mainloop(
             match user_data {
                 USER_DATA_LISTENER => {
                     if opt.accept_multi {
-                        // This should only happen if there was an error
-                        // accepting the connection. This is very unexpected, so
-                        // we should probably restart the webserver.
-                        //
-                        // What could be the reason?
-                        // * Running out of file descriptors? (`ENFILE`).
-                        // * `ECONNECTIONABORTED`? Is this client triggerable?
-                        // * `ENOBUFS/ENOMEM`? May be a memory leak. Restart is
-                        //   good?
-                        assert!(io_uring::cqueue::more(cqe.flags()));
+                        if result >= 0 && !io_uring::cqueue::more(cqe.flags()) {
+                            debug!("accept_multi completed without MORE; re-arming");
+                            ops.push(make_op_accept(opt.accept_multi));
+                        }
                     } else if pooltracker.free() > 1 {
                         ops.push(make_op_accept(opt.accept_multi));
                     }
@@ -2042,8 +2037,8 @@ struct Opt {
     #[arg(long, default_value_t = true, value_parser = parse_bool, help = "Enable AsyncCancel2.")]
     async_cancel2: std::primitive::bool,
 
-    #[arg(long, default_value_t = false, value_parser = parse_bool, help = "Enable AcceptMulti.")]
-    accept_multi: std::primitive::bool,
+    #[arg(long, help = "Enable AcceptMulti.")]
+    accept_multi: bool,
 
     #[arg(long, short, help = "Listen address.")]
     listen: Option<String>,
