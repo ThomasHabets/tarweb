@@ -1088,7 +1088,7 @@ impl Request<'_> {
                     }
                 }
                 "if-modified-since" => {
-                    if let Ok(ims) = httpdate::parse_http_date(v.as_ref()) {
+                    if let Ok(ims) = httpdate::parse_http_date(v) {
                         debug!("If modified since: {ims:?}");
                         if_modified_since = Some(ims);
                     }
