@@ -2198,6 +2198,17 @@ fn main() -> Result<()> {
     trace!("Ring size: {}", opt.ring_size);
     trace!("Single issuer: {}", opt.single_issuer);
 
+    if opt.threads == 0 || opt.max_connections == 0 {
+        return Err(anyhow!(
+            "--threads and --max-connections must be greater than zero"
+        ));
+    }
+    if opt.tls_cert.is_some() != opt.tls_key.is_some() {
+        return Err(anyhow!(
+            "--tls-cert and --tls-key must be provided together"
+        ));
+    }
+
     if !is_ktls_loaded()? {
         return Err(Error::msg(
             "Kernel TLS does not seem to be supported. Either CONFIG_TLS=n, or you need to load the `tls` module using `modprobe tls`",
