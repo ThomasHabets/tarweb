@@ -30,6 +30,7 @@
 // * --cpu-affinity=false (not sure why, but CPU affinity hurts a lot)
 #![allow(clippy::similar_names)]
 
+use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
@@ -1058,6 +1059,7 @@ impl Request<'_> {
         let mut has_body_header = false;
         for header in lines {
             let mut kv = header.splitn(2, ':');
+            // TODO: Use cow lowercasing.
             let k = kv.next().unwrap_or("").to_lowercase();
             let v = kv.next().unwrap_or("").trim();
             match k.as_str() {
@@ -1068,8 +1070,12 @@ impl Request<'_> {
                 }
                 "transfer-encoding" => has_body_header = true,
                 "accept-encoding" => {
-                    for enc in v.split(", ") {
-                        match enc {
+                    for enc in v
+                        .split(',')
+                        // Ignore weighting.
+                        .map(|enc| enc.trim().split(';').next().unwrap_or_default())
+                    {
+                        match cow_ascii_lowercase(enc).as_ref() {
                             "gzip" => encoding_gzip = true,
                             "br" => encoding_brotli = true,
                             "zstd" => encoding_zstd = true,
@@ -2032,6 +2038,17 @@ struct Opt {
 }
 
 const TLS_STR: &[u8; 4] = b"tls\0";
+
+// Use borrow when possible, to reduce allocations.
+//
+// Lowercase is probably the more common case, but maybe we should measure that.
+fn cow_ascii_lowercase(s: &str) -> Cow<'_, str> {
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(s.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
 
 fn parse_bool(input: &str) -> Result<bool, String> {
     match input.to_lowercase().as_str() {
