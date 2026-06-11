@@ -1058,11 +1058,12 @@ impl Request<'_> {
         let mut range = None;
         let mut has_body_header = false;
         for header in lines {
-            let mut kv = header.splitn(2, ':');
-            // TODO: Use cow lowercasing.
-            let k = kv.next().unwrap_or("").to_lowercase();
-            let v = kv.next().unwrap_or("").trim();
-            match k.as_str() {
+            let Some((k, v)) = header.split_once(':') else {
+                continue;
+            };
+            let k = cow_ascii_lowercase(k.trim());
+            let v = v.trim();
+            match k.as_ref() {
                 "content-length" => {
                     // If non-zero content length, assume request body causing close
                     // after response sent.
@@ -1072,7 +1073,8 @@ impl Request<'_> {
                 "accept-encoding" => {
                     for enc in v
                         .split(',')
-                        // Ignore weighting.
+                        // Ignore weighting. We'll choose base on our
+                        // preferences, later.
                         .map(|enc| enc.trim().split(';').next().unwrap_or_default())
                     {
                         match cow_ascii_lowercase(enc).as_ref() {
@@ -1084,7 +1086,7 @@ impl Request<'_> {
                     }
                 }
                 "if-modified-since" => {
-                    if let Ok(ims) = httpdate::parse_http_date(v) {
+                    if let Ok(ims) = httpdate::parse_http_date(v.as_ref()) {
                         debug!("If modified since: {ims:?}");
                         if_modified_since = Some(ims);
                     }
@@ -1093,7 +1095,7 @@ impl Request<'_> {
                     if_none_match = Some(v.split(','));
                 }
                 "range" => {
-                    if let Some(m) = RE_RANGE.captures(v) {
+                    if let Some(m) = RE_RANGE.captures(v.as_ref()) {
                         if let (Ok(start), Ok(end)) = (m[1].parse(), m[2].parse()) {
                             range = Some((start, end));
                         }
