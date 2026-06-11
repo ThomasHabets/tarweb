@@ -262,6 +262,7 @@ fn start_server<S: Into<String>>(
     dir: &std::path::Path,
     with_tls: bool,
     with_proxyline: bool,
+    extra_args: &[&str],
 ) -> Result<(Child, std::net::SocketAddr)> {
     let name = name.into();
     make_tarfile(dir)?;
@@ -274,6 +275,7 @@ fn start_server<S: Into<String>>(
     let addr = format!("[::1]:{port}");
     let mut child = Command::new(env!("CARGO_BIN_EXE_tarweb"));
     child.args(["-v", "trace", "-l", &addr]);
+    child.args(extra_args);
     if with_tls {
         child.args([
             "--tls-cert",
@@ -340,7 +342,7 @@ fn start_router<S: Into<String>>(
 #[test]
 fn curl_http() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child_dropper, addr) = start_server("tarweb", dir.path(), false, false)?;
+    let (child_dropper, addr) = start_server("tarweb", dir.path(), false, false, &[])?;
 
     for compressed in [false, true] {
         for (path, content) in [
@@ -374,7 +376,7 @@ fn curl_http() -> Result<()> {
 #[test]
 fn request_headers_too_large_returns_431_and_closes() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child_dropper, addr) = start_server("tarweb", dir.path(), false, false)?;
+    let (child_dropper, addr) = start_server("tarweb", dir.path(), false, false, &[])?;
 
     let res = std::panic::catch_unwind(|| {
         wrapped_request_headers_too_large_returns_431_and_closes(&addr)
@@ -442,7 +444,8 @@ fn wrapped_request_headers_too_large_returns_431_and_closes(
 #[test]
 fn request_body_headers_close_after_response() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child_dropper, addr) = start_server("tarweb body header close", dir.path(), false, false)?;
+    let (child_dropper, addr) =
+        start_server("tarweb body header close", dir.path(), false, false, &[])?;
 
     let res = std::panic::catch_unwind(|| wrapped_request_body_headers_close_after_response(&addr));
 
@@ -509,9 +512,79 @@ fn wrapped_request_body_headers_close_after_response(addr: &std::net::SocketAddr
 }
 
 #[test]
+fn accept_oneshot_serves_multiple_connections() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let (child_dropper, addr) = start_server("tarweb accept multi", dir.path(), false, false, &[])?;
+
+    let res = std::panic::catch_unwind(|| wrapped_a_few_simple_requests(&addr));
+
+    let (child, stderr) = child_dropper.shutdown()?;
+    let child = child.wait_with_output()?;
+    match res {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
+            eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr?));
+            std::panic::resume_unwind(e);
+        }
+    }
+}
+
+#[test]
+fn accept_multi_serves_multiple_connections() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let (child_dropper, addr) = start_server(
+        "tarweb accept multi",
+        dir.path(),
+        false,
+        false,
+        &["--accept-multi"],
+    )?;
+
+    let res = std::panic::catch_unwind(|| wrapped_a_few_simple_requests(&addr));
+
+    let (child, stderr) = child_dropper.shutdown()?;
+    let child = child.wait_with_output()?;
+    match res {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
+            eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr?));
+            std::panic::resume_unwind(e);
+        }
+    }
+}
+
+fn wrapped_a_few_simple_requests(addr: &std::net::SocketAddr) -> Result<()> {
+    let mut streams = Vec::new();
+    for _ in 0..8 {
+        let stream = std::net::TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        streams.push(stream);
+    }
+
+    for (n, stream) in streams.iter_mut().enumerate() {
+        let path = if n % 2 == 0 { "/" } else { "/something.txt" };
+        write!(stream, "GET {path} HTTP/1.1\r\nHost: {addr}\r\n\r\n")?;
+        stream.flush()?;
+    }
+
+    for (n, stream) in streams.iter_mut().enumerate() {
+        let want = if n % 2 == 0 {
+            "hello world"
+        } else {
+            "the big brown etcetera"
+        };
+        assert_eq!(read_one_http_body(stream)?, want);
+    }
+
+    Ok(())
+}
+
+#[test]
 fn accept_encoding_q_zero_rejects_compressed_variant() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child_dropper, addr) = start_server("tarweb q zero", dir.path(), false, false)?;
+    let (child_dropper, addr) = start_server("tarweb q zero", dir.path(), false, false, &[])?;
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -559,7 +632,7 @@ fn accept_encoding_q_zero_rejects_compressed_variant() -> Result<()> {
 #[test]
 fn head_requests_send_headers_without_body() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child_dropper, addr) = start_server("tarweb head", dir.path(), false, false)?;
+    let (child_dropper, addr) = start_server("tarweb head", dir.path(), false, false, &[])?;
 
     let res = std::panic::catch_unwind(|| wrapped_head_requests_send_headers_without_body(&addr));
 
@@ -758,7 +831,8 @@ fn assert_response_header(headers: &str, name: &str, want: &str) {
 #[test]
 fn proxy_protocol_line_can_arrive_in_chunks() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child_dropper, addr) = start_server("tarweb proxy protocol", dir.path(), false, true)?;
+    let (child_dropper, addr) =
+        start_server("tarweb proxy protocol", dir.path(), false, true, &[])?;
 
     let res = std::panic::catch_unwind(|| wrapped_proxy_protocol_line_can_arrive_in_chunks(&addr));
 
@@ -832,7 +906,7 @@ fn wrapped_proxy_protocol_line_can_arrive_in_chunks(addr: &std::net::SocketAddr)
 #[test]
 fn range_nocompress() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child, addr) = start_server("tarweb", dir.path(), false, false)?;
+    let (child, addr) = start_server("tarweb", dir.path(), false, false, &[])?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -895,7 +969,7 @@ fn range_nocompress() -> Result<()> {
 #[test]
 fn range_compress() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child, addr) = start_server("tarweb", dir.path(), false, false)?;
+    let (child, addr) = start_server("tarweb", dir.path(), false, false, &[])?;
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .no_gzip()
@@ -989,7 +1063,7 @@ fn range_compress() -> Result<()> {
 #[test]
 fn some_requests() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
-    let (child_dropper, addr) = start_server("tarweb", dir.path(), false, false)?;
+    let (child_dropper, addr) = start_server("tarweb", dir.path(), false, false, &[])?;
 
     for compressed in [false, true] {
         for auto_decompress in [false, true] {
@@ -1133,15 +1207,15 @@ fn e2e(sni: &str) -> Result<()> {
     }
 
     // Start tarweb.
-    let (plain_tarweb, plain_addr) = start_server("tarweb plain", dir.path(), false, false)?;
+    let (plain_tarweb, plain_addr) = start_server("tarweb plain", dir.path(), false, false, &[])?;
     logdump.add(plain_tarweb);
     let (plainline_tarweb, plainline_addr) =
-        start_server("tarweb plain proxy line", dir.path(), false, true)?;
+        start_server("tarweb plain proxy line", dir.path(), false, true, &[])?;
     logdump.add(plainline_tarweb);
     let (tls_tarweb, tls_addr) = start_server_pass("tarweb TLS pass", dir.path(), true, false)?;
     logdump.add(tls_tarweb);
     let (tlsline_tarweb, tlsline_addr) =
-        start_server("tarweb TLS proxy line", dir.path(), true, true)?;
+        start_server("tarweb TLS proxy line", dir.path(), true, true, &[])?;
     logdump.add(tlsline_tarweb);
 
     // Set up config.
@@ -1304,7 +1378,7 @@ fn oha(secs: u32) -> Result<()> {
     }
 
     // Start tarweb.
-    let (plain_tarweb, plain_addr) = start_server("tarweb plain", dir.path(), false, false)?;
+    let (plain_tarweb, plain_addr) = start_server("tarweb plain", dir.path(), false, false, &[])?;
     logdump.add(plain_tarweb);
     let (tls_tarweb, tls_addr) = start_server_pass("tarweb TLS pass", dir.path(), true, false)?;
     logdump.add(tls_tarweb);
@@ -1372,7 +1446,7 @@ max_lifetime_ms: 10000
 fn e2e_no_clienthello_proxy() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
     let mut logdump = LogDump::new();
-    let (proxy_tarweb, addr) = start_server("tarweb plain proxy", dir.path(), false, false)?;
+    let (proxy_tarweb, addr) = start_server("tarweb plain proxy", dir.path(), false, false, &[])?;
     logdump.add(proxy_tarweb);
     let config = format!(
         r#"
@@ -1419,7 +1493,7 @@ max_lifetime_ms: 10000
 fn e2e_no_clienthello_proxy_line() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
     let mut logdump = LogDump::new();
-    let (proxy_tarweb, addr) = start_server("tarweb plain proxy", dir.path(), false, true)?;
+    let (proxy_tarweb, addr) = start_server("tarweb plain proxy", dir.path(), false, true, &[])?;
     logdump.add(proxy_tarweb);
     let config = format!(
         r#"
