@@ -2174,6 +2174,12 @@ fn is_ktls_loaded() -> Result<bool> {
 
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
+    println!(
+        "tarweb {} built with {} ({})",
+        env!("GIT_VERSION"),
+        env!("RUSTC_VERSION"),
+        env!("BUILD_PROFILE")
+    );
     let opt = Opt::parse();
 
     // This is only needed for integration tests, that get multiple crypto
