@@ -1073,12 +1073,7 @@ impl Request<'_> {
                 }
                 "transfer-encoding" => has_body_header = true,
                 "accept-encoding" => {
-                    for enc in v
-                        .split(',')
-                        // Ignore weighting. We'll choose base on our
-                        // preferences, later.
-                        .map(|enc| enc.trim().split(';').next().unwrap_or_default())
-                    {
+                    for enc in v.split(',').filter_map(acceptable_encoding) {
                         match cow_ascii_lowercase(enc).as_ref() {
                             "gzip" => encoding_gzip = true,
                             "br" => encoding_brotli = true,
@@ -1134,6 +1129,27 @@ impl Request<'_> {
             has_body_header,
         }))
     }
+}
+
+fn acceptable_encoding(enc: &str) -> Option<&str> {
+    let mut parts = enc.split(';');
+    let name = parts.next()?.trim();
+    if parts.any(|param| {
+        let Some((k, v)) = param.trim().split_once('=') else {
+            return false;
+        };
+        k.trim().eq_ignore_ascii_case("q") && qvalue_is_zero(v.trim())
+    }) {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn qvalue_is_zero(v: &str) -> bool {
+    v == "0"
+        || v.strip_prefix("0.")
+            .is_some_and(|v| v.chars().all(|c| c == '0'))
 }
 
 #[must_use]

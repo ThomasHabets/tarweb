@@ -508,6 +508,54 @@ fn wrapped_request_body_headers_close_after_response(addr: &std::net::SocketAddr
 }
 
 #[test]
+fn accept_encoding_q_zero_rejects_compressed_variant() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let (child_dropper, addr) = start_server("tarweb q zero", dir.path(), false, false)?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .no_gzip()
+        .build()?;
+
+    for header in ["gzip;q=0", "gzip; q=0.000", "br;q=0, gzip;q=0"] {
+        let resp = client
+            .get(format!("http://{addr}/compressed.txt"))
+            .header("accept-encoding", header)
+            .send()?;
+        assert_eq!(resp.status(), 200);
+        assert!(
+            resp.headers()
+                .get(reqwest::header::CONTENT_ENCODING)
+                .is_none(),
+            "unexpected compressed response for {header:?}: {:?}",
+            resp.headers()
+        );
+        assert_eq!(resp.text()?, "what's updog?");
+    }
+
+    let resp = client
+        .get(format!("http://{addr}/compressed.txt"))
+        .header("accept-encoding", "gzip;q=0.001")
+        .send()?;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .unwrap(),
+        "gzip"
+    );
+
+    let (child, stderr) = child_dropper.shutdown()?;
+    let child = child.wait_with_output()?;
+    println!(
+        "tarweb out:\n{}\nerr:\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&stderr?)
+    );
+    Ok(())
+}
+
+#[test]
 fn head_requests_send_headers_without_body() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
     let (child_dropper, addr) = start_server("tarweb head", dir.path(), false, false)?;
