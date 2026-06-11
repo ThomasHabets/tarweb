@@ -1257,16 +1257,15 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
     };
 
     // Handle cached entries.
-    let etag_match = entry
-        .etag()
-        // This clone is cheap, since it's on a `Split<>`.
-        .zip(req.if_none_match.clone())
-        .is_some_and(|(etag, mut h)| {
-            h.any(|x| {
-                let x = x.trim().strip_prefix("W/").unwrap_or(x.trim());
-                x == "*" || x == etag
-            })
-        });
+    let etag_match = req.if_none_match.clone().is_some_and(|mut h| {
+        h.any(|x| {
+            let x = x.trim().strip_prefix("W/").unwrap_or(x.trim());
+            x == "*"
+                || entry
+                    .etag()
+                    .is_some_and(|e| x == e.strip_prefix("W/").unwrap_or(e))
+        })
+    });
     if etag_match
         || (req.if_none_match.is_none()
             && req
