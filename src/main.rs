@@ -1257,13 +1257,22 @@ fn answer_req(out: &mut HeaderBuf, req: &Request, archive: &Archive) -> Result<(
     };
 
     // Handle cached entries.
-    //
-    // Stuff all the regular headers in cached entries too..
-    if req.if_modified_since.zip(entry.modified()).is_some_and(|(h,e)| *e <= h)
-            // Split can only be iterated once, hence mut here.
-            || req.if_none_match.clone().zip(entry.etag()).is_some_and(|(mut h,e)| {
-                h.any(|x| x.trim() == e)
+    let etag_match = entry
+        .etag()
+        // This clone is cheap, since it's on a `Split<>`.
+        .zip(req.if_none_match.clone())
+        .is_some_and(|(etag, mut h)| {
+            h.any(|x| {
+                let x = x.trim().strip_prefix("W/").unwrap_or(x.trim());
+                x == "*" || x == etag
             })
+        });
+    if etag_match
+        || (req.if_none_match.is_none()
+            && req
+                .if_modified_since
+                .zip(entry.modified())
+                .is_some_and(|(h, e)| *e <= h))
     {
         write!(
             out,
