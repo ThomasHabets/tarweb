@@ -344,33 +344,33 @@ fn curl_http() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
     let (child_dropper, addr) = start_server("tarweb", dir.path(), false, false, &[])?;
 
-    for compressed in [false, true] {
-        for (path, content) in [
-            ("non-existing", "Not found\n"),
-            ("", "hello world"),
-            ("index.html", "hello world"),
-            ("something.txt", "the big brown etcetera"),
-            ("compressed.txt", "what's updog?"),
-        ] {
-            let mut curl = Command::new("curl");
-            curl.args(["-sS"]);
-            if compressed {
-                curl.args(["--compressed"]);
-            }
-            let curl = curl.args([&format!("http://{addr}/{path}")]).output()?;
+    run_test(child_dropper, || {
+        for compressed in [false, true] {
+            for (path, content) in [
+                ("non-existing", "Not found\n"),
+                ("", "hello world"),
+                ("index.html", "hello world"),
+                ("something.txt", "the big brown etcetera"),
+                ("compressed.txt", "what's updog?"),
+            ] {
+                let mut curl = Command::new("curl");
+                curl.args(["-sS"]);
+                if compressed {
+                    curl.args(["--compressed"]);
+                }
+                let curl = curl.args([&format!("http://{addr}/{path}")]).output()?;
 
-            let stdout = String::from_utf8(curl.stdout)?;
-            let stderr = String::from_utf8(curl.stderr)?;
-            assert!(
-                curl.status.success(),
-                "curl failed. Stdout: \n{stdout:?}\nStderr:\n{stderr}"
-            );
-            assert_eq!(stdout, content);
+                let stdout = String::from_utf8(curl.stdout)?;
+                let stderr = String::from_utf8(curl.stderr)?;
+                assert!(
+                    curl.status.success(),
+                    "curl failed. Stdout: \n{stdout:?}\nStderr:\n{stderr}"
+                );
+                assert_eq!(stdout, content);
+            }
         }
-    }
-    let child = child_dropper.shutdown()?.0.wait_with_output()?;
-    println!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
-    Ok(())
+        Ok(())
+    })
 }
 
 #[test]
@@ -378,67 +378,50 @@ fn request_headers_too_large_returns_431_and_closes() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
     let (child_dropper, addr) = start_server("tarweb", dir.path(), false, false, &[])?;
 
-    let res = std::panic::catch_unwind(|| {
-        wrapped_request_headers_too_large_returns_431_and_closes(&addr)
-    });
+    run_test(child_dropper, || {
+        let mut stream = std::net::TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
 
-    let (child, stderr) = child_dropper.shutdown()?;
-    let child = child.wait_with_output()?;
-    match res {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
-            eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr?));
-            std::panic::resume_unwind(e);
-        }
-    }
-}
+        let cookie = "x".repeat(1200);
+        write!(
+            stream,
+            "GET / HTTP/1.1\r\nHost: {addr}\r\nCookie: {cookie}\r\n\r\n"
+        )?;
+        stream.flush()?;
 
-fn wrapped_request_headers_too_large_returns_431_and_closes(
-    addr: &std::net::SocketAddr,
-) -> Result<()> {
-    let mut stream = std::net::TcpStream::connect(addr)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        let response = {
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            response
+        };
+        let header_end = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let headers = std::str::from_utf8(&response[..header_end])?;
+        let body = std::str::from_utf8(&response[header_end..]).unwrap();
 
-    let cookie = "x".repeat(1200);
-    write!(
-        stream,
-        "GET / HTTP/1.1\r\nHost: {addr}\r\nCookie: {cookie}\r\n\r\n"
-    )?;
-    stream.flush()?;
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .and_then(|v| v.parse::<usize>().ok())
+            })
+            .ok_or_else(|| anyhow::anyhow!("missing content-length in {headers:?}"))?;
 
-    let response = {
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
-        response
-    };
-    let header_end = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-    let headers = std::str::from_utf8(&response[..header_end])?;
-    let body = std::str::from_utf8(&response[header_end..]).unwrap();
+        assert!(
+            headers.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
+            "bad response: {response:?}"
+        );
+        assert!(
+            headers.contains("\r\nConnection: close\r\n"),
+            "missing close header: {response:?}"
+        );
+        assert_eq!(
+            body, "Request Header Fields Too Large\n",
+            "bad response body: {body:?}"
+        );
+        assert_eq!(body.len(), content_length);
 
-    let content_length = headers
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("Content-Length: ")
-                .and_then(|v| v.parse::<usize>().ok())
-        })
-        .ok_or_else(|| anyhow::anyhow!("missing content-length in {headers:?}"))?;
-
-    assert!(
-        headers.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"),
-        "bad response: {response:?}"
-    );
-    assert!(
-        headers.contains("\r\nConnection: close\r\n"),
-        "missing close header: {response:?}"
-    );
-    assert_eq!(
-        body, "Request Header Fields Too Large\n",
-        "bad response body: {body:?}"
-    );
-    assert_eq!(body.len(), content_length);
-
-    Ok(())
+        Ok(())
+    })
 }
 
 #[test]
@@ -446,88 +429,160 @@ fn request_body_headers_close_after_response() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
     let (child_dropper, addr) =
         start_server("tarweb body header close", dir.path(), false, false, &[])?;
+    run_test(child_dropper, || {
+        for extra in [
+            "Content-Length: 4\r\n\r\nbody",
+            "Content-Length: nope\r\n\r\n",
+            "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        ] {
+            let mut stream = std::net::TcpStream::connect(addr)?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+            write!(stream, "GET / HTTP/1.1\r\nHost: {addr}\r\n{extra}")?;
+            stream.flush()?;
 
-    let res = std::panic::catch_unwind(|| wrapped_request_body_headers_close_after_response(&addr));
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            let header_end = response
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .ok_or_else(|| {
+                    anyhow::anyhow!("missing response header terminator: {response:?}")
+                })?
+                + 4;
+            let headers = std::str::from_utf8(&response[..header_end])?;
+            let body = std::str::from_utf8(&response[header_end..])?;
+
+            assert!(
+                headers.starts_with("HTTP/1.1 200 OK\r\n"),
+                "bad response for {extra:?}: {response:?}"
+            );
+            assert_response_header(headers, "Connection", "close");
+            assert_eq!(body, "hello world");
+        }
+
+        let mut stream = std::net::TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        write!(
+            stream,
+            "GET / HTTP/1.1\r\nHost: {addr}\r\nContent-Length:0\r\n\r\n"
+        )?;
+        stream.flush()?;
+        let body = read_one_http_body(&mut stream)?;
+        assert_eq!(body, "hello world");
+
+        write!(
+            stream,
+            "GET /something.txt HTTP/1.1\r\nHost: {addr}\r\n\r\n"
+        )?;
+        stream.flush()?;
+        let body = read_one_http_body(&mut stream)?;
+        assert_eq!(body, "the big brown etcetera");
+
+        Ok(())
+    })
+}
+
+#[test]
+fn accept_oneshot_stops_accepting_when_pool_is_exhausted() -> Result<()> {
+    let dir = tempfile::TempDir::new()?;
+    let (child_dropper, addr) = start_server(
+        "tarweb accept multi exhausted",
+        dir.as_ref(),
+        false,
+        false,
+        &["--max-connections", "1"],
+    )?;
+    run_test(child_dropper, || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Server will be busy with this first request.
+        let mut holder = std::net::TcpStream::connect(addr)?;
+        holder.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        write!(
+            holder,
+            "GET / HTTP/1.1\r\nX-Test: 1\r\nHost: {addr}\r\n\r\n"
+        )?;
+        holder.flush()?;
+
+        // This request is blocked by the first request.
+        let mut queued = std::net::TcpStream::connect(addr)?;
+        queued.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
+        write!(
+            queued,
+            "GET / HTTP/1.1\r\nX-Test: 2\r\nHost: {addr}\r\n\r\n"
+        )?;
+        queued.flush()?;
+
+        // Await a reply on the second request.
+        let mut probe = [0u8; 1];
+        match queued.peek(&mut probe) {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Ok(0) => {
+                return Err(anyhow::anyhow!(
+                    "queued connection closed before pool freed"
+                ));
+            }
+            Ok(n) => {
+                return Err(anyhow::anyhow!(
+                    "queued connection received {n} bytes while pool was exhausted"
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        // Finish the first request. We need to drop the holder because by default
+        // in HTTP/1.1 we keep-alive.
+        assert_eq!(read_one_http_body(&mut holder)?, "hello world");
+        drop(holder);
+
+        queued.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        assert_eq!(read_one_http_body(&mut queued)?, "hello world");
+        drop(queued);
+
+        // Do a third request, just for fun.
+        let mut third = std::net::TcpStream::connect(addr)?;
+        third.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
+        write!(third, "GET / HTTP/1.1\r\nX-Test: 3\r\nHost: {addr}\r\n\r\n")?;
+        third.flush()?;
+        assert_eq!(read_one_http_body(&mut third)?, "hello world");
+
+        Ok(())
+    })
+}
+
+fn run_test(
+    child_dropper: Child,
+    f: impl FnOnce() -> Result<()> + std::panic::UnwindSafe,
+) -> Result<()> {
+    let res = std::panic::catch_unwind(f);
 
     let (child, stderr) = child_dropper.shutdown()?;
     let child = child.wait_with_output()?;
+    let stderr = stderr?;
     match res {
-        Ok(o) => o,
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            eprintln!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
+            eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr));
+            Err(e)
+        }
         Err(e) => {
             eprintln!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
-            eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr?));
+            eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr));
             std::panic::resume_unwind(e);
         }
     }
-}
-
-fn wrapped_request_body_headers_close_after_response(addr: &std::net::SocketAddr) -> Result<()> {
-    for extra in [
-        "Content-Length: 4\r\n\r\nbody",
-        "Content-Length: nope\r\n\r\n",
-        "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
-    ] {
-        let mut stream = std::net::TcpStream::connect(addr)?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-        write!(stream, "GET / HTTP/1.1\r\nHost: {addr}\r\n{extra}")?;
-        stream.flush()?;
-
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
-        let header_end = response
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .ok_or_else(|| anyhow::anyhow!("missing response header terminator: {response:?}"))?
-            + 4;
-        let headers = std::str::from_utf8(&response[..header_end])?;
-        let body = std::str::from_utf8(&response[header_end..])?;
-
-        assert!(
-            headers.starts_with("HTTP/1.1 200 OK\r\n"),
-            "bad response for {extra:?}: {response:?}"
-        );
-        assert_response_header(headers, "Connection", "close");
-        assert_eq!(body, "hello world");
-    }
-
-    let mut stream = std::net::TcpStream::connect(addr)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-    write!(
-        stream,
-        "GET / HTTP/1.1\r\nHost: {addr}\r\nContent-Length:0\r\n\r\n"
-    )?;
-    stream.flush()?;
-    let body = read_one_http_body(&mut stream)?;
-    assert_eq!(body, "hello world");
-
-    write!(
-        stream,
-        "GET /something.txt HTTP/1.1\r\nHost: {addr}\r\n\r\n"
-    )?;
-    stream.flush()?;
-    let body = read_one_http_body(&mut stream)?;
-    assert_eq!(body, "the big brown etcetera");
-
-    Ok(())
 }
 
 #[test]
 fn accept_oneshot_serves_multiple_connections() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
     let (child_dropper, addr) = start_server("tarweb accept multi", dir.path(), false, false, &[])?;
-
-    let res = std::panic::catch_unwind(|| wrapped_a_few_simple_requests(&addr));
-
-    let (child, stderr) = child_dropper.shutdown()?;
-    let child = child.wait_with_output()?;
-    match res {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
-            eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr?));
-            std::panic::resume_unwind(e);
-        }
-    }
+    run_test(child_dropper, || wrapped_a_few_simple_requests(&addr))
 }
 
 #[test]
@@ -540,19 +595,7 @@ fn accept_multi_serves_multiple_connections() -> Result<()> {
         false,
         &["--accept-multi"],
     )?;
-
-    let res = std::panic::catch_unwind(|| wrapped_a_few_simple_requests(&addr));
-
-    let (child, stderr) = child_dropper.shutdown()?;
-    let child = child.wait_with_output()?;
-    match res {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
-            eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr?));
-            std::panic::resume_unwind(e);
-        }
-    }
+    run_test(child_dropper, || wrapped_a_few_simple_requests(&addr))
 }
 
 fn wrapped_a_few_simple_requests(addr: &std::net::SocketAddr) -> Result<()> {
@@ -585,48 +628,41 @@ fn wrapped_a_few_simple_requests(addr: &std::net::SocketAddr) -> Result<()> {
 fn accept_encoding_q_zero_rejects_compressed_variant() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
     let (child_dropper, addr) = start_server("tarweb q zero", dir.path(), false, false, &[])?;
+    run_test(child_dropper, || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .no_gzip()
+            .build()?;
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .no_gzip()
-        .build()?;
+        for header in ["gzip;q=0", "gzip; q=0.000", "br;q=0, gzip;q=0"] {
+            let resp = client
+                .get(format!("http://{addr}/compressed.txt"))
+                .header("accept-encoding", header)
+                .send()?;
+            assert_eq!(resp.status(), 200);
+            assert!(
+                resp.headers()
+                    .get(reqwest::header::CONTENT_ENCODING)
+                    .is_none(),
+                "unexpected compressed response for {header:?}: {:?}",
+                resp.headers()
+            );
+            assert_eq!(resp.text()?, "what's updog?");
+        }
 
-    for header in ["gzip;q=0", "gzip; q=0.000", "br;q=0, gzip;q=0"] {
         let resp = client
             .get(format!("http://{addr}/compressed.txt"))
-            .header("accept-encoding", header)
+            .header("accept-encoding", "gzip;q=0.001")
             .send()?;
         assert_eq!(resp.status(), 200);
-        assert!(
+        assert_eq!(
             resp.headers()
                 .get(reqwest::header::CONTENT_ENCODING)
-                .is_none(),
-            "unexpected compressed response for {header:?}: {:?}",
-            resp.headers()
+                .unwrap(),
+            "gzip"
         );
-        assert_eq!(resp.text()?, "what's updog?");
-    }
-
-    let resp = client
-        .get(format!("http://{addr}/compressed.txt"))
-        .header("accept-encoding", "gzip;q=0.001")
-        .send()?;
-    assert_eq!(resp.status(), 200);
-    assert_eq!(
-        resp.headers()
-            .get(reqwest::header::CONTENT_ENCODING)
-            .unwrap(),
-        "gzip"
-    );
-
-    let (child, stderr) = child_dropper.shutdown()?;
-    let child = child.wait_with_output()?;
-    println!(
-        "tarweb out:\n{}\nerr:\n{}",
-        String::from_utf8_lossy(&child.stdout),
-        String::from_utf8_lossy(&stderr?)
-    );
-    Ok(())
+        Ok(())
+    })
 }
 
 #[test]
@@ -634,103 +670,90 @@ fn head_requests_send_headers_without_body() -> Result<()> {
     let dir = tempfile::TempDir::new()?;
     let (child_dropper, addr) = start_server("tarweb head", dir.path(), false, false, &[])?;
 
-    let res = std::panic::catch_unwind(|| wrapped_head_requests_send_headers_without_body(&addr));
+    run_test(child_dropper, || {
+        let mut stream = std::net::TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        let mut reader = BufferedHttpReader::default();
 
-    let (child, stderr) = child_dropper.shutdown()?;
-    let child = child.wait_with_output()?;
-    match res {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
-            eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr?));
-            std::panic::resume_unwind(e);
-        }
-    }
-}
+        write!(stream, "HEAD / HTTP/1.1\r\nHost: {addr}\r\n\r\n")?;
+        stream.flush()?;
+        let (headers, body) = reader.read_response(&mut stream, false)?;
+        assert!(
+            headers.starts_with("HTTP/1.1 200 OK\r\n"),
+            "bad HEAD response: {headers:?}"
+        );
+        assert_response_header(&headers, "Content-Length", "11");
+        assert!(body.is_empty(), "HEAD response included a body: {body:?}");
 
-fn wrapped_head_requests_send_headers_without_body(addr: &std::net::SocketAddr) -> Result<()> {
-    let mut stream = std::net::TcpStream::connect(addr)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-    let mut reader = BufferedHttpReader::default();
+        write!(
+            stream,
+            "GET /something.txt HTTP/1.1\r\nHost: {addr}\r\n\r\n"
+        )?;
+        stream.flush()?;
+        let (headers, body) = reader.read_response(&mut stream, true)?;
+        assert!(
+            headers.starts_with("HTTP/1.1 200 OK\r\n"),
+            "bad response after HEAD: {headers:?}"
+        );
+        assert_eq!(std::str::from_utf8(&body)?, "the big brown etcetera");
 
-    write!(stream, "HEAD / HTTP/1.1\r\nHost: {addr}\r\n\r\n")?;
-    stream.flush()?;
-    let (headers, body) = reader.read_response(&mut stream, false)?;
-    assert!(
-        headers.starts_with("HTTP/1.1 200 OK\r\n"),
-        "bad HEAD response: {headers:?}"
-    );
-    assert_response_header(&headers, "Content-Length", "11");
-    assert!(body.is_empty(), "HEAD response included a body: {body:?}");
+        let mut stream = std::net::TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        let mut reader = BufferedHttpReader::default();
+        write!(
+            stream,
+            "HEAD /does-not-exist HTTP/1.1\r\nHost: {addr}\r\n\r\n"
+        )?;
+        stream.flush()?;
+        let (headers, body) = reader.read_response(&mut stream, false)?;
+        assert!(
+            headers.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "bad HEAD 404 response: {headers:?}"
+        );
+        assert_response_header(&headers, "Content-Length", "10");
+        assert!(
+            body.is_empty(),
+            "HEAD 404 response included a body: {body:?}"
+        );
+        write!(stream, "GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n")?;
+        stream.flush()?;
+        let (headers, body) = reader.read_response(&mut stream, true)?;
+        assert!(
+            headers.starts_with("HTTP/1.1 200 OK\r\n"),
+            "bad response after HEAD 404: {headers:?}"
+        );
+        assert_eq!(std::str::from_utf8(&body)?, "hello world");
 
-    write!(
-        stream,
-        "GET /something.txt HTTP/1.1\r\nHost: {addr}\r\n\r\n"
-    )?;
-    stream.flush()?;
-    let (headers, body) = reader.read_response(&mut stream, true)?;
-    assert!(
-        headers.starts_with("HTTP/1.1 200 OK\r\n"),
-        "bad response after HEAD: {headers:?}"
-    );
-    assert_eq!(std::str::from_utf8(&body)?, "the big brown etcetera");
+        let mut stream = std::net::TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        let mut reader = BufferedHttpReader::default();
+        write!(
+            stream,
+            "HEAD / HTTP/1.1\r\nHost: {addr}\r\nRange: bytes=0-1\r\n\r\n"
+        )?;
+        stream.flush()?;
+        let (headers, body) = reader.read_response(&mut stream, false)?;
+        assert!(
+            headers.starts_with("HTTP/1.1 206 Partial Content\r\n"),
+            "bad HEAD range response: {headers:?}"
+        );
+        assert_response_header(&headers, "Content-Length", "2");
+        assert_response_header(&headers, "Content-Range", "bytes 0-1/11");
+        assert!(
+            body.is_empty(),
+            "HEAD range response included a body: {body:?}"
+        );
+        write!(stream, "GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n")?;
+        stream.flush()?;
+        let (headers, body) = reader.read_response(&mut stream, true)?;
+        assert!(
+            headers.starts_with("HTTP/1.1 200 OK\r\n"),
+            "bad response after HEAD range: {headers:?}"
+        );
+        assert_eq!(std::str::from_utf8(&body)?, "hello world");
 
-    let mut stream = std::net::TcpStream::connect(addr)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-    let mut reader = BufferedHttpReader::default();
-    write!(
-        stream,
-        "HEAD /does-not-exist HTTP/1.1\r\nHost: {addr}\r\n\r\n"
-    )?;
-    stream.flush()?;
-    let (headers, body) = reader.read_response(&mut stream, false)?;
-    assert!(
-        headers.starts_with("HTTP/1.1 404 Not Found\r\n"),
-        "bad HEAD 404 response: {headers:?}"
-    );
-    assert_response_header(&headers, "Content-Length", "10");
-    assert!(
-        body.is_empty(),
-        "HEAD 404 response included a body: {body:?}"
-    );
-    write!(stream, "GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n")?;
-    stream.flush()?;
-    let (headers, body) = reader.read_response(&mut stream, true)?;
-    assert!(
-        headers.starts_with("HTTP/1.1 200 OK\r\n"),
-        "bad response after HEAD 404: {headers:?}"
-    );
-    assert_eq!(std::str::from_utf8(&body)?, "hello world");
-
-    let mut stream = std::net::TcpStream::connect(addr)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-    let mut reader = BufferedHttpReader::default();
-    write!(
-        stream,
-        "HEAD / HTTP/1.1\r\nHost: {addr}\r\nRange: bytes=0-1\r\n\r\n"
-    )?;
-    stream.flush()?;
-    let (headers, body) = reader.read_response(&mut stream, false)?;
-    assert!(
-        headers.starts_with("HTTP/1.1 206 Partial Content\r\n"),
-        "bad HEAD range response: {headers:?}"
-    );
-    assert_response_header(&headers, "Content-Length", "2");
-    assert_response_header(&headers, "Content-Range", "bytes 0-1/11");
-    assert!(
-        body.is_empty(),
-        "HEAD range response included a body: {body:?}"
-    );
-    write!(stream, "GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n")?;
-    stream.flush()?;
-    let (headers, body) = reader.read_response(&mut stream, true)?;
-    assert!(
-        headers.starts_with("HTTP/1.1 200 OK\r\n"),
-        "bad response after HEAD range: {headers:?}"
-    );
-    assert_eq!(std::str::from_utf8(&body)?, "hello world");
-
-    Ok(())
+        Ok(())
+    })
 }
 
 fn read_one_http_body(stream: &mut std::net::TcpStream) -> Result<String> {
@@ -834,73 +857,60 @@ fn proxy_protocol_line_can_arrive_in_chunks() -> Result<()> {
     let (child_dropper, addr) =
         start_server("tarweb proxy protocol", dir.path(), false, true, &[])?;
 
-    let res = std::panic::catch_unwind(|| wrapped_proxy_protocol_line_can_arrive_in_chunks(&addr));
+    run_test(child_dropper, || {
+        let mut stream = std::net::TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
 
-    let (child, stderr) = child_dropper.shutdown()?;
-    let child = child.wait_with_output()?;
-    match res {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("tarweb out:\n{}", String::from_utf8_lossy(&child.stdout));
-            eprintln!("tarweb err:\n{}", String::from_utf8_lossy(&stderr?));
-            std::panic::resume_unwind(e);
+        for chunk in ["PROXY TCP4 ", "192.0.2.10 198.51.100.20 ", "12345 80\r\n"] {
+            stream.write_all(chunk.as_bytes())?;
+            stream.flush()?;
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-    }
-}
-
-fn wrapped_proxy_protocol_line_can_arrive_in_chunks(addr: &std::net::SocketAddr) -> Result<()> {
-    let mut stream = std::net::TcpStream::connect(addr)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-
-    for chunk in ["PROXY TCP4 ", "192.0.2.10 198.51.100.20 ", "12345 80\r\n"] {
-        stream.write_all(chunk.as_bytes())?;
+        write!(stream, "GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n")?;
         stream.flush()?;
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    write!(stream, "GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n")?;
-    stream.flush()?;
 
-    let mut response = Vec::new();
-    let header_end = loop {
-        let mut buf = [0u8; 1024];
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            return Err(anyhow::anyhow!(
-                "connection closed before response headers: {response:?}"
-            ));
+        let mut response = Vec::new();
+        let header_end = loop {
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf)?;
+            if n == 0 {
+                return Err(anyhow::anyhow!(
+                    "connection closed before response headers: {response:?}"
+                ));
+            }
+            response.extend_from_slice(&buf[..n]);
+            if let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&response[..header_end])?.to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .and_then(|v| v.parse::<usize>().ok())
+            })
+            .ok_or_else(|| anyhow::anyhow!("missing content-length in {headers:?}"))?;
+        while response.len() - header_end < content_length {
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf)?;
+            if n == 0 {
+                return Err(anyhow::anyhow!(
+                    "connection closed before response body: {response:?}"
+                ));
+            }
+            response.extend_from_slice(&buf[..n]);
         }
-        response.extend_from_slice(&buf[..n]);
-        if let Some(end) = response.windows(4).position(|w| w == b"\r\n\r\n") {
-            break end + 4;
-        }
-    };
-    let headers = std::str::from_utf8(&response[..header_end])?.to_string();
-    let content_length = headers
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("Content-Length: ")
-                .and_then(|v| v.parse::<usize>().ok())
-        })
-        .ok_or_else(|| anyhow::anyhow!("missing content-length in {headers:?}"))?;
-    while response.len() - header_end < content_length {
-        let mut buf = [0u8; 1024];
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            return Err(anyhow::anyhow!(
-                "connection closed before response body: {response:?}"
-            ));
-        }
-        response.extend_from_slice(&buf[..n]);
-    }
-    let body = std::str::from_utf8(&response[header_end..header_end + content_length])?;
+        let body = std::str::from_utf8(&response[header_end..header_end + content_length])?;
 
-    assert!(
-        headers.starts_with("HTTP/1.1 200 OK\r\n"),
-        "bad response: {response:?}"
-    );
-    assert_eq!(body, "hello world");
+        assert!(
+            headers.starts_with("HTTP/1.1 200 OK\r\n"),
+            "bad response: {response:?}"
+        );
+        assert_eq!(body, "hello world");
 
-    Ok(())
+        Ok(())
+    })
 }
 
 #[test]

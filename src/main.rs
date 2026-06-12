@@ -1838,13 +1838,18 @@ fn mainloop(
             //println!("Got some user_data: {user_data:?} {result:?}");
             match user_data {
                 USER_DATA_LISTENER => {
+                    trace!("accept()/acceptmulti() completed with {result}");
                     if opt.accept_multi {
                         if result >= 0 && !io_uring::cqueue::more(cqe.flags()) {
                             debug!("accept_multi completed without MORE; re-arming");
                             ops.push(make_op_accept(opt.accept_multi));
                         }
                     } else if pooltracker.free() > 1 {
+                        trace!("Pool not full. Issuing a new accept()");
+                        assert!(!opt.accept_multi);
                         ops.push(make_op_accept(opt.accept_multi));
+                    } else {
+                        trace!("Pool full. Not issuing a new accept()");
                     }
                     if result < 0 {
                         warn!(
@@ -1880,10 +1885,13 @@ fn mainloop(
                 USER_DATA_PASSED_FD => {
                     trace!("Incoming passfd message with code {result}");
                     if pooltracker.free() > 1 {
+                        trace!("Pool not full. Issuing a new recvmsg");
                         // Issue a new receive.
                         ops.push(make_op_recvmsg_fixed(std::ptr::from_mut::<libc::msghdr>(
                             passfd_msghdr,
                         )));
+                    } else {
+                        trace!("Pool full. Not issuing a new recvmsg");
                     }
                     match result.cmp(&0) {
                         // If Equal, that should certainly be because SNI router
@@ -1937,6 +1945,7 @@ fn mainloop(
                         hook.con.close(opt.async_cancel2, &mut ops);
                     }
                     if was_full && !pooltracker.is_empty() {
+                        trace!("Pool no longer. Issuing a new accept() or recvmsg()");
                         if opt.listen.is_some() {
                             // TODO: no good way to prevent overflow with multi
                             // accept.
