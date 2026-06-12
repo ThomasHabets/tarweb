@@ -1054,18 +1054,42 @@ impl Request<'_> {
 
         let mut lines = s.split("\r\n");
         let mut first = lines.next().ok_or(Error::msg("no first line"))?.split(' ');
+
+        // Default connection settings.
         let mut encoding_gzip = false;
         let mut encoding_brotli = false;
         let mut encoding_zstd = false;
-        let mut keepalive = true;
         let mut if_modified_since = None;
         let mut if_none_match = None;
         let mut range = None;
         let mut has_body_header = false;
+
+        // Parse first line.
+        let method = first.next().ok_or(Error::msg("no method"))?;
+        let head = match method {
+            "GET" => false,
+            "HEAD" => true,
+            _ => {
+                return Err(Error::msg(format!("Invalid HTTP method {method}")));
+            }
+        };
+        let path = first.next().ok_or(Error::msg("no path"))?;
+        let path = path.split_once('?').map_or(path, |(path, _)| path);
+
+        let version = first.next().ok_or(Error::msg("no version"))?;
+        let mut keepalive = version == "HTTP/1.1";
+        if let Some(x) = first.next() {
+            return Err(Error::msg(format!("trailing garbage on first line: {x:?}")));
+        }
+
+        // Do rest of headers.
         for header in lines {
             let Some((k, v)) = header.split_once(':') else {
                 continue;
             };
+
+            // TODO: we can avoid an allocation here on mixed case headers by
+            // doing `.eq_ignore_ascii_case()` instead.
             let k = cow_ascii_lowercase(k.trim());
             let v = v.trim();
             match k.as_ref() {
@@ -1109,17 +1133,6 @@ impl Request<'_> {
                 _ => {}
             }
         }
-        let method = first.next().ok_or(Error::msg("no method"))?;
-        let head = match method {
-            "GET" => false,
-            "HEAD" => true,
-            _ => {
-                return Err(Error::msg(format!("Invalid HTTP method {method}")));
-            }
-        };
-        let path = first.next().ok_or(Error::msg("no path"))?;
-        let path = path.split_once('?').map_or(path, |(path, _)| path);
-        let _version = first.next().ok_or(Error::msg("no version"))?;
 
         // Headers ignored.
         Ok(Some(Request {
@@ -1952,7 +1965,7 @@ fn mainloop(
                         hook.con.close(opt.async_cancel2, &mut ops);
                     }
                     if was_full && !pooltracker.is_empty() {
-                        trace!("Pool no longer. Issuing a new accept() or recvmsg()");
+                        trace!("Pool no longer full. Issuing a new accept() or recvmsg()");
                         if opt.listen.is_some() {
                             // TODO: no good way to prevent overflow with multi
                             // accept.

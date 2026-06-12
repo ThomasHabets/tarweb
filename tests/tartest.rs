@@ -546,9 +546,21 @@ fn accept_oneshot_stops_accepting_when_pool_is_exhausted() -> Result<()> {
         // Do a third request to confirm `queued` closed.
         let mut third = std::net::TcpStream::connect(addr)?;
         third.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
-        write!(third, "GET / HTTP/1.1\r\nX-Test: 3\r\nHost: {addr}\r\n\r\n")?;
+        write!(third, "GET / HTTP/1.0\r\nX-Test: 3\r\nHost: {addr}\r\n\r\n")?;
         third.flush()?;
         assert_eq!(read_one_http_body(&mut third)?, "hello world");
+        // Not dropping `third` because it uses HTTP/1.0 which has keepalive off
+        // by default.
+
+        // Do a fourth request to confirm `third` closed.
+        let mut fourth = std::net::TcpStream::connect(addr)?;
+        fourth.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
+        write!(
+            fourth,
+            "GET / HTTP/1.1\r\nX-Test: 4\r\nHost: {addr}\r\n\r\n"
+        )?;
+        fourth.flush()?;
+        assert_eq!(read_one_http_body(&mut fourth)?, "hello world");
 
         Ok(())
     })
