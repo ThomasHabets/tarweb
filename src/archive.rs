@@ -133,7 +133,7 @@ impl Archive {
             };
             if let Some(dir) = name.strip_suffix("/index.html") {
                 trace!("Inserting index for dir {dir}");
-                content.insert(dir.to_string(), entry.clone());
+                content.insert(dir.to_owned() + "/", entry.clone());
             }
             if name == "index.html" {
                 trace!("Inserting index for root");
