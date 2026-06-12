@@ -23,7 +23,7 @@ jobs:
     - name: Install stuff
       run: sudo apt-get install libseccomp-dev protobuf-compiler libprotobuf-dev
     - name: Cargo install
-      run: cargo install cargo-deny oha tickbox sni-router
+      run: cargo install --locked cargo-deny oha tickbox sni-router
     - name: Build
       run: cargo build --verbose
     - name: Run tests
