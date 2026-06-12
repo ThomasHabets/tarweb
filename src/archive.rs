@@ -95,12 +95,16 @@ impl Archive {
         info!("Indexing…");
         for e in archive.entries()? {
             let e = e?;
-            if !matches![e.header().entry_type(), tar::EntryType::Regular] {
-                continue;
-            }
+
             let name = e.path()?;
             let name = name.to_string_lossy();
             let name = name.strip_prefix(prefix).unwrap_or(name.as_ref());
+
+            let etype = e.header().entry_type();
+            if tar::EntryType::Regular != etype {
+                trace!("Ignored tar entry type {etype:?}: {name}");
+                continue;
+            }
             let modified = e
                 .header()
                 .mtime()
@@ -114,21 +118,28 @@ impl Archive {
                     httpdate::fmt_http_date(m)
                 )?;
             }
-            content.insert(
-                name.to_string(),
-                ArchiveEntry {
-                    plain: ArchiveRange {
-                        pos: e.raw_file_position().try_into()?,
-                        len: e.size().try_into()?,
-                    },
-                    brotli: None,
-                    gzip: None,
-                    zstd: None,
-                    modified,
-                    etag: None, // Set later.
-                    headers,
+
+            let entry = ArchiveEntry {
+                plain: ArchiveRange {
+                    pos: e.raw_file_position().try_into()?,
+                    len: e.size().try_into()?,
                 },
-            );
+                brotli: None,
+                gzip: None,
+                zstd: None,
+                modified,
+                etag: None, // Set later.
+                headers,
+            };
+            if let Some(dir) = name.strip_suffix("/index.html") {
+                trace!("Inserting index for dir {dir}");
+                content.insert(dir.to_string(), entry.clone());
+            }
+            if name == "index.html" {
+                trace!("Inserting index for root");
+                content.insert("".to_string(), entry.clone());
+            }
+            content.insert(name.to_string(), entry);
         }
         if etags {
             info!("Hashing etags…");
@@ -166,23 +177,13 @@ impl Archive {
     /// Get the `ArchiveEntry` for a given filename.
     #[must_use]
     pub fn entry(&self, filename: &str) -> Option<&ArchiveEntry> {
-        use std::borrow::Cow;
         if filename.is_empty() {
             return None;
         }
         // Strip initial slash.
         let filename = filename.strip_prefix("/").unwrap_or(filename);
-
-        // Add index.html to directory paths.
-        let filename = if filename.is_empty() || filename.ends_with('/') {
-            // TODO: fix this allocation.
-            Cow::Owned(filename.to_owned() + "index.html")
-        } else {
-            Cow::Borrowed(filename)
-        };
-
         trace!("Looking up {filename}");
-        self.content.get(filename.as_ref())
+        self.content.get(filename)
     }
 
     /// Get a slice from the mapped memory area.
