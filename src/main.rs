@@ -30,7 +30,6 @@
 // * --cpu-affinity=false (not sure why, but CPU affinity hurts a lot)
 #![allow(clippy::similar_names)]
 
-use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
@@ -1165,47 +1164,45 @@ impl Request<'_> {
 
             // TODO: we can avoid an allocation here on mixed case headers by
             // doing `.eq_ignore_ascii_case()` instead.
-            let k = cow_ascii_lowercase(k.trim());
+            let k = k.trim();
             let v = v.trim();
-            match k.as_ref() {
-                "content-length" => {
-                    // If non-zero content length, assume request body causing close
-                    // after response sent.
-                    has_body_header |= v.parse::<u64>().map_or(true, |len| len > 0);
-                }
-                "transfer-encoding" => has_body_header = true,
-                "connection" => {
-                    keepalive = v.eq_ignore_ascii_case("keep-alive");
-                }
-                "accept-encoding" => {
-                    for enc in v.split(',').filter_map(acceptable_encoding) {
-                        match cow_ascii_lowercase(enc).as_ref() {
-                            "gzip" => encoding_gzip = true,
-                            "br" => encoding_brotli = true,
-                            "zstd" => encoding_zstd = true,
-                            _ => {}
-                        }
-                    }
-                }
-                "if-modified-since" => {
-                    if let Ok(ims) = httpdate::parse_http_date(v) {
-                        debug!("If modified since: {ims:?}");
-                        if_modified_since = Some(ims);
-                    }
-                }
-                "if-none-match" => {
-                    if_none_match = Some(v.split(','));
-                }
-                "range" => {
-                    if let Some(m) = RE_RANGE.captures(v.as_ref()) {
-                        if let (Ok(start), Ok(end)) = (m[1].parse(), m[2].parse()) {
-                            range = Some((start, end));
-                        }
+            if k.eq_ignore_ascii_case("content-length") {
+                // If non-zero content length, assume request body causing close
+                // after response sent.
+                has_body_header |= v.parse::<u64>().map_or(true, |len| len > 0);
+            } else if k.eq_ignore_ascii_case("transfer-encoding") {
+                has_body_header = true
+            } else if k.eq_ignore_ascii_case("connection") {
+                keepalive = v.eq_ignore_ascii_case("keep-alive");
+            } else if k.eq_ignore_ascii_case("accept-encoding") {
+                for enc in v.split(',').filter_map(acceptable_encoding) {
+                    if enc.eq_ignore_ascii_case("gzip") {
+                        encoding_gzip = true;
+                    } else if enc.eq_ignore_ascii_case("br") {
+                        encoding_brotli = true;
+                    } else if enc.eq_ignore_ascii_case("zstd") {
+                        encoding_zstd = true;
                     } else {
-                        debug!("Invalid range header: {v:?}");
+                        trace!("Unknown accept-encoding {enc}");
                     }
                 }
-                _ => {}
+            } else if k.eq_ignore_ascii_case("if-modified-since") {
+                if let Ok(ims) = httpdate::parse_http_date(v) {
+                    debug!("If modified since: {ims:?}");
+                    if_modified_since = Some(ims);
+                }
+            } else if k.eq_ignore_ascii_case("if-none-match") {
+                if_none_match = Some(v.split(','));
+            } else if k.eq_ignore_ascii_case("range") {
+                if let Some(m) = RE_RANGE.captures(v.as_ref()) {
+                    if let (Ok(start), Ok(end)) = (m[1].parse(), m[2].parse()) {
+                        range = Some((start, end));
+                    }
+                } else {
+                    debug!("Invalid range header: {v:?}");
+                }
+            } else {
+                // ignore header.
             }
         }
 
@@ -2183,17 +2180,6 @@ struct Opt {
 }
 
 const TLS_STR: &[u8; 4] = b"tls\0";
-
-// Use borrow when possible, to reduce allocations.
-//
-// Lowercase is probably the more common case, but maybe we should measure that.
-fn cow_ascii_lowercase(s: &str) -> Cow<'_, str> {
-    if s.bytes().any(|b| b.is_ascii_uppercase()) {
-        Cow::Owned(s.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(s)
-    }
-}
 
 fn parse_bool(input: &str) -> Result<bool, String> {
     match input.to_lowercase().as_str() {
