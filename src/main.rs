@@ -55,6 +55,78 @@ mod privs;
 
 type FixedFile = io_uring::types::Fixed;
 
+#[cfg(not(feature = "alloc-tripwire"))]
+mod allocation_tripwire {
+    pub(crate) fn disable_allocs() {}
+}
+
+#[cfg(feature = "alloc-tripwire")]
+mod allocation_tripwire {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::backtrace::Backtrace;
+    use std::cell::Cell;
+    use std::sync::LazyLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct GuardedAlloc;
+
+    static ALLOC_ALLOWED: AtomicBool = AtomicBool::new(true);
+
+    pub(crate) fn disable_allocs() {
+        ALLOC_ALLOWED.store(false, Ordering::SeqCst);
+    }
+
+    thread_local! {
+        static IN_ALLOC_HOOK: Cell<bool> = const { Cell::new(false) };
+    }
+
+    unsafe impl GlobalAlloc for GuardedAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            if !ALLOC_ALLOWED.load(Ordering::SeqCst) {
+                IN_ALLOC_HOOK.with(|in_hook| {
+                    ALLOC_ALLOWED.store(true, Ordering::SeqCst);
+                    if !in_hook.get() {
+                        in_hook.set(true);
+                        eprintln!(
+                            "unexpected allocation: size={}, align={}",
+                            layout.size(),
+                            layout.align(),
+                        );
+                        let bt = Backtrace::force_capture();
+                        pretty_print_stack(bt);
+                        in_hook.set(false);
+                    }
+                    ALLOC_ALLOWED.store(false, Ordering::SeqCst);
+                });
+            }
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static A: GuardedAlloc = GuardedAlloc;
+
+    static RE_SKIP: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\d+: (<?(std|core|(&mut )?alloc)::)|at (/rustc/|/home/\w+/[.]rustup/)")
+            .unwrap()
+    });
+
+    fn pretty_print_stack(bt: std::backtrace::Backtrace) {
+        //eprintln!("{bt}"); return;
+        let s = format!("{bt}");
+        for line in s.split('\n') {
+            if RE_SKIP.is_match(line) {
+                continue;
+            }
+            eprintln!("{line}");
+        }
+    }
+}
+
 static RE_RANGE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)^bytes=(\d+)-(\d+)$").unwrap());
 
@@ -1053,7 +1125,10 @@ impl Request<'_> {
         debug!("Found req len {end}: {s:?}");
 
         let mut lines = s.split("\r\n");
-        let mut first = lines.next().ok_or(Error::msg("no first line"))?.split(' ');
+        let mut first = lines
+            .next()
+            .ok_or_else(|| Error::msg("no first line"))?
+            .split(' ');
 
         // Default connection settings.
         let mut encoding_gzip = false;
@@ -1065,7 +1140,7 @@ impl Request<'_> {
         let mut has_body_header = false;
 
         // Parse first line.
-        let method = first.next().ok_or(Error::msg("no method"))?;
+        let method = first.next().ok_or_else(|| Error::msg("no method"))?;
         let head = match method {
             "GET" => false,
             "HEAD" => true,
@@ -1073,10 +1148,10 @@ impl Request<'_> {
                 return Err(Error::msg(format!("Invalid HTTP method {method}")));
             }
         };
-        let path = first.next().ok_or(Error::msg("no path"))?;
+        let path = first.next().ok_or_else(|| Error::msg("no path"))?;
         let path = path.split_once('?').map_or(path, |(path, _)| path);
 
-        let version = first.next().ok_or(Error::msg("no version"))?;
+        let version = first.next().ok_or_else(|| Error::msg("no version"))?;
         let mut keepalive = version == "HTTP/1.1";
         if let Some(x) = first.next() {
             return Err(Error::msg(format!("trailing garbage on first line: {x:?}")));
@@ -1255,6 +1330,7 @@ fn common_headers(out: &mut HeaderBuf, close_after_response: bool) -> Result<()>
 }
 
 fn date_header(out: &mut HeaderBuf) -> Result<()> {
+    // TODO: remove this allocation
     Ok(write!(
         out,
         "Date: {}\r\n",
@@ -1823,6 +1899,7 @@ fn mainloop(
     if opt.secure {
         privs::drop_privs(tls_config.is_some())?;
     }
+    allocation_tripwire::disable_allocs();
     loop {
         let mut cq = ring.completion();
         assert_eq!(cq.overflow(), 0);

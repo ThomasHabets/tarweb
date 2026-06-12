@@ -175,6 +175,7 @@ impl Archive {
 
         // Add index.html to directory paths.
         let filename = if filename.is_empty() || filename.ends_with('/') {
+            // TODO: fix this allocation.
             Cow::Owned(filename.to_owned() + "index.html")
         } else {
             Cow::Borrowed(filename)

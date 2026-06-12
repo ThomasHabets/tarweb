@@ -61,6 +61,7 @@ rcgen = "0.14.5"
 [features]
 # Not supported on riscv64
 #rtsan = ["rtsan-standalone/enable"]
+alloc-tripwire = []
 
 [profile.release]
 debug = true
