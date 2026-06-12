@@ -1523,6 +1523,7 @@ fn handle_connection(
         }
         UserDataOp::Write => {
             if hook.result < 0 {
+                let _guard = allocation_tripwire::TempAllow::allow();
                 return Err(Error::msg(format!(
                     "write() failed: {}",
                     std::io::Error::from_raw_os_error(hook.result.abs())
@@ -1890,6 +1891,8 @@ fn mainloop(
     archive: &Archive,
 ) -> Result<()> {
     info!("Thread main");
+    let alloc_guard = allocation_tripwire::TempAllow::allow();
+
     let mut pooltracker = PoolTracker::new(opt.max_connections);
     let mut ops: SQueue = ArrayVec::new();
     let mut last_submit = std::time::Instant::now();
@@ -1917,6 +1920,7 @@ fn mainloop(
     if opt.secure {
         privs::drop_privs(tls_config.is_some())?;
     }
+    drop(alloc_guard);
     allocation_tripwire::disable_allocs();
     loop {
         let mut cq = ring.completion();
