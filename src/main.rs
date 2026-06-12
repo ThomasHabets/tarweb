@@ -50,6 +50,7 @@ use archive::Archive;
 mod sock;
 use sock::set_nodelay;
 
+mod datefmt;
 mod privs;
 
 type FixedFile = io_uring::types::Fixed;
@@ -1327,12 +1328,8 @@ fn common_headers(out: &mut HeaderBuf, close_after_response: bool) -> Result<()>
 }
 
 fn date_header(out: &mut HeaderBuf) -> Result<()> {
-    // TODO: remove this allocation
-    Ok(write!(
-        out,
-        "Date: {}\r\n",
-        httpdate::fmt_http_date(std::time::SystemTime::now())
-    )?)
+    let now = datefmt::HttpDate::now();
+    Ok(write!(out, "Date: {now}\r\n")?)
 }
 
 // TODO: Maybe use some pos/len into the tarfile for custom 431.
