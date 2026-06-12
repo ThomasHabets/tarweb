@@ -57,6 +57,12 @@ type FixedFile = io_uring::types::Fixed;
 
 #[cfg(not(feature = "alloc-tripwire"))]
 mod allocation_tripwire {
+    pub(crate) struct TempAllow {}
+    impl TempAllow {
+        pub(crate) fn allow() -> Self {
+            Self {}
+        }
+    }
     pub(crate) fn disable_allocs() {}
 }
 
@@ -70,7 +76,26 @@ mod allocation_tripwire {
 
     struct GuardedAlloc;
 
+    thread_local! {
+        static ALLOC_THREAD_ALLOWED: Cell<bool> = Cell::new(false);
+    }
+
     static ALLOC_ALLOWED: AtomicBool = AtomicBool::new(true);
+
+    pub(crate) struct TempAllow {}
+    impl TempAllow {
+        pub(crate) fn allow() -> Self {
+            debug_assert!(!ALLOC_THREAD_ALLOWED.get());
+            ALLOC_THREAD_ALLOWED.set(true);
+            Self {}
+        }
+    }
+    impl Drop for TempAllow {
+        fn drop(&mut self) {
+            debug_assert!(ALLOC_THREAD_ALLOWED.get());
+            ALLOC_THREAD_ALLOWED.set(false);
+        }
+    }
 
     pub(crate) fn disable_allocs() {
         ALLOC_ALLOWED.store(false, Ordering::SeqCst);
@@ -82,7 +107,7 @@ mod allocation_tripwire {
 
     unsafe impl GlobalAlloc for GuardedAlloc {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            if !ALLOC_ALLOWED.load(Ordering::SeqCst) {
+            if !ALLOC_THREAD_ALLOWED.get() && !ALLOC_ALLOWED.load(Ordering::SeqCst) {
                 IN_ALLOC_HOOK.with(|in_hook| {
                     ALLOC_ALLOWED.store(true, Ordering::SeqCst);
                     if !in_hook.get() {
@@ -1473,6 +1498,7 @@ fn handle_connection(
                 // severity. This, for example, is triggered by the client
                 // disconnecting in the middle of a request, which should be
                 // debug level logging.
+                let _guard = allocation_tripwire::TempAllow::allow();
                 return Err(Error::msg(format!(
                     "read() failed: {}",
                     std::io::Error::from_raw_os_error(hook.result.abs())
