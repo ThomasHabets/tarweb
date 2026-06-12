@@ -1163,8 +1163,6 @@ impl Request<'_> {
                 continue;
             };
 
-            // TODO: we can avoid an allocation here on mixed case headers by
-            // doing `.eq_ignore_ascii_case()` instead.
             let k = k.trim();
             let v = v.trim();
             if k.eq_ignore_ascii_case("content-length") {
