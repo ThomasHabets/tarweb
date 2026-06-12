@@ -1037,6 +1037,8 @@ struct Request<'a> {
     // If the request has a body, close the connection before we start reading
     // body bytes as further requests.
     has_body_header: bool,
+
+    keepalive: bool,
 }
 
 impl Request<'_> {
@@ -1055,6 +1057,7 @@ impl Request<'_> {
         let mut encoding_gzip = false;
         let mut encoding_brotli = false;
         let mut encoding_zstd = false;
+        let mut keepalive = true;
         let mut if_modified_since = None;
         let mut if_none_match = None;
         let mut range = None;
@@ -1072,6 +1075,9 @@ impl Request<'_> {
                     has_body_header |= v.parse::<u64>().map_or(true, |len| len > 0);
                 }
                 "transfer-encoding" => has_body_header = true,
+                "connection" => {
+                    keepalive = v.eq_ignore_ascii_case("keep-alive");
+                }
                 "accept-encoding" => {
                     for enc in v.split(',').filter_map(acceptable_encoding) {
                         match cow_ascii_lowercase(enc).as_ref() {
@@ -1127,6 +1133,7 @@ impl Request<'_> {
             if_none_match,
             range,
             has_body_header,
+            keepalive,
         }))
     }
 }
@@ -1199,7 +1206,7 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
         return Ok(());
     };
     debug!("Got request for path {}", req.path);
-    if req.has_body_header {
+    if req.has_body_header || !req.keepalive {
         hook.con.close_after_response = true;
     }
     let reqlen = req.len + 4;

@@ -509,7 +509,7 @@ fn accept_oneshot_stops_accepting_when_pool_is_exhausted() -> Result<()> {
         queued.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
         write!(
             queued,
-            "GET / HTTP/1.1\r\nX-Test: 2\r\nHost: {addr}\r\n\r\n"
+            "GET / HTTP/1.1\r\nConnection: close\r\nX-Test: 2\r\nHost: {addr}\r\n\r\n"
         )?;
         queued.flush()?;
 
@@ -541,9 +541,9 @@ fn accept_oneshot_stops_accepting_when_pool_is_exhausted() -> Result<()> {
 
         queued.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
         assert_eq!(read_one_http_body(&mut queued)?, "hello world");
-        drop(queued);
+        // Not dropping queued because it uses `Connection: close`.
 
-        // Do a third request, just for fun.
+        // Do a third request to confirm `queued` closed.
         let mut third = std::net::TcpStream::connect(addr)?;
         third.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
         write!(third, "GET / HTTP/1.1\r\nX-Test: 3\r\nHost: {addr}\r\n\r\n")?;
@@ -760,7 +760,7 @@ fn read_one_http_body(stream: &mut std::net::TcpStream) -> Result<String> {
     let mut response = Vec::new();
     let header_end = loop {
         let mut buf = [0u8; 1024];
-        let n = stream.read(&mut buf)?;
+        let n = stream.read(&mut buf).context("read_one_http_body() read")?;
         if n == 0 {
             return Err(anyhow::anyhow!(
                 "connection closed before response headers: {response:?}"
