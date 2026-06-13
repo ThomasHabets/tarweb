@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use bytes::BytesMut;
 use clap::Parser;
-use io_uring::types::Fd;
 use quinn_proto::crypto::rustls::QuicServerConfig;
 use quinn_proto::{
     Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig, EndpointEvent,
@@ -33,6 +32,9 @@ use tracing::{debug, info, trace, warn};
 const USER_DATA_RECV: u64 = 1;
 const USER_DATA_TIMEOUT: u64 = 2;
 const USER_DATA_SEND_BASE: u64 = 1_000_000;
+
+type FixedFile = io_uring::types::Fixed;
+const SOCKET_FIXED_FILE: FixedFile = io_uring::types::Fixed(0);
 
 const H3_FRAME_DATA: u64 = 0x00;
 const H3_FRAME_HEADERS: u64 = 0x01;
@@ -130,9 +132,9 @@ impl RecvSlot {
         };
     }
 
-    fn op(&mut self, fd: i32) -> io_uring::squeue::Entry {
+    fn op(&mut self, fd: FixedFile) -> io_uring::squeue::Entry {
         self.refresh();
-        io_uring::opcode::RecvMsg::new(Fd(fd), std::ptr::from_mut::<libc::msghdr>(&mut self.hdr))
+        io_uring::opcode::RecvMsg::new(fd, std::ptr::from_mut::<libc::msghdr>(&mut self.hdr))
             .build()
             .user_data(USER_DATA_RECV)
     }
@@ -158,16 +160,12 @@ impl SendOp {
         }
     }
 
-    fn op(&self, fd: i32, user_data: u64) -> io_uring::squeue::Entry {
-        io_uring::opcode::Send::new(
-            Fd(fd),
-            self.data.as_ptr(),
-            self.data.len().try_into().unwrap(),
-        )
-        .dest_addr(std::ptr::from_ref::<libc::sockaddr_storage>(&self.storage).cast())
-        .dest_addr_len(self.namelen)
-        .build()
-        .user_data(user_data)
+    fn op(&self, fd: FixedFile, user_data: u64) -> io_uring::squeue::Entry {
+        io_uring::opcode::Send::new(fd, self.data.as_ptr(), self.data.len().try_into().unwrap())
+            .dest_addr(std::ptr::from_ref::<libc::sockaddr_storage>(&self.storage).cast())
+            .dest_addr_len(self.namelen)
+            .build()
+            .user_data(user_data)
     }
 }
 
@@ -198,13 +196,13 @@ struct Server {
     endpoint: Endpoint,
     connections: HashMap<ConnectionHandle, ConnectionState>,
     archive: Archive,
-    socket_fd: i32,
+    socket_fd: FixedFile,
     pending_sends: HashMap<u64, Box<SendOp>>,
     next_send_id: u64,
 }
 
 impl Server {
-    fn new(endpoint: Endpoint, archive: Archive, socket_fd: i32) -> Self {
+    fn new(endpoint: Endpoint, archive: Archive, socket_fd: FixedFile) -> Self {
         Self {
             endpoint,
             connections: HashMap::new(),
@@ -715,19 +713,22 @@ fn main() -> Result<()> {
         .with_context(|| format!("binding UDP {}", opt.listen))?;
     socket.set_nonblocking(true)?;
     let socket_fd = socket.as_raw_fd();
-    info!("HTTP/3 listening on {}", socket.local_addr()?);
+    let local_addr = socket.local_addr()?;
+    info!("HTTP/3 listening on {local_addr}");
 
     let endpoint_config = Arc::new(EndpointConfig::default());
     let server_config = Arc::new(make_server_config(&opt)?);
     let endpoint = Endpoint::new(endpoint_config, Some(server_config), false, None);
 
     let mut ring = io_uring::IoUring::new(opt.ring_size)?;
+    ring.submitter().register_files(&[socket_fd])?;
+    drop(socket);
     let mut recv = RecvSlot::new();
     let timeout: io_uring::types::Timespec = opt.periodic_wakeup.into();
-    let mut server = Server::new(endpoint, archive, socket_fd);
+    let mut server = Server::new(endpoint, archive, SOCKET_FIXED_FILE);
 
     unsafe {
-        ring.submission().push(&recv.op(socket_fd)).unwrap();
+        ring.submission().push(&recv.op(SOCKET_FIXED_FILE)).unwrap();
         ring.submission().push(&make_timeout(&timeout)).unwrap();
     }
     ring.submit()?;
@@ -762,7 +763,7 @@ fn main() -> Result<()> {
                             io::Error::from_raw_os_error(result.abs())
                         );
                     }
-                    ops.push(recv.op(socket_fd));
+                    ops.push(recv.op(SOCKET_FIXED_FILE));
                 }
                 USER_DATA_TIMEOUT => {
                     server.handle_timeouts(Instant::now(), &mut ops);
