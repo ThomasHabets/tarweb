@@ -733,6 +733,8 @@ fn main() -> Result<()> {
     }
     ring.submit()?;
 
+    tarweb::privs::drop_privs(true)?;
+
     let mut ops = Vec::new();
     loop {
         let mut cq = ring.completion();

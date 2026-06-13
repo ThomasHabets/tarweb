@@ -132,6 +132,7 @@ fn seccomp(with_rustls: bool) -> Result<()> {
             "newfstatat",
             // memory allocations.
             "mmap",
+            "brk",
             "madvise",
             "mprotect",
             "munmap",
