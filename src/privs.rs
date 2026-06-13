@@ -112,6 +112,8 @@ fn drop_caps() -> Result<()> {
 /// syscalls via io-uring.
 fn seccomp(with_rustls: bool) -> Result<()> {
     let mut f = ScmpFilterContext::new(ScmpAction::KillProcess)?;
+    // tarweb and tarweb-h3 install this after worker threads exist.
+    f.set_ctl_tsync(true)?;
 
     // Intentionally turned on.
     for name in [
