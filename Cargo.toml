@@ -16,6 +16,7 @@ anyhow = "1"
 # The feature doesn't seem to add anything.
 arrayvec = { version = "0.7", features = ["zeroize"]}
 boring = "4"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 core_affinity = "0.8"
 httpdate = "1"
@@ -49,6 +50,7 @@ libseccomp = "0.4.0"
 caps = "0.5.6"
 landlock = "0.4.3"
 chrono = "0.4.45"
+quinn-proto = { version = "0.11.14", default-features = false, features = ["bloom", "log", "rustls-ring"] }
 
 [build-dependencies]
 prost-build = "0.14.1"

@@ -3,6 +3,7 @@ use anyhow::Result;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
+pub mod archive;
 pub mod privs;
 pub mod sock;
 
