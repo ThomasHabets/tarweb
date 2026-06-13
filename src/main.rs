@@ -1933,9 +1933,11 @@ fn mainloop(
                 // Nothing has completed, so submit anything pending, and sleep.
                 if let Err(ref e) = ring.submit_and_wait(1) {
                     if e.kind() == std::io::ErrorKind::Interrupted {
+                        // This happens when resuming in a debugger.
                         debug!("Interrupted system call for submit_and_wait");
+                    } else {
+                        warn!("io_uring submit_and_wait(): {e}");
                     }
-                    warn!("io_uring submit_and_wait(): {e}");
                 }
             }
             continue;
