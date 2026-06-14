@@ -67,9 +67,6 @@ const H3_STREAM_CONTROL: u64 = 0x00;
 // meaning (on the Internet) 1500 bytes. Adding 100 bytes just in case.
 const RECV_BUF_SIZE: usize = 1600;
 
-// Maximum number of datagraphs to queue up for sending in one go.
-const MAX_SEND_DATAGRAMS: usize = 1;
-
 // Arbitrary byte so that we can quickly know that this is not a connection ID
 // we generated.
 //
@@ -645,12 +642,17 @@ impl Worker {
                 let Some(state) = self.connections.get_mut(&handle) else {
                     return;
                 };
+
+                // TODO: Get multiple segments and send them using `SendBundle`.
                 while let Some(transmit) =
                     state
                         .conn
-                        .poll_transmit(now, MAX_SEND_DATAGRAMS, &mut scratch)
+                        .poll_transmit(now, /* max segments */ 1, &mut scratch)
                 {
                     let size = transmit.size;
+                    // The copying and keeping in memory here is not too bad. We
+                    // We need it copied into memory until the sendmsg op
+                    // completes anyway.
                     transmits.push((transmit, scratch[..size].to_vec()));
                     scratch.clear();
                 }
@@ -862,8 +864,11 @@ impl Worker {
             );
             return;
         }
-        if transmit.segment_size.is_some() {
-            warn!("dropping segmented transmit; GSO is not enabled in this binary");
+        if let Some(n) = transmit.segment_size {
+            warn!(
+                "dropping segmented ({n} of {}) transmit; GSO is not enabled in this binary",
+                transmit.size
+            );
             return;
         }
         let id = self.next_send_id;
