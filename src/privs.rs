@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use caps::CapSet;
-use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
+use libseccomp::{ScmpAction, ScmpArgCompare, ScmpCompareOp, ScmpFilterContext, ScmpSyscall};
 use tracing::{info, trace, warn};
 
 /// Drop privileges to bare minimum.
@@ -120,12 +120,27 @@ fn seccomp(with_rustls: bool) -> Result<()> {
         "write",
         "close",
         "futex",
+        "rt_sigprocmask",
         "io_uring_enter",
         "io_uring_register",
         "getrandom",
+        "sched_yield",
+        "sigaltstack",
+        "exit_group",
+        "exit",
     ] {
         f.add_rule(ScmpAction::Allow, ScmpSyscall::from_name(name)?)?;
     }
+    // glibc malloc may lazily probe /proc/sys/vm/overcommit_memory.
+    f.add_rule_conditional(
+        ScmpAction::Errno(libc::EACCES),
+        ScmpSyscall::from_name("openat")?,
+        &[ScmpArgCompare::new(
+            2,
+            ScmpCompareOp::MaskedEqual(libc::O_ACCMODE as u64),
+            libc::O_RDONLY as u64,
+        )],
+    )?;
 
     if with_rustls {
         // Rustls does some memory allocation.
