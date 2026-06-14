@@ -1,11 +1,15 @@
-//! LLM-coded HTTP/3 version of tarweb.
+//! HTTP/3 version of tarweb.
+//!
+//! This is mostly written by LLM, but with manual oversight and fixes. I've not
+//! really checked the H3 code carefully, as I hope to replace it with a
+//! library.
 //!
 //! Things to sort out:
 //! * Do we really need custom hpack/qpack code?
 //! * Add the allocation tripwire.
 //! * Preallocate all buffers.
-//! * Allow creating a separate outgoing socket, in case it's on a different
-//!   address. E.g. listen to lo, but allow going out to anywhere.
+//! * Allow each worker to have its own address and/or port, to offload the
+//!   network thread.
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
 
@@ -27,9 +31,8 @@ use bytes::BytesMut;
 use clap::Parser;
 use quinn_proto::crypto::rustls::QuicServerConfig;
 use quinn_proto::{
-    Connection, ConnectionHandle, ConnectionId, DatagramEvent, Dir, Endpoint, EndpointConfig,
-    EndpointEvent, Event, InvalidCid, ReadError, ServerConfig, StreamEvent, StreamId, Transmit,
-    TransportConfig, WriteError,
+    ConnectionId, DatagramEvent, Dir, EndpointConfig, EndpointEvent, Event, InvalidCid, ReadError,
+    ServerConfig, StreamEvent, StreamId, Transmit, TransportConfig, WriteError,
 };
 use rand::RngCore;
 use sha3::{Digest, Sha3_256};
@@ -63,6 +66,8 @@ const H3_STREAM_CONTROL: u64 = 0x00;
 // Size of a single recvmsg buffer. This can't be bigger than a UDP packet,
 // meaning (on the Internet) 1500 bytes. Adding 100 bytes just in case.
 const RECV_BUF_SIZE: usize = 1600;
+
+// Maximum number of datagraphs to queue up for sending in one go.
 const MAX_SEND_DATAGRAMS: usize = 1;
 
 // Arbitrary byte so that we can quickly know that this is not a connection ID
@@ -311,18 +316,25 @@ fn worker_cid_signature(key: &[u8; 32], prefix: &[u8]) -> [u8; WORKER_CID_SIGNAT
 
 // Pick the worker that should perform all QUIC processing for this datagram.
 // Server-generated CIDs carry an explicit worker id; client-generated Initial
-// CIDs fall back to a stable hash so retransmits land on the same worker.
-fn worker_for_datagram(data: &[u8], worker_count: usize) -> Option<usize> {
+// CIDs fall back to a keyed hash so retransmits land on the same worker
+// without letting the peer steer traffic by choosing the DCID.
+//
+// Packet will be dropped if this returns None, since it doesn't even have a
+// destination CID.
+fn worker_for_datagram(data: &[u8], key: &[u8; 32], worker_count: usize) -> Option<usize> {
     let cid = packet_destination_cid(data)?;
     if let Some(worker) = worker_from_server_cid(cid, worker_count) {
         return Some(worker);
     }
-    Some(hash_connection_id(cid, worker_count))
+    Some(hash_connection_id(key, cid, worker_count))
 }
 
 // Extract only the QUIC destination connection ID from the invariant header.
 // The network thread deliberately stops here; parsing/decryption stays on the
 // selected worker.
+//
+// Packet will be dropped if this returns None, since it doesn't even have a
+// destination CID.
 fn packet_destination_cid(data: &[u8]) -> Option<&[u8]> {
     let first = *data.first()?;
     if first & 0x80 != 0 {
@@ -351,15 +363,28 @@ fn worker_from_server_cid(cid: &[u8], worker_count: usize) -> Option<usize> {
     (worker < worker_count).then_some(worker)
 }
 
-// Hash client-generated Initial CIDs. This is the only routing path before the
-// server has issued a worker-prefixed CID.
-fn hash_connection_id(cid: &[u8], worker_count: usize) -> usize {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in cid {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash as usize % worker_count
+// Hash client-generated Initial CIDs with a secret. This is the only routing
+// path before the server has issued a worker-prefixed CID.
+//
+// Since the initial CID is client-controlled, we need to mix in our secret key
+// before choosing a worker. Otherwise an attacker can target a specific worker.
+fn hash_connection_id(key: &[u8; 32], cid: &[u8], worker_count: usize) -> usize {
+    let digest = keyed_connection_id_digest(key, cid);
+    let mut bytes = [0u8; std::mem::size_of::<usize>()];
+    let len = bytes.len();
+    bytes.copy_from_slice(&digest[..len]);
+    usize::from_be_bytes(bytes) % worker_count
+}
+
+fn keyed_connection_id_digest(key: &[u8; 32], cid: &[u8]) -> [u8; 32] {
+    let mut hash = Sha3_256::new();
+    hash.update(key);
+    hash.update(b"tarweb-h3 worker shard");
+    hash.update(cid);
+    let digest = hash.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 #[derive(Default)]
@@ -381,7 +406,7 @@ struct PendingResponse {
 }
 
 struct ConnectionState {
-    conn: Connection,
+    conn: quinn_proto::Connection,
     h3: H3Connection,
 }
 
@@ -393,11 +418,23 @@ enum WorkerCommand {
     },
 }
 
+/// A worker runs in its own thread, with its own io_uring used only for
+/// sending.
+///
+/// The receive path comes from the network thread, since that's currently the
+/// only way to route to the correct worker.
 struct Worker {
     id: usize,
-    endpoint: Endpoint,
-    connections: HashMap<ConnectionHandle, ConnectionState>,
+
+    // Endpoint is the main quinn API surface.
+    endpoint: quinn_proto::Endpoint,
+
+    // Active connections. They expire after a while.
+    connections: HashMap<quinn_proto::ConnectionHandle, ConnectionState>,
+
+    // Website contents.
     archive: Arc<Archive>,
+
     ring: io_uring::IoUring,
 
     // A pending send is set up in memory for use by io-uring. When a SendOp is
@@ -418,7 +455,7 @@ impl Worker {
     fn new(
         id: usize,
         archive: Arc<Archive>,
-        endpoint: Endpoint,
+        endpoint: quinn_proto::Endpoint,
         socket: std::net::UdpSocket,
         ring_size: u32,
     ) -> Result<Self> {
@@ -493,10 +530,14 @@ impl Worker {
     // happen, so the network thread never performs that work.
     fn handle_datagram(&mut self, now: Instant, remote: SocketAddr, data: BytesMut) {
         let mut scratch = Vec::new();
-        match self
-            .endpoint
-            .handle(now, remote, None, None, data, &mut scratch)
-        {
+        match self.endpoint.handle(
+            now,
+            remote,
+            /* local ip */ None,
+            /* ECN */ None,
+            data,
+            &mut scratch,
+        ) {
             Some(DatagramEvent::Response(transmit)) => {
                 assert_eq!(
                     transmit.size,
@@ -530,7 +571,12 @@ impl Worker {
 
     // Register a newly accepted QUIC connection on this worker and immediately
     // drain any handshake/application work it made available.
-    fn assign_connection(&mut self, handle: ConnectionHandle, conn: Connection, now: Instant) {
+    fn assign_connection(
+        &mut self,
+        handle: quinn_proto::ConnectionHandle,
+        conn: quinn_proto::Connection,
+        now: Instant,
+    ) {
         debug!(
             "Accepted HTTP/3 connection {handle:?} on worker {}",
             self.id
@@ -548,7 +594,7 @@ impl Worker {
     // Deliver an endpoint-produced connection event to a local connection.
     fn handle_connection_event(
         &mut self,
-        handle: ConnectionHandle,
+        handle: quinn_proto::ConnectionHandle,
         event: quinn_proto::ConnectionEvent,
         now: Instant,
     ) {
@@ -582,14 +628,19 @@ impl Worker {
     }
 
     // Drain QUIC state for one connection and publish any resulting work.
-    fn drive_connection(&mut self, handle: ConnectionHandle, now: Instant) {
+    fn drive_connection(&mut self, handle: quinn_proto::ConnectionHandle, now: Instant) {
         let mut remove = false;
         let mut sent_drained = false;
         let mut scratch = Vec::new();
         loop {
             let mut endpoint_events = Vec::new();
             let mut app_events = Vec::new();
+
+            // Packets to transmit. TODO: This is ripe for a bump allocator.
             let mut transmits = Vec::new();
+
+            // Collect what we need to do. We have to do it this way first
+            // because the loop holds mutable borrow.
             {
                 let Some(state) = self.connections.get_mut(&handle) else {
                     return;
@@ -611,6 +662,7 @@ impl Worker {
                 }
             }
 
+            // Send packets.
             for (transmit, packet) in transmits {
                 self.queue_transmit(transmit, packet);
             }
@@ -628,12 +680,14 @@ impl Worker {
                 }
             }
 
+            // Handle endpoint events, and forward them to the endpoint.
             if let Some(state) = self.connections.get_mut(&handle) {
                 for event in returned_conn_events {
                     state.conn.handle_event(event);
                 }
             }
 
+            // Handle app events like "connected" and "I have some data".
             for event in app_events {
                 if self.handle_app_event(handle, event) {
                     remove = true;
@@ -650,7 +704,7 @@ impl Worker {
     }
 
     // React to QUIC events that are not directly tied to a socket packet.
-    fn handle_app_event(&mut self, handle: ConnectionHandle, event: Event) -> bool {
+    fn handle_app_event(&mut self, handle: quinn_proto::ConnectionHandle, event: Event) -> bool {
         match event {
             Event::Connected => {
                 if let Some(state) = self.connections.get_mut(&handle) {
@@ -701,7 +755,7 @@ impl Worker {
     }
 
     // Read request bytes from a bidirectional stream and build a response.
-    fn read_stream(&mut self, handle: ConnectionHandle, id: StreamId) {
+    fn read_stream(&mut self, handle: quinn_proto::ConnectionHandle, id: StreamId) {
         let Some(state) = self.connections.get_mut(&handle) else {
             return;
         };
@@ -761,7 +815,7 @@ impl Worker {
     }
 
     // Continue writing a queued HTTP response onto a QUIC stream.
-    fn flush_response(&mut self, handle: ConnectionHandle, id: StreamId) {
+    fn flush_response(&mut self, handle: quinn_proto::ConnectionHandle, id: StreamId) {
         let Some(state) = self.connections.get_mut(&handle) else {
             return;
         };
@@ -843,7 +897,7 @@ impl Worker {
 }
 
 // Open the HTTP/3 control stream and send SETTINGS once per connection.
-fn send_h3_control_stream(conn: &mut Connection, h3: &mut H3Connection) {
+fn send_h3_control_stream(conn: &mut quinn_proto::Connection, h3: &mut H3Connection) {
     if h3.sent_control {
         return;
     }
@@ -1086,7 +1140,8 @@ fn main() -> Result<()> {
             endpoint_config.cid_generator(move || {
                 Box::new(WorkerConnectionIdGenerator::new(worker_id, cid_key))
             });
-            let endpoint = Endpoint::new(
+            // TODO: set reset key.
+            let endpoint = quinn_proto::Endpoint::new(
                 Arc::new(endpoint_config),
                 Some(Arc::clone(&server_config)),
                 false,
@@ -1129,6 +1184,9 @@ fn main() -> Result<()> {
     let mut ring = io_uring::IoUring::new(opt.ring_size)?;
     ring.submitter().register_files(&[socket.as_raw_fd()])?;
     drop(socket);
+
+    // This `recv` object MUST live longer than any outstanding
+    // reception.
     let mut recv = RecvSlot::new();
 
     unsafe {
@@ -1167,7 +1225,8 @@ fn main() -> Result<()> {
                         match recv.remote() {
                             Ok(remote) => {
                                 let packet = &recv.buf[..len];
-                                if let Some(worker) = worker_for_datagram(packet, worker_txs.len())
+                                if let Some(worker) =
+                                    worker_for_datagram(packet, &cid_key, worker_txs.len())
                                 {
                                     let data = BytesMut::from(packet);
                                     if let Err(e) =
@@ -1220,7 +1279,7 @@ mod tests {
         let mut short_packet = Vec::with_capacity(1 + WORKER_CID_LEN);
         short_packet.push(0x40);
         short_packet.extend_from_slice(cid.as_ref());
-        assert_eq!(worker_for_datagram(&short_packet, 64), Some(42));
+        assert_eq!(worker_for_datagram(&short_packet, &key, 64), Some(42));
     }
 
     #[test]
@@ -1236,6 +1295,7 @@ mod tests {
 
     #[test]
     fn client_initial_cid_hashes_consistently() {
+        let key = [0x6b; 32];
         let mut long_packet = Vec::new();
         long_packet.push(0xc0);
         long_packet.extend_from_slice(&1u32.to_be_bytes());
@@ -1243,9 +1303,24 @@ mod tests {
         long_packet.extend_from_slice(&[1, 2, 3, 4]);
         long_packet.push(0);
 
-        let first = worker_for_datagram(&long_packet, 8);
-        let second = worker_for_datagram(&long_packet, 8);
+        let first = worker_for_datagram(&long_packet, &key, 8);
+        let second = worker_for_datagram(&long_packet, &key, 8);
         assert_eq!(first, second);
         assert!(first.is_some());
+    }
+
+    #[test]
+    fn client_initial_cid_digest_changes_with_key() {
+        let mut long_packet = Vec::new();
+        long_packet.push(0xc0);
+        long_packet.extend_from_slice(&1u32.to_be_bytes());
+        long_packet.push(4);
+        long_packet.extend_from_slice(&[1, 2, 3, 4]);
+        long_packet.push(0);
+
+        let cid = packet_destination_cid(&long_packet).unwrap();
+        let a = keyed_connection_id_digest(&[0x11; 32], cid);
+        let b = keyed_connection_id_digest(&[0x22; 32], cid);
+        assert_ne!(a, b);
     }
 }
