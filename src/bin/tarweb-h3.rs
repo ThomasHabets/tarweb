@@ -475,6 +475,8 @@ impl Worker {
     fn run(mut self, rx: Receiver<WorkerCommand>) {
         loop {
             let now = Instant::now();
+            // Once https://github.com/quinn-rs/quinn/pull/2684 is merged, maybe
+            // 0.11.15, we can turn this `values_mut()` into `values()`
             let wait = if self.pending_sends.is_empty() {
                 self.connections
                     .values_mut()
