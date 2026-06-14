@@ -18,7 +18,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::sync::{
     Arc,
-    mpsc::{self, Receiver, Sender, TryRecvError},
+    mpsc::{self, Receiver},
 };
 use std::time::{Duration, Instant};
 
@@ -27,15 +27,29 @@ use bytes::BytesMut;
 use clap::Parser;
 use quinn_proto::crypto::rustls::QuicServerConfig;
 use quinn_proto::{
-    Connection, ConnectionEvent, ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig,
-    EndpointEvent, Event, ReadError, ServerConfig, StreamEvent, StreamId, Transmit,
+    Connection, ConnectionHandle, ConnectionId, DatagramEvent, Dir, Endpoint, EndpointConfig,
+    EndpointEvent, Event, InvalidCid, ReadError, ServerConfig, StreamEvent, StreamId, Transmit,
     TransportConfig, WriteError,
 };
+use rand::RngCore;
+use sha3::{Digest, Sha3_256};
 use tarweb::archive::Archive;
 use tracing::{debug, info, trace, warn};
 
+// Max two bytes worth of workers because we map worker ID into the connection
+// ID.
+const MAX_WORKERS: usize = u16::MAX as usize;
+
+// Minimum time to spent in each processing iteration loop waiting only for
+// non-timer events.
+const MINIMUM_TICK: std::time::Duration = std::time::Duration::from_millis(10);
+
+// Maximum time to wait. This should only happen when there are no connections
+// and no pending sends.
+const MAXIMUM_TICK: std::time::Duration = std::time::Duration::from_mins(1);
+
+// io-uring user data for operations.
 const USER_DATA_RECV: u64 = 1;
-const USER_DATA_TIMEOUT: u64 = 2;
 const USER_DATA_SEND_BASE: u64 = 1_000_000;
 
 type FixedFile = io_uring::types::Fixed;
@@ -50,6 +64,29 @@ const H3_STREAM_CONTROL: u64 = 0x00;
 // meaning (on the Internet) 1500 bytes. Adding 100 bytes just in case.
 const RECV_BUF_SIZE: usize = 1600;
 const MAX_SEND_DATAGRAMS: usize = 1;
+
+// Arbitrary byte so that we can quickly know that this is not a connection ID
+// we generated.
+//
+// A mismatch means it's a new connection, or garbage. If it's garbage, the
+// assigned worker will take care of that.
+const WORKER_CID_MARKER: u8 = 0xa7;
+const WORKER_CID_LEN: usize = 16;
+
+// Where in the CID we place our worker ID.
+const WORKER_CID_WORKER_OFFSET: usize = 1;
+
+// The nonce needs to be fairly big, because within a worker it's the unique
+// identifier for a connection.
+const WORKER_CID_NONCE_OFFSET: usize = 3;
+const WORKER_CID_NONCE_LEN: usize = 8;
+
+// The signature can be relatively short, because it's just the quick way to
+// drop invalid packets. (invalid packets include ones from a previous
+// run of the server).
+const WORKER_CID_SIGNATURE_OFFSET: usize = WORKER_CID_NONCE_OFFSET + WORKER_CID_NONCE_LEN;
+const WORKER_CID_SIGNATURE_LEN: usize = WORKER_CID_LEN - WORKER_CID_SIGNATURE_OFFSET;
+const _: () = assert!(WORKER_CID_SIGNATURE_LEN == 5);
 
 #[derive(Parser)]
 struct Opt {
@@ -66,9 +103,6 @@ struct Opt {
 
     #[arg(long, default_value_t = 1024, help = "io_uring ring size")]
     ring_size: u32,
-
-    #[arg(long, default_value = "10ms", value_parser = parse_duration, help = "QUIC timer poll interval.")]
-    periodic_wakeup: Duration,
 
     #[arg(
         long,
@@ -161,14 +195,9 @@ impl RecvSlot {
     }
 }
 
-// A end operation send from the worker threads to the network thread owning the
-// io_uring.
+// An outbound UDP send operation owned by a worker io_uring.
 //
 // TODO: should this be pinned?
-//
-// TODO: should we let each worker have its own socket for sending? This should
-// speed things up by migrating both client-tarweb and tarweb-backend off of the
-// network thread.
 struct SendOp {
     data: Vec<u8>,
     storage: libc::sockaddr_storage,
@@ -176,8 +205,8 @@ struct SendOp {
 }
 
 impl SendOp {
-    // Snapshot a datagram and its destination so the network thread can send
-    // it later from io_uring.
+    // Snapshot a datagram and its destination so a worker can send it later
+    // from io_uring.
     fn new(destination: SocketAddr, data: impl Into<Vec<u8>>) -> Self {
         let (storage, namelen) = sockaddr_from_addr(destination);
         Self {
@@ -195,6 +224,142 @@ impl SendOp {
             .build()
             .user_data(user_data)
     }
+}
+
+// We need to generate connection IDs that include the worker ID.
+struct WorkerConnectionIdGenerator {
+    worker_id: u16,
+    key: [u8; 32],
+    next: u64,
+}
+
+impl WorkerConnectionIdGenerator {
+    // Construct a worker-scoped CID generator. Generated CIDs carry the worker
+    // id in a fixed prefix so the network thread can route packets without
+    // invoking QUIC packet processing.
+    fn new(worker_id: u16, key: [u8; 32]) -> Self {
+        Self {
+            worker_id,
+            key,
+            next: 0,
+        }
+    }
+}
+
+impl quinn_proto::ConnectionIdGenerator for WorkerConnectionIdGenerator {
+    fn generate_cid(&mut self) -> ConnectionId {
+        let mut bytes = [0; WORKER_CID_LEN];
+        bytes[0] = WORKER_CID_MARKER;
+        bytes[WORKER_CID_WORKER_OFFSET..WORKER_CID_NONCE_OFFSET]
+            .copy_from_slice(&self.worker_id.to_be_bytes());
+
+        let mut nonce_hash = Sha3_256::new();
+        nonce_hash.update(self.key);
+        nonce_hash.update(b"tarweb-h3 cid nonce");
+        nonce_hash.update(self.worker_id.to_be_bytes());
+        nonce_hash.update(self.next.to_be_bytes());
+        self.next = self.next.wrapping_add(1);
+        let nonce = nonce_hash.finalize();
+        bytes[WORKER_CID_NONCE_OFFSET..WORKER_CID_SIGNATURE_OFFSET]
+            .copy_from_slice(&nonce[..WORKER_CID_NONCE_LEN]);
+
+        let signature = worker_cid_signature(&self.key, &bytes[..WORKER_CID_SIGNATURE_OFFSET]);
+        bytes[WORKER_CID_SIGNATURE_OFFSET..].copy_from_slice(&signature);
+        ConnectionId::new(&bytes)
+    }
+
+    fn validate(&self, cid: &ConnectionId) -> std::result::Result<(), InvalidCid> {
+        let cid = cid.as_ref();
+        if cid.len() != WORKER_CID_LEN || cid[0] != WORKER_CID_MARKER {
+            return Err(InvalidCid);
+        }
+        if u16::from_be_bytes([
+            cid[WORKER_CID_WORKER_OFFSET],
+            cid[WORKER_CID_WORKER_OFFSET + 1],
+        ]) != self.worker_id
+        {
+            return Err(InvalidCid);
+        }
+        let expected = worker_cid_signature(&self.key, &cid[..WORKER_CID_SIGNATURE_OFFSET]);
+        if cid[WORKER_CID_SIGNATURE_OFFSET..] != expected {
+            return Err(InvalidCid);
+        }
+        Ok(())
+    }
+
+    fn cid_len(&self) -> usize {
+        WORKER_CID_LEN
+    }
+
+    fn cid_lifetime(&self) -> Option<Duration> {
+        None
+    }
+}
+
+// Sign the routable CID prefix. This preserves cheap worker lookup while
+// letting Quinn reject spoofed CIDs before it emits stateless resets.
+fn worker_cid_signature(key: &[u8; 32], prefix: &[u8]) -> [u8; WORKER_CID_SIGNATURE_LEN] {
+    let mut hash = Sha3_256::new();
+    hash.update(key);
+    hash.update(b"tarweb-h3 cid signature");
+    hash.update(prefix);
+    let digest = hash.finalize();
+    let mut out = [0; WORKER_CID_SIGNATURE_LEN];
+    out.copy_from_slice(&digest[..WORKER_CID_SIGNATURE_LEN]);
+    out
+}
+
+// Pick the worker that should perform all QUIC processing for this datagram.
+// Server-generated CIDs carry an explicit worker id; client-generated Initial
+// CIDs fall back to a stable hash so retransmits land on the same worker.
+fn worker_for_datagram(data: &[u8], worker_count: usize) -> Option<usize> {
+    let cid = packet_destination_cid(data)?;
+    if let Some(worker) = worker_from_server_cid(cid, worker_count) {
+        return Some(worker);
+    }
+    Some(hash_connection_id(cid, worker_count))
+}
+
+// Extract only the QUIC destination connection ID from the invariant header.
+// The network thread deliberately stops here; parsing/decryption stays on the
+// selected worker.
+fn packet_destination_cid(data: &[u8]) -> Option<&[u8]> {
+    let first = *data.first()?;
+    if first & 0x80 != 0 {
+        let cid_len = *data.get(5)? as usize;
+        if data.len() < 6 + cid_len {
+            return None;
+        }
+        Some(&data[6..6 + cid_len])
+    } else {
+        if data.len() < 1 + WORKER_CID_LEN {
+            return None;
+        }
+        Some(&data[1..1 + WORKER_CID_LEN])
+    }
+}
+
+// Decode the worker prefix from CIDs generated by `WorkerConnectionIdGenerator`.
+fn worker_from_server_cid(cid: &[u8], worker_count: usize) -> Option<usize> {
+    if cid.len() != WORKER_CID_LEN || cid[0] != WORKER_CID_MARKER {
+        return None;
+    }
+    let worker = u16::from_be_bytes([
+        cid[WORKER_CID_WORKER_OFFSET],
+        cid[WORKER_CID_WORKER_OFFSET + 1],
+    ]) as usize;
+    (worker < worker_count).then_some(worker)
+}
+
+// Hash client-generated Initial CIDs. This is the only routing path before the
+// server has issued a worker-prefixed CID.
+fn hash_connection_id(cid: &[u8], worker_count: usize) -> usize {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in cid {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash as usize % worker_count
 }
 
 #[derive(Default)]
@@ -221,72 +386,112 @@ struct ConnectionState {
 }
 
 enum WorkerCommand {
-    NewConnection {
-        handle: ConnectionHandle,
-        conn: Connection,
-    },
-    ConnectionEvent {
-        handle: ConnectionHandle,
-        event: ConnectionEvent,
-    },
-    Tick {
-        now: Instant,
-    },
-}
-
-enum NetworkCommand {
-    Transmit {
-        transmit: Transmit,
-        packet: Vec<u8>,
-    },
-    EndpointEvent {
-        handle: ConnectionHandle,
-        event: EndpointEvent,
-    },
-    ConnectionClosed {
-        handle: ConnectionHandle,
-    },
-}
-
-struct NetworkServer {
-    endpoint: Endpoint,
-    socket_fd: FixedFile,
-    pending_sends: HashMap<u64, Box<SendOp>>,
-    next_send_id: u64,
-    workers: Vec<Sender<WorkerCommand>>,
-    worker_by_handle: HashMap<ConnectionHandle, usize>,
-    network_rx: Receiver<NetworkCommand>,
-    next_worker: usize,
-}
-
-impl NetworkServer {
-    // Construct the network-side owner of the endpoint and UDP socket.
-    fn new(
-        endpoint: Endpoint,
-        socket_fd: FixedFile,
-        workers: Vec<Sender<WorkerCommand>>,
-        network_rx: Receiver<NetworkCommand>,
-    ) -> Self {
-        Self {
-            endpoint,
-            socket_fd,
-            pending_sends: HashMap::new(),
-            next_send_id: USER_DATA_SEND_BASE,
-            workers,
-            worker_by_handle: HashMap::new(),
-            network_rx,
-            next_worker: 0,
-        }
-    }
-
-    // Called from the network thread whenever a UDP datagram arrives.
-    fn handle_datagram(
-        &mut self,
+    Datagram {
         now: Instant,
         remote: SocketAddr,
         data: BytesMut,
-        ops: &mut Vec<io_uring::squeue::Entry>,
-    ) {
+    },
+}
+
+struct Worker {
+    id: usize,
+    endpoint: Endpoint,
+    connections: HashMap<ConnectionHandle, ConnectionState>,
+    archive: Arc<Archive>,
+    ring: io_uring::IoUring,
+
+    // A pending send is set up in memory for use by io-uring. When a SendOp is
+    // in this map, it is either about to be in flight (see `send_ops`) or
+    // actually in flight.
+    pending_sends: HashMap<u64, Box<SendOp>>,
+    next_send_id: u64,
+
+    // Temporary buffer of send ops about to be sent. The event loop builds this
+    // up, and then submits them all at once to io_uring.
+    send_ops: Vec<io_uring::squeue::Entry>,
+}
+
+impl Worker {
+    // Create a worker thread state with its own connection table and send ring.
+    //
+    // Worker never read from the socket directly, since they share the socket.
+    fn new(
+        id: usize,
+        archive: Arc<Archive>,
+        endpoint: Endpoint,
+        socket: std::net::UdpSocket,
+        ring_size: u32,
+    ) -> Result<Self> {
+        let ring = io_uring::IoUring::new(ring_size)?;
+        ring.submitter().register_files(&[socket.as_raw_fd()])?;
+        drop(socket);
+        Ok(Self {
+            id,
+            endpoint,
+            connections: HashMap::new(),
+            archive,
+            ring,
+            pending_sends: HashMap::new(),
+            next_send_id: USER_DATA_SEND_BASE,
+            send_ops: Vec::new(),
+        })
+    }
+
+    // Run the worker message loop until its command channel closes.
+    fn run(mut self, rx: Receiver<WorkerCommand>) {
+        loop {
+            let now = Instant::now();
+            let wait = if self.pending_sends.is_empty() {
+                self.connections
+                    .values_mut()
+                    .filter_map(|v| {
+                        v.conn
+                            .poll_timeout()
+                            .map(|t| t.saturating_duration_since(now))
+                    })
+                    //.inspect(|v| trace!("Connection min: {v:?}"))
+                    .min()
+                    .unwrap_or(MAXIMUM_TICK)
+                    .max(MINIMUM_TICK)
+                    .min(MAXIMUM_TICK)
+            } else {
+                MINIMUM_TICK
+            };
+            trace!("Worker {} next timeout: {:?}", self.id, wait);
+            let next_tick = now + wait;
+
+            // Wait for next event.
+            match rx.recv_timeout(wait) {
+                Ok(WorkerCommand::Datagram { now, remote, data }) => {
+                    self.handle_datagram(now, remote, data)
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            // Run timers. May be nothing to run, and this is just an empty tick
+            // (because received message, or just waiting for send completions),
+            // but it's harmless.
+            if Instant::now() >= next_tick {
+                trace!("Worker {} running timers", self.id);
+                self.handle_timeouts(now);
+            }
+
+            // Cleanup.
+            self.reap_send_completions();
+
+            // If anything above created more ops, give them to io_uring.
+            if let Err(e) = submit_ops(&mut self.ring, &mut self.send_ops) {
+                warn!("worker {} failed to submit send ops: {e}", self.id);
+            }
+        }
+        debug!("HTTP/3 worker {} exiting", self.id);
+    }
+
+    // Run QUIC endpoint processing for a datagram already assigned to this
+    // worker. This is where Initial handling, accept, and connection routing
+    // happen, so the network thread never performs that work.
+    fn handle_datagram(&mut self, now: Instant, remote: SocketAddr, data: BytesMut) {
         let mut scratch = Vec::new();
         match self
             .endpoint
@@ -298,207 +503,63 @@ impl NetworkServer {
                     scratch.len(),
                     "These should be equal. If not, truncate scratch?"
                 );
-                self.queue_transmit(transmit, &scratch, ops);
+                self.queue_transmit(transmit, scratch);
             }
             Some(DatagramEvent::NewConnection(incoming)) => {
                 match self.endpoint.accept(incoming, now, &mut scratch, None) {
-                    Ok((handle, conn)) => {
-                        self.assign_connection(handle, conn);
-                    }
+                    Ok((handle, conn)) => self.assign_connection(handle, conn, now),
                     Err(e) => {
-                        warn!("QUIC accept failed: {}", e.cause);
+                        warn!("worker {} QUIC accept failed: {}", self.id, e.cause);
                         if let Some(transmit) = e.response {
                             assert_eq!(
                                 transmit.size,
                                 scratch.len(),
                                 "These should be equal. If not, truncate scratch?"
                             );
-                            self.queue_transmit(transmit, &scratch, ops);
+                            self.queue_transmit(transmit, scratch);
                         }
                     }
                 }
             }
             Some(DatagramEvent::ConnectionEvent(handle, event)) => {
-                self.route_connection_event(handle, event);
+                self.handle_connection_event(handle, event, now);
             }
             None => {}
         }
     }
 
-    // Assign a new QUIC connection to a worker thread.
-    fn assign_connection(&mut self, handle: ConnectionHandle, conn: Connection) {
-        let worker = self.next_worker % self.workers.len();
-        self.next_worker = (self.next_worker + 1) % self.workers.len();
-        debug!("Accepted HTTP/3 connection {handle:?} on worker {worker}");
-        if let Err(e) = self.workers[worker].send(WorkerCommand::NewConnection { handle, conn }) {
-            warn!("worker {worker} channel closed while accepting {handle:?}: {e}");
-            self.endpoint.handle_event(handle, EndpointEvent::drained());
-            return;
-        }
-        self.worker_by_handle.insert(handle, worker);
-    }
-
-    // Forward an endpoint event back to the worker that owns the connection.
-    fn route_connection_event(&mut self, handle: ConnectionHandle, event: ConnectionEvent) {
-        let Some(&worker) = self.worker_by_handle.get(&handle) else {
-            warn!("dropping event for connection {handle:?} with no worker");
-            return;
-        };
-        if let Err(e) = self.workers[worker].send(WorkerCommand::ConnectionEvent { handle, event })
-        {
-            warn!("worker {worker} channel closed for connection {handle:?}: {e}");
-            self.worker_by_handle.remove(&handle);
-            self.endpoint.handle_event(handle, EndpointEvent::drained());
-        }
-    }
-
-    // Wake every worker so they can process QUIC timeouts.
-    //
-    // TODO: move this to another threads so that the network thread can sleep
-    // more.
-    fn handle_timeouts(&self, now: Instant) {
-        for (worker, tx) in self.workers.iter().enumerate() {
-            if let Err(e) = tx.send(WorkerCommand::Tick { now }) {
-                warn!("worker {worker} channel closed during timeout tick: {e}");
-            }
-        }
-    }
-
-    // Drain commands emitted by workers and turn them into network-side work.
-    fn handle_network_commands(&mut self, ops: &mut Vec<io_uring::squeue::Entry>) {
-        loop {
-            match self.network_rx.try_recv() {
-                Ok(command) => self.handle_network_command(command, ops),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
-            }
-        }
-    }
-
-    // Apply one worker-to-network command.
-    fn handle_network_command(
-        &mut self,
-        command: NetworkCommand,
-        ops: &mut Vec<io_uring::squeue::Entry>,
-    ) {
-        match command {
-            NetworkCommand::Transmit { transmit, packet } => {
-                self.queue_transmit(transmit, &packet, ops);
-            }
-            NetworkCommand::EndpointEvent { handle, event } => {
-                let drained = event.is_drained();
-                if let Some(conn_event) = self.endpoint.handle_event(handle, event) {
-                    self.route_connection_event(handle, conn_event);
-                }
-                if drained {
-                    self.worker_by_handle.remove(&handle);
-                }
-            }
-            NetworkCommand::ConnectionClosed { handle } => {
-                self.worker_by_handle.remove(&handle);
-                self.endpoint.handle_event(handle, EndpointEvent::drained());
-            }
-        }
-    }
-
-    // Queue an outbound UDP datagram on the fixed socket.
-    //
-    // TODO: instead of `packet` payload, take `impl Into<Vec<u8>>` to save a
-    // copy?
-    fn queue_transmit(
-        &mut self,
-        transmit: Transmit,
-        packet: &[u8],
-        ops: &mut Vec<io_uring::squeue::Entry>,
-    ) {
-        assert_eq!(
-            transmit.size,
-            packet.len(),
-            "Temporary check to make sure they're always equal"
+    // Register a newly accepted QUIC connection on this worker and immediately
+    // drain any handshake/application work it made available.
+    fn assign_connection(&mut self, handle: ConnectionHandle, conn: Connection, now: Instant) {
+        debug!(
+            "Accepted HTTP/3 connection {handle:?} on worker {}",
+            self.id
         );
-        if packet.len() < transmit.size {
+        self.connections.insert(
+            handle,
+            ConnectionState {
+                conn,
+                h3: H3Connection::default(),
+            },
+        );
+        self.drive_connection(handle, now);
+    }
+
+    // Deliver an endpoint-produced connection event to a local connection.
+    fn handle_connection_event(
+        &mut self,
+        handle: ConnectionHandle,
+        event: quinn_proto::ConnectionEvent,
+        now: Instant,
+    ) {
+        if let Some(state) = self.connections.get_mut(&handle) {
+            state.conn.handle_event(event);
+            self.drive_connection(handle, now);
+        } else {
             warn!(
-                "dropping malformed transmit with missing packet bytes. {} < {}",
-                packet.len(),
-                transmit.size
+                "worker {} dropping event for unknown connection {handle:?}",
+                self.id
             );
-            return;
-        }
-        if transmit.segment_size.is_some() {
-            warn!("dropping segmented transmit; GSO is not enabled in this binary");
-            return;
-        }
-        let id = self.next_send_id;
-        self.next_send_id += 1;
-        let send = Box::new(SendOp::new(transmit.destination, &packet[..transmit.size]));
-        let op = send.op(self.socket_fd, id);
-        self.pending_sends.insert(id, send);
-        ops.push(op);
-    }
-
-    // Release the send completion bookkeeping once io_uring finishes.
-    fn send_completed(&mut self, id: u64, result: i32) {
-        self.pending_sends.remove(&id);
-        if result < 0 {
-            warn!(
-                "send failed: {}",
-                io::Error::from_raw_os_error(result.abs())
-            );
-        }
-    }
-}
-
-struct WorkerState {
-    id: usize,
-    connections: HashMap<ConnectionHandle, ConnectionState>,
-    archive: Arc<Archive>,
-    network_tx: Sender<NetworkCommand>,
-}
-
-impl WorkerState {
-    // Create a worker thread state with its own connection table.
-    fn new(id: usize, archive: Arc<Archive>, network_tx: Sender<NetworkCommand>) -> Self {
-        Self {
-            id,
-            connections: HashMap::new(),
-            archive,
-            network_tx,
-        }
-    }
-
-    // Run the worker message loop until its command channel closes.
-    fn run(mut self, rx: Receiver<WorkerCommand>) {
-        while let Ok(command) = rx.recv() {
-            self.handle_command(command);
-        }
-        debug!("HTTP/3 worker {} exiting", self.id);
-    }
-
-    // Handle a single command from the network thread.
-    fn handle_command(&mut self, command: WorkerCommand) {
-        match command {
-            WorkerCommand::NewConnection { handle, conn } => {
-                self.connections.insert(
-                    handle,
-                    ConnectionState {
-                        conn,
-                        h3: H3Connection::default(),
-                    },
-                );
-                self.drive_connection(handle, Instant::now());
-            }
-            WorkerCommand::ConnectionEvent { handle, event } => {
-                if let Some(state) = self.connections.get_mut(&handle) {
-                    state.conn.handle_event(event);
-                    self.drive_connection(handle, Instant::now());
-                } else {
-                    warn!(
-                        "worker {} dropping event for unknown connection {handle:?}",
-                        self.id
-                    );
-                }
-            }
-            WorkerCommand::Tick { now } => self.handle_timeouts(now),
         }
     }
 
@@ -551,17 +612,26 @@ impl WorkerState {
             }
 
             for (transmit, packet) in transmits {
-                self.send_network(NetworkCommand::Transmit { transmit, packet });
+                self.queue_transmit(transmit, packet);
             }
 
             if endpoint_events.is_empty() && app_events.is_empty() {
                 break;
             }
 
+            let mut returned_conn_events = Vec::new();
             for event in endpoint_events {
                 sent_drained |= event.is_drained();
                 remove |= event.is_drained();
-                self.send_network(NetworkCommand::EndpointEvent { handle, event });
+                if let Some(conn_event) = self.endpoint.handle_event(handle, event) {
+                    returned_conn_events.push(conn_event);
+                }
+            }
+
+            if let Some(state) = self.connections.get_mut(&handle) {
+                for event in returned_conn_events {
+                    state.conn.handle_event(event);
+                }
             }
 
             for event in app_events {
@@ -574,7 +644,7 @@ impl WorkerState {
         if remove {
             self.connections.remove(&handle);
             if !sent_drained {
-                self.send_network(NetworkCommand::ConnectionClosed { handle });
+                self.endpoint.handle_event(handle, EndpointEvent::drained());
             }
         }
     }
@@ -723,10 +793,51 @@ impl WorkerState {
         }
     }
 
-    // Send a worker-produced command back to the network thread.
-    fn send_network(&self, command: NetworkCommand) {
-        if let Err(e) = self.network_tx.send(command) {
-            warn!("network channel closed for worker {}: {e}", self.id);
+    // Queue an outbound UDP datagram on this worker's fixed socket.
+    fn queue_transmit(&mut self, transmit: Transmit, packet: Vec<u8>) {
+        assert_eq!(
+            transmit.size,
+            packet.len(),
+            "Temporary check to make sure they're always equal"
+        );
+        if packet.len() < transmit.size {
+            warn!(
+                "dropping malformed transmit with missing packet bytes. {} < {}",
+                packet.len(),
+                transmit.size
+            );
+            return;
+        }
+        if transmit.segment_size.is_some() {
+            warn!("dropping segmented transmit; GSO is not enabled in this binary");
+            return;
+        }
+        let id = self.next_send_id;
+        self.next_send_id += 1;
+        let send = Box::new(SendOp::new(transmit.destination, packet));
+        let op = send.op(SOCKET_FIXED_FILE, id);
+        self.pending_sends.insert(id, send);
+        self.send_ops.push(op);
+    }
+
+    // Release send buffers once this worker's ring completes sends.
+    fn reap_send_completions(&mut self) {
+        let mut cq = self.ring.completion();
+        cq.sync();
+        let completions: Vec<_> = cq.map(|cqe| (cqe.user_data(), cqe.result())).collect();
+        for (id, result) in completions {
+            if id < USER_DATA_SEND_BASE {
+                warn!("worker {} unknown completion user_data={id}", self.id);
+                continue;
+            }
+            self.pending_sends.remove(&id);
+            if result < 0 {
+                warn!(
+                    "worker {} send failed: {}",
+                    self.id,
+                    io::Error::from_raw_os_error(result.abs())
+                );
+            }
         }
     }
 }
@@ -825,29 +936,6 @@ fn make_server_config(opt: &Opt) -> Result<ServerConfig> {
     transport.max_concurrent_bidi_streams(256_u16.into());
     config.transport_config(Arc::new(transport));
     Ok(config)
-}
-
-// Build the timeout SQE used to wake the main loop periodically.
-fn make_timeout(ts: &io_uring::types::Timespec) -> io_uring::squeue::Entry {
-    io_uring::opcode::Timeout::new(std::ptr::from_ref(ts))
-        .build()
-        .user_data(USER_DATA_TIMEOUT)
-}
-
-// Parse the human-friendly CLI duration syntax.
-fn parse_duration(src: &str) -> std::result::Result<Duration, String> {
-    if let Some(ms) = src.strip_suffix("ms") {
-        return Ok(Duration::from_millis(
-            ms.parse().map_err(|_| "Invalid milliseconds")?,
-        ));
-    }
-    if let Some(secs) = src.strip_suffix('s') {
-        let secs = secs.parse::<f64>().map_err(|_| "Invalid seconds")?;
-        let secs_whole = secs.trunc() as u64;
-        let nanos = (secs.fract() * 1_000_000_000.0) as u32;
-        return Ok(Duration::new(secs_whole, nanos));
-    }
-    Err("Invalid format. Use 'Xs' or 'Yms' (e.g., '1.5s', '500ms')".to_string())
 }
 
 // Convert a SocketAddr into the sockaddr storage needed by io_uring.
@@ -971,47 +1059,80 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| {
             std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
         })
-        .max(1);
+        .max(1)
+        .min(MAX_WORKERS);
     info!("Using {worker_count} HTTP/3 worker threads");
 
-    // Spawn threads.
-    let (network_tx, network_rx) = mpsc::channel();
-    let mut worker_txs = Vec::with_capacity(worker_count);
-    let mut _worker_handles = Vec::with_capacity(worker_count);
-    for id in 0..worker_count {
-        let (worker_tx, worker_rx) = mpsc::channel();
-        let worker = WorkerState::new(id, Arc::clone(&archive), network_tx.clone());
-        let handle = std::thread::Builder::new()
-            .name(format!("tarweb-h3-worker-{id}"))
-            .spawn(move || worker.run(worker_rx))
-            .with_context(|| format!("spawning HTTP/3 worker {id}"))?;
-        worker_txs.push(worker_tx);
-        _worker_handles.push(handle);
-    }
-    drop(network_tx);
+    let server_config = Arc::new(make_server_config(&opt)?);
 
     // Bind to listening socket.
     let socket = std::net::UdpSocket::bind(opt.listen)
         .with_context(|| format!("binding UDP {}", opt.listen))?;
     socket.set_nonblocking(true)?;
-    let socket_fd = socket.as_raw_fd();
-    let local_addr = socket.local_addr()?;
-    info!("HTTP/3 listening on {local_addr}");
+    info!("HTTP/3 listening on {}", socket.local_addr()?);
 
-    let endpoint_config = Arc::new(EndpointConfig::default());
-    let server_config = Arc::new(make_server_config(&opt)?);
-    let endpoint = Endpoint::new(endpoint_config, Some(server_config), false, None);
+    let mut cid_key = [0; 32];
+    rand::rng().fill_bytes(&mut cid_key);
+
+    // Start workers.
+    let mut worker_txs = Vec::with_capacity(worker_count);
+    let mut _worker_handles = Vec::with_capacity(worker_count);
+    {
+        let (worker_init_tx, worker_init_rx) = mpsc::channel();
+        for id in 0..worker_count {
+            let (worker_tx, worker_rx) = mpsc::channel();
+            let worker_id = u16::try_from(id).expect("worker_count was checked above");
+            let mut endpoint_config = EndpointConfig::default();
+            endpoint_config.cid_generator(move || {
+                Box::new(WorkerConnectionIdGenerator::new(worker_id, cid_key))
+            });
+            let endpoint = Endpoint::new(
+                Arc::new(endpoint_config),
+                Some(Arc::clone(&server_config)),
+                false,
+                None,
+            );
+            let worker_socket = socket.try_clone()?;
+            let worker_archive = Arc::clone(&archive);
+            let init_tx = worker_init_tx.clone();
+            let ring_size = opt.ring_size;
+            let handle = std::thread::Builder::new()
+                .name(format!("tarweb-h3-worker-{id}"))
+                .spawn(move || {
+                    match Worker::new(id, worker_archive, endpoint, worker_socket, ring_size) {
+                        Ok(worker) => {
+                            let _ = init_tx.send(Ok(id));
+                            worker.run(worker_rx);
+                        }
+                        Err(e) => {
+                            let _ =
+                                init_tx.send(Err(format!("HTTP/3 worker {id} init failed: {e}")));
+                        }
+                    }
+                })
+                .with_context(|| format!("spawning HTTP/3 worker {id}"))?;
+            worker_txs.push(worker_tx);
+            _worker_handles.push(handle);
+        }
+        drop(worker_init_tx);
+        for _ in 0..worker_count {
+            match worker_init_rx
+                .recv()
+                .context("waiting for HTTP/3 worker init")?
+            {
+                Ok(id) => debug!("HTTP/3 worker {id} initialized"),
+                Err(e) => return Err(anyhow!(e)),
+            }
+        }
+    }
 
     let mut ring = io_uring::IoUring::new(opt.ring_size)?;
-    ring.submitter().register_files(&[socket_fd])?;
+    ring.submitter().register_files(&[socket.as_raw_fd()])?;
     drop(socket);
     let mut recv = RecvSlot::new();
-    let timeout: io_uring::types::Timespec = opt.periodic_wakeup.into();
-    let mut server = NetworkServer::new(endpoint, SOCKET_FIXED_FILE, worker_txs, network_rx);
 
     unsafe {
         ring.submission().push(&recv.op(SOCKET_FIXED_FILE)).unwrap();
-        ring.submission().push(&make_timeout(&timeout)).unwrap();
     }
     ring.submit()?;
 
@@ -1019,7 +1140,6 @@ fn main() -> Result<()> {
 
     let mut ops = Vec::new();
     loop {
-        server.handle_network_commands(&mut ops);
         submit_ops(&mut ring, &mut ops)?;
 
         let mut cq = ring.completion();
@@ -1046,8 +1166,24 @@ fn main() -> Result<()> {
                         let len: usize = result.try_into().unwrap();
                         match recv.remote() {
                             Ok(remote) => {
-                                let data = BytesMut::from(&recv.buf[..len]);
-                                server.handle_datagram(Instant::now(), remote, data, &mut ops);
+                                let packet = &recv.buf[..len];
+                                if let Some(worker) = worker_for_datagram(packet, worker_txs.len())
+                                {
+                                    let data = BytesMut::from(packet);
+                                    if let Err(e) =
+                                        worker_txs[worker].send(WorkerCommand::Datagram {
+                                            now: Instant::now(),
+                                            remote,
+                                            data,
+                                        })
+                                    {
+                                        warn!(
+                                            "worker {worker} channel closed while forwarding datagram: {e}"
+                                        );
+                                    }
+                                } else {
+                                    trace!("dropping datagram without a routable QUIC CID");
+                                }
                             }
                             Err(e) => warn!("recvmsg address error: {e}"),
                         }
@@ -1059,18 +1195,57 @@ fn main() -> Result<()> {
                     }
                     ops.push(recv.op(SOCKET_FIXED_FILE));
                 }
-                USER_DATA_TIMEOUT => {
-                    server.handle_timeouts(Instant::now());
-                    ops.push(make_timeout(&timeout));
-                }
-                id if id >= USER_DATA_SEND_BASE => {
-                    server.send_completed(id, result);
-                }
                 _ => warn!("unknown completion user_data={user_data} result={result}"),
             }
         }
 
-        server.handle_network_commands(&mut ops);
         submit_ops(&mut ring, &mut ops)?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quinn_proto::ConnectionIdGenerator;
+
+    #[test]
+    fn worker_cid_routes_to_issuing_worker() {
+        let key = [0x5a; 32];
+        let mut generator = WorkerConnectionIdGenerator::new(42, key);
+        let cid = generator.generate_cid();
+
+        assert_eq!(worker_from_server_cid(cid.as_ref(), 64), Some(42));
+        assert!(generator.validate(&cid).is_ok());
+
+        let mut short_packet = Vec::with_capacity(1 + WORKER_CID_LEN);
+        short_packet.push(0x40);
+        short_packet.extend_from_slice(cid.as_ref());
+        assert_eq!(worker_for_datagram(&short_packet, 64), Some(42));
+    }
+
+    #[test]
+    fn tampered_worker_cid_fails_endpoint_validation() {
+        let key = [0x5a; 32];
+        let mut generator = WorkerConnectionIdGenerator::new(7, key);
+        let mut cid = generator.generate_cid().as_ref().to_vec();
+        cid[WORKER_CID_SIGNATURE_OFFSET] ^= 0x01;
+
+        assert!(generator.validate(&ConnectionId::new(&cid)).is_err());
+        assert_eq!(worker_from_server_cid(&cid, 16), Some(7));
+    }
+
+    #[test]
+    fn client_initial_cid_hashes_consistently() {
+        let mut long_packet = Vec::new();
+        long_packet.push(0xc0);
+        long_packet.extend_from_slice(&1u32.to_be_bytes());
+        long_packet.push(4);
+        long_packet.extend_from_slice(&[1, 2, 3, 4]);
+        long_packet.push(0);
+
+        let first = worker_for_datagram(&long_packet, 8);
+        let second = worker_for_datagram(&long_packet, 8);
+        assert_eq!(first, second);
+        assert!(first.is_some());
     }
 }

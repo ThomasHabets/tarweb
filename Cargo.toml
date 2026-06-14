@@ -51,6 +51,7 @@ caps = "0.5.6"
 landlock = "0.4.3"
 chrono = "0.4.45"
 quinn-proto = { version = "0.11.14", default-features = false, features = ["bloom", "log", "rustls-ring"] }
+rand = "0.9"
 
 [build-dependencies]
 prost-build = "0.14.1"
