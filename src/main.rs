@@ -310,7 +310,9 @@ enum State {
     //
     // This state has a pending Write.
     //
-    // When writing headers finishes, state goes to WritingData.
+    // The pending op is a writev() that starts with headers and may include the
+    // first response body bytes. If it only writes headers, state goes to
+    // WritingData.
     WritingHeaders(FixedFile, usize, usize),
 
     // This state has a pending Write.
@@ -366,6 +368,7 @@ struct Connection {
     // TODO: merge these buffers. We're either reading or writing.
     write_buf: [u8; MAX_WRITE_BUF],
     header_buf: HeaderBuf,
+    write_iov: [libc::iovec; 2],
 
     // Close the connection after the in-flight response has been written.
     close_after_response: bool,
@@ -384,6 +387,16 @@ impl Connection {
             read_buf_pos: 0,
             outstanding: 0,
             header_buf: HeaderBuf::default(),
+            write_iov: [
+                libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                },
+                libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                },
+            ],
             close_after_response: false,
             last_action: std::time::Instant::now(),
             _pin: std::marker::PhantomPinned,
@@ -518,31 +531,51 @@ impl Connection {
     }
 
     // Header bytes have been put in `header_buf`, so this triggers write.
-    fn write_header_bytes(&mut self, ops: &mut SQueue, pos: usize, len: usize) {
+    fn write_header_bytes(&mut self, ops: &mut SQueue, archive: &Archive, pos: usize, len: usize) {
         let State::Reading(fd) = self.state else {
             panic!("Called write_header in state {:?}", self.state);
         };
-        self.write_headers(ops, fd, pos, len);
+        self.write_headers(ops, archive, fd, pos, len);
     }
 
-    fn write_headers(&mut self, ops: &mut SQueue, fd: FixedFile, pos: usize, len: usize) {
+    fn write_headers(
+        &mut self,
+        ops: &mut SQueue,
+        archive: &Archive,
+        fd: FixedFile,
+        pos: usize,
+        len: usize,
+    ) {
         // TODO: change to SendZc?
         // Or in some cases Splice?
-        // Surely at least writev()
-        // If writev, make sure to handle the over-consumption in write_done()
         self.outstanding += 1;
-        let op = io_uring::opcode::Write::new(
-            fd,
-            self.header_buf.as_ptr(),
-            self.header_buf.len().try_into().unwrap(),
-        )
-        .build()
-        .user_data((self.id as u64) | USER_DATA_OP_WRITE);
+        let iovecs = if len == 0 {
+            self.write_iov[0] = libc::iovec {
+                iov_base: self.header_buf.as_ptr().cast::<libc::c_void>().cast_mut(),
+                iov_len: self.header_buf.len(),
+            };
+            1
+        } else {
+            let msg = archive.get_slice(pos, len);
+            self.write_iov[0] = libc::iovec {
+                iov_base: self.header_buf.as_ptr().cast::<libc::c_void>().cast_mut(),
+                iov_len: self.header_buf.len(),
+            };
+            self.write_iov[1] = libc::iovec {
+                iov_base: msg.as_ptr().cast::<libc::c_void>().cast_mut(),
+                iov_len: msg.len(),
+            };
+            2
+        };
+        let op =
+            io_uring::opcode::Writev::new(fd, self.write_iov.as_ptr(), iovecs.try_into().unwrap())
+                .build()
+                .user_data((self.id as u64) | USER_DATA_OP_WRITE);
         ops.push(op);
         self.state = State::WritingHeaders(fd, pos, len);
     }
 
-    // Writing headers has finished. Now we send data.
+    // Continue writing response body data after headers have completed.
     //
     // This call may or may not be the first bytes of writing data.
     //
@@ -571,17 +604,30 @@ impl Connection {
         match &self.state {
             State::WritingHeaders(fd, pos, len) => {
                 let fd = *fd;
-                self.header_buf.drain(..wrote);
+                let pos = *pos;
+                let len = *len;
+                let header_len = self.header_buf.len();
+                let header_wrote = wrote.min(header_len);
+                let body_wrote = wrote.saturating_sub(header_len);
+                self.header_buf.drain(..header_wrote);
                 if self.header_buf.is_empty() {
-                    if *len == 0 {
+                    if body_wrote > len {
+                        warn!(
+                            "writev reported more body bytes ({body_wrote}) than response body length ({len})"
+                        );
+                    }
+                    let body_wrote = body_wrote.min(len);
+                    let pos = pos + body_wrote;
+                    let len = len - body_wrote;
+                    if len == 0 {
                         self.state = State::Reading(fd);
                         true
                     } else {
-                        self.write_data(ops, archive, fd, *pos, *len);
+                        self.write_data(ops, archive, fd, pos, len);
                         false
                     }
                 } else {
-                    self.write_headers(ops, fd, *pos, *len);
+                    self.write_headers(ops, archive, fd, pos, len);
                     false
                 }
             }
@@ -1307,7 +1353,7 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
             hook.con.header_buf.clear();
             let (pos, len) = answer_request_header_fields_too_large(&mut hook.con.header_buf)?;
             hook.con.close_after_response = true;
-            hook.con.write_header_bytes(ops, pos, len);
+            hook.con.write_header_bytes(ops, archive, pos, len);
             return Ok(());
         }
         // No full request yet.
@@ -1326,7 +1372,7 @@ fn maybe_answer_req(hook: &mut Hook, ops: &mut SQueue, archive: &Archive) -> Res
         hook.con.close_after_response,
     )
     .context("failed to populate response headers")?;
-    hook.con.write_header_bytes(ops, pos, len);
+    hook.con.write_header_bytes(ops, archive, pos, len);
     hook.con.read_buf.copy_within(reqlen.., 0);
     hook.con.read_buf_pos -= reqlen;
     Ok(())
