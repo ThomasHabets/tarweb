@@ -931,7 +931,7 @@ fn build_response(request_stream: &[u8], archive: &Archive) -> Vec<u8> {
     let (status, body, content_type) = match archive.entry(path) {
         Some(entry) => {
             let range = entry.plain();
-            let content_type = if path.ends_with(".html") {
+            let content_type = if path.ends_with(".html") || path.ends_with("/") {
                 qpack::ContentType::Html
             } else {
                 qpack::ContentType::Plain

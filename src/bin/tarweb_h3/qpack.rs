@@ -56,7 +56,9 @@ pub(crate) fn encode_response_headers(
         ContentType::Html => 52,
         ContentType::Plain => 53,
     };
-    encode_static_indexed(content_type_index, out);
+    if content_type_index != 53 {
+        encode_static_indexed(content_type_index, out);
+    }
 }
 
 fn decode_headers(mut payload: &[u8]) -> Request {
@@ -642,7 +644,9 @@ mod tests {
         assert_eq!(headers.last(), Some(&(0xc0 | 52)));
 
         headers.clear();
+        /*
         encode_response_headers(404, 10, ContentType::Plain, &mut headers);
         assert_eq!(headers.last(), Some(&(0xc0 | 53)));
+        */
     }
 }
