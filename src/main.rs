@@ -37,6 +37,7 @@ use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Error, Result, anyhow};
 use arrayvec::ArrayVec;
@@ -54,6 +55,8 @@ mod datefmt;
 mod privs;
 
 type FixedFile = io_uring::types::Fixed;
+
+static ENABLE_H3: AtomicBool = AtomicBool::new(false);
 
 #[cfg(not(feature = "alloc-tripwire"))]
 mod allocation_tripwire {
@@ -1393,6 +1396,10 @@ fn common_headers(out: &mut HeaderBuf, close_after_response: bool) -> Result<()>
         "Connection: {connection}\r\nVary: accept-encoding\r\nServer: tarweb/{}\r\n",
         env!("CARGO_PKG_VERSION"),
     )?;
+    if ENABLE_H3.load(std::sync::atomic::Ordering::Relaxed) {
+        // TODO: allow custom port?
+        write!(out, "Alt-Svc: h3=\":443\"; ma=86400\r\n")?;
+    }
     Ok(())
 }
 
@@ -2188,6 +2195,10 @@ struct Opt {
     #[arg(long)]
     etags: bool,
 
+    /// Advertise H3 support.
+    #[arg(long)]
+    h3: bool,
+
     /// Max concurrent connections.
     #[arg(long, default_value_t = 100)]
     max_connections: usize,
@@ -2372,6 +2383,7 @@ fn main() -> Result<()> {
         env!("BUILD_PROFILE")
     );
     let opt = Opt::parse();
+    ENABLE_H3.store(opt.h3, std::sync::atomic::Ordering::Relaxed);
 
     // This is only needed for integration tests, that get multiple crypto
     // implementation features turned on, so we have to pick one.
