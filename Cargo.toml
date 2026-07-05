@@ -68,7 +68,7 @@ rcgen = "0.14.5"
 alloc-tripwire = []
 
 [profile.release]
-debug = true
+#debug = true
 
 [lib]
 name = "tarweb"
