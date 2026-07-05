@@ -928,18 +928,23 @@ fn build_response(request_stream: &[u8], archive: &Archive) -> Vec<u8> {
     let is_head = request.method.as_deref() == Some("HEAD");
     let path = request.path.as_deref().unwrap_or("/");
 
-    let (status, body) = match archive.entry(path) {
+    let (status, body, content_type) = match archive.entry(path) {
         Some(entry) => {
             let range = entry.plain();
-            (200, archive.get_slice(range.pos, range.len))
+            let content_type = if path.ends_with(".html") {
+                qpack::ContentType::Html
+            } else {
+                qpack::ContentType::Plain
+            };
+            (200, archive.get_slice(range.pos, range.len), content_type)
         }
-        None => (404, b"Not found\n".as_slice()),
+        None => (404, b"Not found\n".as_slice(), qpack::ContentType::Plain),
     };
     let content_length = body.len();
     let body = if is_head { &[][..] } else { body };
 
     let mut headers = Vec::new();
-    qpack::encode_response_headers(status, content_length, &mut headers);
+    qpack::encode_response_headers(status, content_length, content_type, &mut headers);
 
     let mut out = Vec::new();
     encode_frame(H3_FRAME_HEADERS, &headers, &mut out);

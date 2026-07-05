@@ -6,6 +6,12 @@ pub(crate) struct Request {
     pub(crate) path: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ContentType {
+    Html,
+    Plain,
+}
+
 pub(crate) fn parse_request(stream: &[u8]) -> Request {
     let mut pos = 0;
     while pos < stream.len() {
@@ -30,7 +36,12 @@ pub(crate) fn parse_request(stream: &[u8]) -> Request {
     }
 }
 
-pub(crate) fn encode_response_headers(status: u16, content_length: usize, out: &mut Vec<u8>) {
+pub(crate) fn encode_response_headers(
+    status: u16,
+    content_length: usize,
+    content_type: ContentType,
+    out: &mut Vec<u8>,
+) {
     // Required Insert Count and Delta Base are both zero because this minimal
     // encoder only references the static table.
     out.extend_from_slice(&[0, 0]);
@@ -41,7 +52,11 @@ pub(crate) fn encode_response_headers(status: u16, content_length: usize, out: &
     };
     encode_static_indexed(status_index, out);
     encode_literal_static_name(4, &content_length.to_string(), out);
-    encode_static_indexed(53, out);
+    let content_type_index = match content_type {
+        ContentType::Html => 52,
+        ContentType::Plain => 53,
+    };
+    encode_static_indexed(content_type_index, out);
 }
 
 fn decode_headers(mut payload: &[u8]) -> Request {
@@ -618,5 +633,16 @@ mod tests {
         let request = parse_request(&stream);
         assert_eq!(request.method.as_deref(), Some("GET"));
         assert_eq!(request.path.as_deref(), Some("/README.md"));
+    }
+
+    #[test]
+    fn response_headers_choose_content_type() {
+        let mut headers = Vec::new();
+        encode_response_headers(200, 123, ContentType::Html, &mut headers);
+        assert_eq!(headers.last(), Some(&(0xc0 | 52)));
+
+        headers.clear();
+        encode_response_headers(404, 10, ContentType::Plain, &mut headers);
+        assert_eq!(headers.last(), Some(&(0xc0 | 53)));
     }
 }
