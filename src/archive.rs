@@ -5,7 +5,7 @@ use std::io::Read;
 use anyhow::{Context, Result};
 use rayon::iter::IntoParallelRefMutIterator;
 use rayon::iter::ParallelIterator;
-use tracing::{info, trace};
+use tracing::{debug, info, trace};
 
 #[must_use]
 fn calculate_etag(bytes: &[u8]) -> String {
@@ -56,8 +56,11 @@ impl Archive {
     fn new(filename: &std::path::Path, prefix: &str, etags: bool) -> Result<Self> {
         let file = std::fs::File::open(filename)?;
         let map = unsafe { memmap2::Mmap::map(&file)? };
-        // Can't hurt to at least ask to be hugepages or mergable.
-        map.advise(memmap2::Advice::HugePage)?;
+        // These memory optimizations are optional and may be unsupported by
+        // the kernel or the filesystem backing the archive.
+        if let Err(e) = map.advise(memmap2::Advice::HugePage) {
+            debug!("Huge page advice unavailable: {e}");
+        }
         Self::new_inner(map, file, prefix, etags)
     }
 
@@ -89,7 +92,9 @@ impl Archive {
         prefix: &str,
         etags: bool,
     ) -> Result<Self> {
-        mmap.advise(memmap2::Advice::Mergeable)?;
+        if let Err(e) = mmap.advise(memmap2::Advice::Mergeable) {
+            debug!("Mergeable memory advice unavailable: {e}");
+        }
         let mut archive = tar::Archive::new(file);
         let mut content = HashMap::new();
         info!("Indexing…");
