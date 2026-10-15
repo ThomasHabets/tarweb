@@ -1,5 +1,3 @@
-// ## TODO
-// * Print server error log if assert fails.
 use std::io::{Read, Write};
 use std::process::Command;
 
@@ -66,8 +64,21 @@ impl Child {
             thread: Some(thread),
         }
     }
-    fn is_done(&mut self) -> Result<bool> {
-        Ok(self.process.as_mut().unwrap().try_wait()?.is_some())
+    fn ensure_running(&mut self) -> Result<()> {
+        if let Some(status) = self.process.as_mut().unwrap().try_wait()? {
+            let stderr = self
+                .thread
+                .take()
+                .unwrap()
+                .join()
+                .map_err(|e| anyhow::anyhow!("{e:?}"))??;
+            return Err(anyhow::anyhow!(
+                "server {} has exited ({status}):\n{}",
+                self.name,
+                String::from_utf8_lossy(&stderr)
+            ));
+        }
+        Ok(())
     }
     fn shutdown(mut self) -> Result<(std::process::Child, Result<Vec<u8>>)> {
         self.stop();
@@ -197,9 +208,7 @@ fn make_tarfile(dir: &std::path::Path) -> Result<()> {
 // exited, then that's an error.
 fn probe_tcp(child: &mut Child, addr: std::net::SocketAddr) -> Result<()> {
     while std::net::TcpStream::connect(addr).is_err() {
-        if child.is_done()? {
-            return Err(anyhow::anyhow!("server has exited"));
-        }
+        child.ensure_running()?;
     }
     Ok(())
 }
@@ -210,9 +219,7 @@ fn probe_pass(child: &mut Child, addr: &std::path::Path) -> Result<()> {
         if sock.connect(addr).is_ok() {
             break;
         }
-        if child.is_done()? {
-            return Err(anyhow::anyhow!("server has exited"));
-        }
+        child.ensure_running()?;
     }
     Ok(())
 }
@@ -330,12 +337,7 @@ fn start_router<S: Into<String>>(
     });
     let mut ch = Child::new(name, child, thread);
     let addr = addr.parse()?;
-    if let Err(e) = probe_tcp(&mut ch, addr) {
-        let ch = ch.shutdown()?.0.wait_with_output()?;
-        println!("out:\n{}", String::from_utf8_lossy(&ch.stdout));
-        println!("err:\n{}", String::from_utf8_lossy(&ch.stderr));
-        return Err(e);
-    }
+    probe_tcp(&mut ch, addr)?;
     Ok((ch, addr))
 }
 
@@ -1445,7 +1447,10 @@ max_lifetime_ms: 10000
 
     let mut oha = Command::new("oha");
     let oha = oha
+        // oha parses NO_COLOR as a boolean and rejects values such as "1".
+        .env_remove("NO_COLOR")
         .args([
+            "--no-color",
             "--insecure",
             "--no-tui",
             "-z",
@@ -1458,7 +1463,7 @@ max_lifetime_ms: 10000
     let stderr = String::from_utf8(oha.stderr)?;
     assert!(
         oha.status.success(),
-        "curl failed. Stdout: \n{stdout:?}\nStderr:\n{stderr}"
+        "oha failed. Stdout: \n{stdout:?}\nStderr:\n{stderr}"
     );
     logdump.set_success();
     Ok(())
