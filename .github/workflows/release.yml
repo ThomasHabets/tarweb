@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 1.2.3 (defaults to next version)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Require main
+        env:
+          RELEASE_BRANCH: ${{ github.ref_name }}
+        run: test "$RELEASE_BRANCH" = main
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Rustup install nightly
+        run: rustup install nightly
+      - name: Install clippy
+        run: rustup component add --toolchain nightly clippy
+
+      - name: Cargo install
+        run: cargo install --locked tickbox cargo-semver-checks cargo-deny sni-router oha
+
+      - name: apt-get update
+        run: sudo apt-get update
+
+      - name: Install native dependencies
+        run: sudo apt-get install -y libseccomp-dev protobuf-compiler libprotobuf-dev
+
+      - name: Run release
+        env:
+          MANUAL_VERSION: ${{ inputs.version }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          CLEANUP=true tickbox --dir tickbox/bump_version --disable-tui --max-concurrency=1
