@@ -36,14 +36,14 @@ jobs:
       - name: Install clippy
         run: rustup component add --toolchain nightly clippy
 
-      - name: Cargo install
-        run: cargo install --locked tickbox cargo-semver-checks cargo-deny sni-router oha
-
       - name: apt-get update
         run: sudo apt-get update
 
       - name: Install native dependencies
         run: sudo apt-get install -y libseccomp-dev protobuf-compiler libprotobuf-dev
+
+      - name: Cargo install
+        run: cargo install --locked tickbox cargo-semver-checks cargo-deny sni-router oha
 
       - name: Run release
         env:
