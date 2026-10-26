@@ -2163,6 +2163,7 @@ fn parse_octal(s: &str) -> Result<u32, std::num::ParseIntError> {
 
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Parser)]
+#[clap(version)]
 struct Opt {
     #[arg(
         long,

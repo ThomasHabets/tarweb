@@ -91,6 +91,7 @@ const WORKER_CID_SIGNATURE_LEN: usize = WORKER_CID_LEN - WORKER_CID_SIGNATURE_OF
 const _: () = assert!(WORKER_CID_SIGNATURE_LEN == 5);
 
 #[derive(Parser)]
+#[clap(version)]
 struct Opt {
     #[arg(
         long,
