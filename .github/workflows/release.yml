@@ -71,6 +71,7 @@ jobs:
         env:
           MANUAL_VERSION: ${{ inputs.version }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          SNI_ROUTER_H3_BIN: sni-router-h3
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
