@@ -112,3 +112,56 @@ a 10Gbps link at least, with small requests.
   either it'd require copying from the fixed buffer to the connection buffer, or
   parse request from a non-contiguous buffer (all the while holding on to the
   buffer, and there can only be 65536 of them).
+
+
+## HTTP/3 with routable connection IDs
+
+`tarweb-h3` can issue QUIC-LB connection IDs so `sni-router-h3` can forward
+replacement CIDs and client address migrations. This is opt-in: without any
+`--quic-lb-*` flags, the existing 16-byte worker CIDs and behavior are unchanged.
+
+Create a shared AES-128 key file and restrict access to it:
+
+```sh
+umask 077
+openssl rand -hex 16 > quic-lb.key
+```
+
+Configure the router with the same key, configuration ID, and backend ID (see
+sni-router's QUIC-LB configuration). Then start the backend:
+
+```sh
+tarweb-h3 --listen '[::1]:8443' --tls-cert cert.pem --tls-key key.pem \
+    --quic-lb-key-file quic-lb.key --quic-lb-server-id 123 \
+    --quic-lb-config-id 0 site.tar
+```
+
+The key file must contain 32 hexadecimal characters, with optional surrounding
+whitespace. Server IDs are decimal unsigned 32-bit integers. Configuration IDs
+are 0 through 6 and default to 0 when QUIC-LB is enabled. The key-file and server-ID
+flags must be provided together; a configuration ID alone is an error.
+
+The implementation supports the 17-byte, single-pass AES-128 encoding from
+`draft-ietf-quic-load-balancers-22`. The encrypted block begins with a four-byte
+backend ID; its twelve-byte nonce also carries private worker-routing and
+validation data. Other QUIC-LB encodings are not supported. Quinn handles QUIC
+packet authentication and path validation without any dependency modifications.
+
+Provision the router's decoder before enabling a new server configuration.
+During key rotation, retain both old and new configurations in the router until
+connections using the old configuration have drained. Do not reassign a backend
+ID within an active configuration. Tarweb loads its configuration at startup;
+restarting tarweb does not preserve QUIC connections.
+
+Routable paths authorize access to a configured backend without another SNI ACL
+check. Migrated paths receive fresh idle/global lifetime timers at the router;
+they do not retain the original SNI rule's connection lifetime limit. Use this
+mode only with that routing policy in mind.
+
+To run the cross-repository rotation and migration test after building both
+binaries:
+
+```sh
+SNI_ROUTER_H3_BIN=../sni-router/target/debug/sni-router-h3 \
+    cargo test --test h3_quic_lb -- --ignored --nocapture
+```

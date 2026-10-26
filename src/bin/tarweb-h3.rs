@@ -15,6 +15,8 @@
 
 #[path = "tarweb_h3/qpack.rs"]
 mod qpack;
+#[path = "../quic_lb.rs"]
+mod quic_lb;
 
 use std::collections::HashMap;
 use std::io;
@@ -133,6 +135,18 @@ struct Opt {
     #[arg(long, short = 'C', help = "TLS certificate chain")]
     tls_cert: std::path::PathBuf,
 
+    /// QUIC-LB AES-128 key file (32 hexadecimal characters).
+    #[arg(long, requires = "quic_lb_server_id")]
+    quic_lb_key_file: Option<std::path::PathBuf>,
+
+    /// Four-byte QUIC-LB backend ID, in decimal.
+    #[arg(long, requires = "quic_lb_key_file")]
+    quic_lb_server_id: Option<u32>,
+
+    /// QUIC-LB configuration ID (0..6). Defaults to 0 when enabled.
+    #[arg(long, requires_all = ["quic_lb_key_file", "quic_lb_server_id"], value_parser = clap::value_parser!(u8).range(0..=6))]
+    quic_lb_config_id: Option<u8>,
+
     tarfile: std::path::PathBuf,
 }
 
@@ -229,11 +243,43 @@ impl SendOp {
     }
 }
 
+#[derive(Clone)]
+struct LbConfig {
+    codec: quic_lb::Codec,
+    server_id: u32,
+}
+
+impl LbConfig {
+    fn worker(&self, cid: &[u8], worker_count: usize) -> Option<usize> {
+        let plaintext = self.codec.decrypt(cid)?;
+        if plaintext[..4] != self.server_id.to_be_bytes() {
+            return None;
+        }
+        let worker = usize::from(u16::from_be_bytes([plaintext[4], plaintext[5]]));
+        (worker < worker_count).then_some(worker)
+    }
+}
+
+impl Opt {
+    fn quic_lb(&self) -> Result<Option<LbConfig>> {
+        let Some(path) = &self.quic_lb_key_file else {
+            return Ok(None);
+        };
+        Ok(Some(LbConfig {
+            codec: quic_lb::Codec::from_key_file(self.quic_lb_config_id.unwrap_or(0), path)?,
+            server_id: self
+                .quic_lb_server_id
+                .context("QUIC-LB requires a server ID")?,
+        }))
+    }
+}
+
 // We need to generate connection IDs that include the worker ID.
 struct WorkerConnectionIdGenerator {
     worker_id: u16,
     key: [u8; 32],
     next: u64,
+    quic_lb: Option<LbConfig>,
 }
 
 impl WorkerConnectionIdGenerator {
@@ -245,12 +291,35 @@ impl WorkerConnectionIdGenerator {
             worker_id,
             key,
             next: 0,
+            quic_lb: None,
         }
     }
 }
 
 impl quinn_proto::ConnectionIdGenerator for WorkerConnectionIdGenerator {
     fn generate_cid(&mut self) -> ConnectionId {
+        if let Some(lb) = &self.quic_lb {
+            // QUIC-LB treats all twelve bytes after the backend ID as nonce.
+            // Locally: worker(2), counter(5), signature(5). AES conceals them.
+            assert!(self.next < (1u64 << 40), "QUIC-LB CID counter exhausted");
+            let mut plaintext = [0u8; 16];
+            plaintext[..4].copy_from_slice(&lb.server_id.to_be_bytes());
+            plaintext[4..6].copy_from_slice(&self.worker_id.to_be_bytes());
+            // Randomize the counter's origin per process, without reducing
+            // its collision-free 40-bit range. Together with the signature,
+            // this avoids repeating nonces when a backend restarts.
+            let mask = worker_cid_signature(&self.key, b"QUIC-LB counter mask");
+            for (out, (counter, mask)) in plaintext[6..11]
+                .iter_mut()
+                .zip(self.next.to_be_bytes()[3..].iter().zip(mask))
+            {
+                *out = counter ^ mask;
+            }
+            self.next += 1;
+            let signature = worker_cid_signature(&self.key, &plaintext[..11]);
+            plaintext[11..].copy_from_slice(&signature);
+            return ConnectionId::new(&lb.codec.encrypt(plaintext));
+        }
         let mut bytes = [0; WORKER_CID_LEN];
         bytes[0] = WORKER_CID_MARKER;
         bytes[WORKER_CID_WORKER_OFFSET..WORKER_CID_NONCE_OFFSET]
@@ -273,6 +342,21 @@ impl quinn_proto::ConnectionIdGenerator for WorkerConnectionIdGenerator {
 
     fn validate(&self, cid: &ConnectionId) -> std::result::Result<(), InvalidCid> {
         let cid = cid.as_ref();
+        if let Some(lb) = &self.quic_lb {
+            let plaintext = lb.codec.decrypt(cid).ok_or(InvalidCid)?;
+            if plaintext[..4] != lb.server_id.to_be_bytes()
+                || plaintext[4..6] != self.worker_id.to_be_bytes()
+            {
+                return Err(InvalidCid);
+            }
+            let expected = worker_cid_signature(&self.key, &plaintext[..11]);
+            use subtle::ConstantTimeEq;
+            return if bool::from(plaintext[11..].ct_eq(&expected)) {
+                Ok(())
+            } else {
+                Err(InvalidCid)
+            };
+        }
         if cid.len() != WORKER_CID_LEN || cid[0] != WORKER_CID_MARKER {
             return Err(InvalidCid);
         }
@@ -291,7 +375,11 @@ impl quinn_proto::ConnectionIdGenerator for WorkerConnectionIdGenerator {
     }
 
     fn cid_len(&self) -> usize {
-        WORKER_CID_LEN
+        if self.quic_lb.is_some() {
+            quic_lb::CID_LEN
+        } else {
+            WORKER_CID_LEN
+        }
     }
 
     fn cid_lifetime(&self) -> Option<Duration> {
@@ -319,9 +407,23 @@ fn worker_cid_signature(key: &[u8; 32], prefix: &[u8]) -> [u8; WORKER_CID_SIGNAT
 //
 // Packet will be dropped if this returns None, since it doesn't even have a
 // destination CID.
-fn worker_for_datagram(data: &[u8], key: &[u8; 32], worker_count: usize) -> Option<usize> {
-    let cid = packet_destination_cid(data)?;
-    if let Some(worker) = worker_from_server_cid(cid, worker_count) {
+fn worker_for_datagram(
+    data: &[u8],
+    key: &[u8; 32],
+    worker_count: usize,
+    lb: Option<&LbConfig>,
+) -> Option<usize> {
+    let cid_len = if lb.is_some() {
+        quic_lb::CID_LEN
+    } else {
+        WORKER_CID_LEN
+    };
+    let cid = packet_destination_cid(data, cid_len)?;
+    let worker = match lb {
+        Some(lb) => lb.worker(cid, worker_count),
+        None => worker_from_server_cid(cid, worker_count),
+    };
+    if let Some(worker) = worker {
         return Some(worker);
     }
     Some(hash_connection_id(key, cid, worker_count))
@@ -333,7 +435,7 @@ fn worker_for_datagram(data: &[u8], key: &[u8; 32], worker_count: usize) -> Opti
 //
 // Packet will be dropped if this returns None, since it doesn't even have a
 // destination CID.
-fn packet_destination_cid(data: &[u8]) -> Option<&[u8]> {
+fn packet_destination_cid(data: &[u8], short_cid_len: usize) -> Option<&[u8]> {
     let first = *data.first()?;
     if first & 0x80 != 0 {
         let cid_len = *data.get(5)? as usize;
@@ -342,10 +444,7 @@ fn packet_destination_cid(data: &[u8]) -> Option<&[u8]> {
         }
         Some(&data[6..6 + cid_len])
     } else {
-        if data.len() < 1 + WORKER_CID_LEN {
-            return None;
-        }
-        Some(&data[1..1 + WORKER_CID_LEN])
+        data.get(1..1 + short_cid_len)
     }
 }
 
@@ -1108,6 +1207,7 @@ fn main() -> Result<()> {
         env!("BUILD_PROFILE")
     );
     let opt = Opt::parse();
+    let quic_lb = opt.quic_lb()?;
     tracing_subscriber::fmt()
         .with_env_filter(format!("tarweb={}", opt.verbose))
         .with_writer(std::io::stderr)
@@ -1150,8 +1250,11 @@ fn main() -> Result<()> {
             let (worker_tx, worker_rx) = mpsc::channel();
             let worker_id = u16::try_from(id).expect("worker_count was checked above");
             let mut endpoint_config = EndpointConfig::default();
+            let worker_lb = quic_lb.clone();
             endpoint_config.cid_generator(move || {
-                Box::new(WorkerConnectionIdGenerator::new(worker_id, cid_key))
+                let mut generator = WorkerConnectionIdGenerator::new(worker_id, cid_key);
+                generator.quic_lb = worker_lb.clone();
+                Box::new(generator)
             });
             // TODO: set reset key.
             let endpoint = quinn_proto::Endpoint::new(
@@ -1238,9 +1341,12 @@ fn main() -> Result<()> {
                         match recv.remote() {
                             Ok(remote) => {
                                 let packet = &recv.buf[..len];
-                                if let Some(worker) =
-                                    worker_for_datagram(packet, &cid_key, worker_txs.len())
-                                {
+                                if let Some(worker) = worker_for_datagram(
+                                    packet,
+                                    &cid_key,
+                                    worker_txs.len(),
+                                    quic_lb.as_ref(),
+                                ) {
                                     let data = BytesMut::from(packet);
                                     if let Err(e) =
                                         worker_txs[worker].send(WorkerCommand::Datagram {
@@ -1292,7 +1398,7 @@ mod tests {
         let mut short_packet = Vec::with_capacity(1 + WORKER_CID_LEN);
         short_packet.push(0x40);
         short_packet.extend_from_slice(cid.as_ref());
-        assert_eq!(worker_for_datagram(&short_packet, &key, 64), Some(42));
+        assert_eq!(worker_for_datagram(&short_packet, &key, 64, None), Some(42));
     }
 
     #[test]
@@ -1316,8 +1422,8 @@ mod tests {
         long_packet.extend_from_slice(&[1, 2, 3, 4]);
         long_packet.push(0);
 
-        let first = worker_for_datagram(&long_packet, &key, 8);
-        let second = worker_for_datagram(&long_packet, &key, 8);
+        let first = worker_for_datagram(&long_packet, &key, 8, None);
+        let second = worker_for_datagram(&long_packet, &key, 8, None);
         assert_eq!(first, second);
         assert!(first.is_some());
     }
@@ -1331,9 +1437,106 @@ mod tests {
         long_packet.extend_from_slice(&[1, 2, 3, 4]);
         long_packet.push(0);
 
-        let cid = packet_destination_cid(&long_packet).unwrap();
+        let cid = packet_destination_cid(&long_packet, WORKER_CID_LEN).unwrap();
         let a = keyed_connection_id_digest(&[0x11; 32], cid);
         let b = keyed_connection_id_digest(&[0x22; 32], cid);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn quic_lb_is_strictly_opt_in() -> Result<()> {
+        let base = [
+            "tarweb-h3",
+            "--tls-cert",
+            "cert",
+            "--tls-key",
+            "key",
+            "archive.tar",
+        ];
+        let opt = Opt::try_parse_from(base)?;
+        assert!(opt.quic_lb()?.is_none());
+        let mut legacy = WorkerConnectionIdGenerator::new(42, [0x5a; 32]);
+        assert_eq!(legacy.cid_len(), 16);
+        assert_eq!(&legacy.generate_cid()[..3], &[0xa7, 0, 42]);
+        assert_eq!(legacy.cid_lifetime(), None);
+        for flags in [
+            vec!["--quic-lb-key-file", "key"],
+            vec!["--quic-lb-server-id", "7"],
+            vec!["--quic-lb-config-id", "0"],
+            vec![
+                "--quic-lb-key-file",
+                "key",
+                "--quic-lb-server-id",
+                "7",
+                "--quic-lb-config-id",
+                "7",
+            ],
+        ] {
+            assert!(Opt::try_parse_from(base.into_iter().chain(flags)).is_err());
+        }
+        let file = tempfile::NamedTempFile::new()?;
+        std::fs::write(file.path(), "00000000000000000000000000000000\n")?;
+        let opt = Opt::try_parse_from(base.into_iter().chain([
+            "--quic-lb-key-file",
+            file.path().to_str().unwrap(),
+            "--quic-lb-server-id",
+            "7",
+        ]))?;
+        let lb = opt.quic_lb()?.unwrap();
+        assert!(lb.codec.decrypt(&[0x10; 17]).is_some());
+        assert_eq!(lb.server_id, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn quic_lb_cids_route_and_validate() -> Result<()> {
+        let lb = LbConfig {
+            codec: quic_lb::Codec::new(2, &[0x55; 16])?,
+            server_id: 123,
+        };
+        let key = [0x5a; 32];
+        let mut generator = WorkerConnectionIdGenerator::new(42, key);
+        generator.quic_lb = Some(lb.clone());
+        assert_eq!(generator.cid_len(), 17);
+        let first = generator.generate_cid();
+        let second = generator.generate_cid();
+        assert_ne!(first, second);
+        for cid in [first, second] {
+            assert!(generator.validate(&cid).is_ok());
+            assert_eq!(lb.worker(&cid, 64), Some(42));
+            assert_eq!(lb.worker(&cid, 42), None);
+            let mut packet = vec![0x40];
+            packet.extend_from_slice(&cid);
+            assert_eq!(worker_for_datagram(&packet, &key, 64, Some(&lb)), Some(42));
+            assert!(worker_for_datagram(&packet[..17], &key, 64, Some(&lb)).is_none());
+            let mut long = vec![0xc0, 0, 0, 0, 1, 17];
+            long.extend_from_slice(&cid);
+            assert_eq!(worker_for_datagram(&long, &key, 64, Some(&lb)), Some(42));
+        }
+        let mut plaintext = lb.codec.decrypt(&first).unwrap();
+        plaintext[6] ^= 1;
+        assert!(
+            generator
+                .validate(&ConnectionId::new(&lb.codec.encrypt(plaintext)))
+                .is_err()
+        );
+        plaintext[..4].copy_from_slice(&124u32.to_be_bytes());
+        assert_eq!(lb.worker(&lb.codec.encrypt(plaintext), 64), None);
+        let mut restarted = WorkerConnectionIdGenerator::new(42, [0x6b; 32]);
+        restarted.quic_lb = Some(lb);
+        assert!(restarted.validate(&first).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[should_panic(expected = "QUIC-LB CID counter exhausted")]
+    fn quic_lb_counter_must_not_wrap() {
+        let mut generator = WorkerConnectionIdGenerator::new(0, [0; 32]);
+        generator.quic_lb = Some(LbConfig {
+            codec: quic_lb::Codec::new(0, &[0; 16]).unwrap(),
+            server_id: 1,
+        });
+        generator.next = 1u64 << 40;
+        generator.generate_cid();
     }
 }
