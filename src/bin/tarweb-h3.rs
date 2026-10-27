@@ -20,7 +20,7 @@ mod quic_lb;
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::AsRawFd;
 use std::sync::{
     Arc,
@@ -28,7 +28,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use bytes::BytesMut;
 use clap::Parser;
 use quinn_proto::crypto::rustls::QuicServerConfig;
@@ -105,6 +105,14 @@ struct Opt {
 
     #[arg(long, short, default_value = "[::1]:443", help = "UDP listen address.")]
     listen: SocketAddr,
+
+    /// Client-reachable IPv4 UDP address to prefer after the handshake.
+    #[arg(long)]
+    preferred_address_v4: Option<SocketAddrV4>,
+
+    /// Client-reachable IPv6 UDP address to prefer after the handshake.
+    #[arg(long)]
+    preferred_address_v6: Option<SocketAddrV6>,
 
     #[arg(long, default_value_t = 1024, help = "io_uring ring size")]
     ring_size: u32,
@@ -261,6 +269,33 @@ impl LbConfig {
 }
 
 impl Opt {
+    fn validate_preferred_addresses(&self) -> Result<()> {
+        for address in self
+            .preferred_address_v4
+            .map(SocketAddr::V4)
+            .into_iter()
+            .chain(self.preferred_address_v6.map(SocketAddr::V6))
+        {
+            ensure!(
+                address.port() != 0,
+                "preferred address must have a nonzero UDP port"
+            );
+            ensure!(
+                !address.ip().is_unspecified()
+                    && !address.ip().is_multicast()
+                    && !matches!(address.ip(), IpAddr::V4(ip) if ip.is_broadcast()),
+                "preferred address must be a unicast IP address"
+            );
+        }
+        if let Some(address) = self.preferred_address_v6 {
+            ensure!(
+                address.scope_id() == 0 && address.flowinfo() == 0,
+                "preferred IPv6 address cannot include a scope ID or flow information"
+            );
+        }
+        Ok(())
+    }
+
     fn quic_lb(&self) -> Result<Option<LbConfig>> {
         let Some(path) = &self.quic_lb_key_file else {
             return Ok(None);
@@ -1097,6 +1132,8 @@ fn make_server_config(opt: &Opt) -> Result<ServerConfig> {
     tls_config.alpn_protocols = vec![b"h3".to_vec()];
 
     let mut config = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls_config)?));
+    config.preferred_address_v4(opt.preferred_address_v4);
+    config.preferred_address_v6(opt.preferred_address_v6);
     let mut transport = TransportConfig::default();
     transport.max_concurrent_uni_streams(16_u8.into());
     transport.max_concurrent_bidi_streams(256_u16.into());
@@ -1207,6 +1244,7 @@ fn main() -> Result<()> {
         env!("BUILD_PROFILE")
     );
     let opt = Opt::parse();
+    opt.validate_preferred_addresses()?;
     let quic_lb = opt.quic_lb()?;
     tracing_subscriber::fmt()
         .with_env_filter(format!("tarweb={}", opt.verbose))
@@ -1538,5 +1576,60 @@ mod tests {
         });
         generator.next = 1u64 << 40;
         generator.generate_cid();
+    }
+
+    #[test]
+    fn preferred_addresses_are_optional_and_validate_wire_addresses() -> Result<()> {
+        let base = [
+            "tarweb-h3",
+            "--tls-cert",
+            "cert",
+            "--tls-key",
+            "key",
+            "archive.tar",
+        ];
+        let defaults = Opt::try_parse_from(base)?;
+        assert!(defaults.preferred_address_v4.is_none());
+        assert!(defaults.preferred_address_v6.is_none());
+        defaults.validate_preferred_addresses()?;
+        let opt = Opt::try_parse_from(base.into_iter().chain([
+            "--preferred-address-v4",
+            "192.0.2.10:8443",
+            "--preferred-address-v6",
+            "[2001:db8::10]:9443",
+        ]))?;
+        opt.validate_preferred_addresses()?;
+        assert_eq!(
+            opt.preferred_address_v4.unwrap().to_string(),
+            "192.0.2.10:8443"
+        );
+        assert_eq!(
+            opt.preferred_address_v6.unwrap().to_string(),
+            "[2001:db8::10]:9443"
+        );
+        assert!(opt.quic_lb()?.is_none());
+        for (flag, addr) in [
+            ("--preferred-address-v4", "127.0.0.1:0"),
+            ("--preferred-address-v4", "0.0.0.0:443"),
+            ("--preferred-address-v4", "224.0.0.1:443"),
+            ("--preferred-address-v4", "255.255.255.255:443"),
+            ("--preferred-address-v6", "[::1]:0"),
+            ("--preferred-address-v6", "[::]:443"),
+            ("--preferred-address-v6", "[ff02::1]:443"),
+            ("--preferred-address-v6", "[fe80::1%2]:443"),
+        ] {
+            let opt = Opt::try_parse_from(base.into_iter().chain([flag, addr]))?;
+            assert!(
+                opt.validate_preferred_addresses().is_err(),
+                "accepted {flag} {addr}"
+            );
+        }
+        for (flag, addr) in [
+            ("--preferred-address-v4", "[::1]:443"),
+            ("--preferred-address-v6", "127.0.0.1:443"),
+        ] {
+            assert!(Opt::try_parse_from(base.into_iter().chain([flag, addr])).is_err());
+        }
+        Ok(())
     }
 }

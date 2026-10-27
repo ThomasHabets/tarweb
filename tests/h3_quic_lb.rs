@@ -3,7 +3,7 @@
 //!   cargo test --test h3_quic_lb -- --ignored --nocapture
 
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -11,8 +11,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use bytes::BytesMut;
+use quinn_proto::coding::Codec;
 use quinn_proto::crypto::rustls::QuicClientConfig;
-use quinn_proto::{ClientConfig, DatagramEvent, Dir, Endpoint, EndpointConfig, Event, ReadError};
+use quinn_proto::{
+    ClientConfig, DatagramEvent, Dir, Endpoint, EndpointConfig, Event, ReadError, VarInt,
+};
 
 struct Server {
     child: Child,
@@ -43,6 +46,11 @@ impl Drop for Server {
     }
 }
 
+struct PreferredAddress {
+    addresses: Vec<SocketAddr>,
+    cid: Vec<u8>,
+}
+
 struct Client {
     endpoint: Endpoint,
     conn: quinn_proto::Connection,
@@ -51,6 +59,10 @@ struct Client {
     connected: usize,
     last_cid: Vec<u8>,
     cid_len: usize,
+    original_remote: SocketAddr,
+    direct_path: Option<SocketAddr>,
+    direct_sends: usize,
+    direct_receives: usize,
 }
 
 impl Client {
@@ -74,17 +86,68 @@ impl Client {
             endpoint,
             conn,
             handle,
-            socket: Self::socket()?,
+            socket: Self::socket(remote)?,
             connected: 0,
             last_cid: Vec::new(),
             cid_len,
+            original_remote: remote,
+            direct_path: None,
+            direct_sends: 0,
+            direct_receives: 0,
         })
     }
 
-    fn socket() -> Result<UdpSocket> {
-        let socket = UdpSocket::bind("127.0.0.1:0")?;
+    fn socket(remote: SocketAddr) -> Result<UdpSocket> {
+        let bind = if remote.is_ipv6() {
+            "[::1]:0"
+        } else {
+            "127.0.0.1:0"
+        };
+        let socket = UdpSocket::bind(bind)?;
         socket.set_read_timeout(Some(Duration::from_millis(5)))?;
         Ok(socket)
+    }
+
+    fn preferred_address(&self) -> Result<Option<PreferredAddress>> {
+        let params = self
+            .conn
+            .crypto_session()
+            .transport_parameters()?
+            .context("server transport parameters are not available")?;
+        let mut encoded = Vec::new();
+        params.write(&mut encoded);
+        let mut remaining = encoded.as_slice();
+        while !remaining.is_empty() {
+            let id = VarInt::decode(&mut remaining)?.into_inner();
+            let length = usize::try_from(VarInt::decode(&mut remaining)?.into_inner())?;
+            ensure!(remaining.len() >= length, "truncated transport parameter");
+            let (mut value, rest) = remaining.split_at(length);
+            remaining = rest;
+            if id != 0x0d {
+                continue;
+            }
+            let v4 = Ipv4Addr::decode(&mut value)?;
+            let v4_port = u16::decode(&mut value)?;
+            let v6 = Ipv6Addr::decode(&mut value)?;
+            let v6_port = u16::decode(&mut value)?;
+            let cid_len = usize::from(u8::decode(&mut value)?);
+            ensure!(
+                value.len() == cid_len + 16,
+                "invalid preferred address CID/reset token"
+            );
+            let mut addresses = Vec::new();
+            if v4_port != 0 {
+                addresses.push(SocketAddr::new(v4.into(), v4_port));
+            }
+            if v6_port != 0 {
+                addresses.push(SocketAddr::new(v6.into(), v6_port));
+            }
+            return Ok(Some(PreferredAddress {
+                addresses,
+                cid: value[..cid_len].to_vec(),
+            }));
+        }
+        Ok(None)
     }
 
     fn step(&mut self) -> Result<()> {
@@ -113,13 +176,25 @@ impl Client {
             if packet.first().is_some_and(|first| first & 0x80 == 0) {
                 self.last_cid = packet[1..1 + self.cid_len].to_vec();
             }
-            self.socket
-                .send_to(&packet[..transmit.size], transmit.destination)?;
+            let destination = self.direct_path.unwrap_or(transmit.destination);
+            self.socket.send_to(&packet[..transmit.size], destination)?;
+            if self.direct_path.is_some() {
+                self.direct_sends += 1;
+            }
             packet.clear();
         }
         let mut buf = [0u8; 65535];
         match self.socket.recv_from(&mut buf) {
             Ok((len, peer)) => {
+                // Quinn's client records preferred CIDs but does not migrate to
+                // the advertised address itself. Model the address change in
+                // this test's UDP adapter, keeping the QUIC state untouched.
+                let peer = if self.direct_path == Some(peer) {
+                    self.direct_receives += 1;
+                    self.original_remote
+                } else {
+                    peer
+                };
                 let mut response = Vec::new();
                 match self.endpoint.handle(
                     Instant::now(),
@@ -134,8 +209,10 @@ impl Client {
                         self.conn.handle_event(event);
                     }
                     Some(DatagramEvent::Response(transmit)) => {
-                        self.socket
-                            .send_to(&response[..transmit.size], transmit.destination)?;
+                        self.socket.send_to(
+                            &response[..transmit.size],
+                            self.direct_path.unwrap_or(transmit.destination),
+                        )?;
                     }
                     _ => {}
                 }
@@ -203,11 +280,12 @@ impl Client {
     }
 }
 
-fn free_addr() -> Result<SocketAddr> {
-    Ok(UdpSocket::bind("127.0.0.1:0")?.local_addr()?)
+fn free_addr(ipv6: bool) -> Result<SocketAddr> {
+    let bind = if ipv6 { "[::1]:0" } else { "127.0.0.1:0" };
+    Ok(UdpSocket::bind(bind)?.local_addr()?)
 }
 
-fn run(router: &Path, quic_lb: bool) -> Result<()> {
+fn run(router: &Path, quic_lb: bool, preferred: Option<bool>) -> Result<()> {
     let dir = tempfile::tempdir()?;
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let cert_path = dir.path().join("cert.pem");
@@ -225,8 +303,8 @@ fn run(router: &Path, quic_lb: bool) -> Result<()> {
     header.set_cksum();
     archive.append_data(&mut header, "index.html", content.as_slice())?;
     archive.finish()?;
-    let backend = free_addr()?;
-    let frontend = free_addr()?;
+    let backend = free_addr(preferred.unwrap_or(false))?;
+    let frontend = free_addr(preferred.unwrap_or(false))?;
     let mut backend_command = Command::new(env!("CARGO_BIN_EXE_tarweb-h3"));
     backend_command
         .args([
@@ -247,6 +325,15 @@ fn run(router: &Path, quic_lb: bool) -> Result<()> {
             .arg("--quic-lb-key-file")
             .arg(&lb_key)
             .args(["--quic-lb-server-id", "123"]);
+    }
+    if let Some(ipv6) = preferred {
+        backend_command
+            .arg(if ipv6 {
+                "--preferred-address-v6"
+            } else {
+                "--preferred-address-v4"
+            })
+            .arg(backend.to_string());
     }
     let backend_server = Server::start(&mut backend_command)?;
     let config = dir.path().join("h3.conf");
@@ -271,11 +358,17 @@ fn run(router: &Path, quic_lb: bool) -> Result<()> {
         .args(["--listen", &frontend.to_string(), "--verbose", "debug"])
         .arg("--config")
         .arg(&config);
-    let router_server = Server::start(&mut router_command)?;
+    let mut router_server = Server::start(&mut router_command)?;
     let result = (|| -> Result<()> {
         let cid_len = if quic_lb { 17 } else { 16 };
         let mut client = Client::new(frontend, cert.cert.der().clone(), cid_len)?;
-        client.until(|c| c.connected == 1 && c.conn.stats().frame_rx.new_connection_id >= 2)?;
+        let new_cids = if preferred.is_some() { 1 } else { 2 };
+        client
+            .until(|c| c.connected == 1 && c.conn.stats().frame_rx.new_connection_id >= new_cids)?;
+        let advertised = client.preferred_address()?;
+        if preferred.is_none() {
+            ensure!(advertised.is_none(), "preferred address must be opt-in");
+        }
         let control = client
             .conn
             .streams()
@@ -288,6 +381,34 @@ fn run(router: &Path, quic_lb: bool) -> Result<()> {
         if !quic_lb {
             ensure!(original_cid[0] == 0xa7);
         }
+        if preferred.is_some() {
+            let advertised = advertised.context("server did not advertise a preferred address")?;
+            ensure!(
+                advertised.addresses == vec![backend],
+                "incorrect preferred address"
+            );
+            ensure!(advertised.cid.len() == cid_len);
+            client.direct_path = Some(backend);
+            client.conn.local_address_changed();
+            client.fetch(content)?;
+            ensure!(
+                client.last_cid == advertised.cid,
+                "did not use the preferred-address CID"
+            );
+            client.until(|c| c.conn.stats().frame_rx.path_challenge > 0)?;
+            client.until(|c| c.conn.stats().frame_tx.path_response > 0)?;
+            ensure!(client.direct_sends > 0 && client.direct_receives > 0);
+            router_server.child.kill()?;
+            router_server.child.wait()?;
+            // Successful requests after router shutdown prove traffic is direct.
+            client.fetch(content)?;
+            client.fetch(content)?;
+            ensure!(
+                client.connected == 1,
+                "preferred address opened another connection"
+            );
+            return Ok(());
+        }
         client.conn.local_address_changed();
         client.fetch(content)?;
         ensure!(client.last_cid != original_cid, "CID did not rotate");
@@ -296,7 +417,7 @@ fn run(router: &Path, quic_lb: bool) -> Result<()> {
         }
         let rotated_cid = client.last_cid.clone();
         let old_port = client.socket.local_addr()?;
-        client.socket = Client::socket()?;
+        client.socket = Client::socket(frontend)?;
         ensure!(client.socket.local_addr()? != old_port);
         client.conn.local_address_changed();
         client.fetch(content)?;
@@ -328,6 +449,19 @@ fn run(router: &Path, quic_lb: bool) -> Result<()> {
 fn legacy_rotation_and_quic_lb_migration() -> Result<()> {
     let router = std::env::var_os("SNI_ROUTER_H3_BIN")
         .context("set SNI_ROUTER_H3_BIN to the built router binary")?;
-    run(Path::new(&router), false)?;
-    run(Path::new(&router), true)
+    run(Path::new(&router), false, None)?;
+    run(Path::new(&router), true, None)
+}
+
+#[test]
+#[ignore = "requires a built sni-router-h3; set SNI_ROUTER_H3_BIN"]
+fn preferred_address_bypasses_router() -> Result<()> {
+    let router = std::env::var_os("SNI_ROUTER_H3_BIN")
+        .context("set SNI_ROUTER_H3_BIN to the built router binary")?;
+    for quic_lb in [false, true] {
+        for ipv6 in [false, true] {
+            run(Path::new(&router), quic_lb, Some(ipv6))?;
+        }
+    }
+    Ok(())
 }

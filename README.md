@@ -165,3 +165,38 @@ binaries:
 SNI_ROUTER_H3_BIN=../sni-router/target/debug/sni-router-h3 \
     cargo test --test h3_quic_lb -- --ignored --nocapture
 ```
+
+
+### Connecting directly after the HTTP/3 handshake
+
+`tarweb-h3` can advertise a directly reachable UDP endpoint in QUIC's
+`preferred_address` transport parameter. Clients that support this parameter
+can validate the direct path and move the existing connection off
+`sni-router-h3`, keeping the same TLS session and hostname certificate.
+
+For example, with the router forwarding to `127.0.0.1:8443`:
+
+```sh
+tarweb-h3 --listen '0.0.0.0:8443' --tls-cert cert.pem --tls-key key.pem \
+    --preferred-address-v4 '203.0.113.10:8443' site.tar
+```
+
+Replace `203.0.113.10` with the server's client-reachable IPv4 address. For IPv6,
+use `--preferred-address-v6 '[2001:db8::10]:8443'` and an IPv6 listener. You can
+advertise one address of each family together, provided both reach the same
+listener. The advertised address and port may differ from `--listen` when NAT
+or port forwarding maps them to that listener. These options advertise addresses;
+they do not bind additional sockets. Allow clients to reach the direct UDP port.
+
+Preferred addresses work with both ordinary worker CIDs and QUIC-LB CIDs, without
+router configuration changes. Quinn issues the additional preferred-address CID
+using the configured worker CID generator and validates the client's new path.
+Clients that ignore the preference or cannot validate the direct endpoint keep
+using the router. Without either preferred-address flag, nothing is advertised
+and the existing behavior is unchanged.
+
+The cross-repository test command above also checks IPv4 and IPv6 direct paths,
+with and without QUIC-LB, and verifies that requests succeed after stopping the
+router. Its Quinn client does not automatically act on preferred addresses, so
+the test reads the advertised transport parameter and models the address change
+in its UDP adapter.
