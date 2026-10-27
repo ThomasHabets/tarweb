@@ -2535,6 +2535,7 @@ dependencies = [
  "core_affinity",
  "httpdate",
  "io-uring",
+ "ipnet",
  "ktls",
  "landlock",
  "libc",

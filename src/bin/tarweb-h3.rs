@@ -13,6 +13,8 @@
 #![allow(clippy::similar_names)]
 #![allow(clippy::too_many_lines)]
 
+#[path = "tarweb_h3/handshake_acl.rs"]
+mod handshake_acl;
 #[path = "tarweb_h3/qpack.rs"]
 mod qpack;
 #[path = "../quic_lb.rs"]
@@ -31,6 +33,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, ensure};
 use bytes::BytesMut;
 use clap::Parser;
+use handshake_acl::HandshakeAcl;
 use quinn_proto::crypto::rustls::QuicServerConfig;
 use quinn_proto::{
     ConnectionId, DatagramEvent, Dir, EndpointConfig, EndpointEvent, Event, InvalidCid, ReadError,
@@ -113,6 +116,10 @@ struct Opt {
     /// Client-reachable IPv6 UDP address to prefer after the handshake.
     #[arg(long)]
     preferred_address_v6: Option<SocketAddrV6>,
+
+    /// Allow new connections only from these source CIDRs. Repeatable; defaults to all.
+    #[arg(long)]
+    allow_handshake_from: Vec<ipnet::IpNet>,
 
     #[arg(long, default_value_t = 1024, help = "io_uring ring size")]
     ring_size: u32,
@@ -558,6 +565,8 @@ enum WorkerCommand {
 struct Worker {
     id: usize,
 
+    handshake_acl: HandshakeAcl,
+
     // Endpoint is the main quinn API surface.
     endpoint: quinn_proto::Endpoint,
 
@@ -590,12 +599,14 @@ impl Worker {
         endpoint: quinn_proto::Endpoint,
         socket: std::net::UdpSocket,
         ring_size: u32,
+        handshake_acl: HandshakeAcl,
     ) -> Result<Self> {
         let ring = io_uring::IoUring::new(ring_size)?;
         ring.submitter().register_files(&[socket.as_raw_fd()])?;
         drop(socket);
         Ok(Self {
             id,
+            handshake_acl,
             endpoint,
             connections: HashMap::new(),
             archive,
@@ -681,6 +692,14 @@ impl Worker {
                 self.queue_transmit(transmit, scratch);
             }
             Some(DatagramEvent::NewConnection(incoming)) => {
+                if !self.handshake_acl.allows(incoming.remote_address().ip()) {
+                    debug!(remote = %incoming.remote_address(), "Ignoring new connection outside handshake ACL");
+                    // Explicitly discard the Incoming so Quinn releases its
+                    // pending state. Do not apply the ACL to ConnectionEvent:
+                    // authenticated connections may migrate to direct paths.
+                    self.endpoint.ignore(incoming);
+                    return;
+                }
                 match self.endpoint.accept(incoming, now, &mut scratch, None) {
                     Ok((handle, conn)) => self.assign_connection(handle, conn, now),
                     Err(e) => {
@@ -1269,6 +1288,7 @@ fn main() -> Result<()> {
     info!("Using {worker_count} HTTP/3 worker threads");
 
     let server_config = Arc::new(make_server_config(&opt)?);
+    let handshake_acl = HandshakeAcl::new(opt.allow_handshake_from.clone());
 
     // Bind to listening socket.
     let socket = std::net::UdpSocket::bind(opt.listen)
@@ -1303,12 +1323,20 @@ fn main() -> Result<()> {
             );
             let worker_socket = socket.try_clone()?;
             let worker_archive = Arc::clone(&archive);
+            let worker_handshake_acl = handshake_acl.clone();
             let init_tx = worker_init_tx.clone();
             let ring_size = opt.ring_size;
             let handle = std::thread::Builder::new()
                 .name(format!("tarweb-h3-worker-{id}"))
                 .spawn(move || {
-                    match Worker::new(id, worker_archive, endpoint, worker_socket, ring_size) {
+                    match Worker::new(
+                        id,
+                        worker_archive,
+                        endpoint,
+                        worker_socket,
+                        ring_size,
+                        worker_handshake_acl,
+                    ) {
                         Ok(worker) => {
                             let _ = init_tx.send(Ok(id));
                             worker.run(worker_rx);
@@ -1629,6 +1657,44 @@ mod tests {
             ("--preferred-address-v6", "127.0.0.1:443"),
         ] {
             assert!(Opt::try_parse_from(base.into_iter().chain([flag, addr])).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn handshake_acl_flags_accept_repeated_cidrs_and_reject_invalid_inputs() -> Result<()> {
+        let base = [
+            "tarweb-h3",
+            "--tls-cert",
+            "cert",
+            "--tls-key",
+            "key",
+            "archive.tar",
+        ];
+        let default = Opt::try_parse_from(base)?;
+        assert!(default.allow_handshake_from.is_empty());
+        let opt = Opt::try_parse_from(base.into_iter().chain([
+            "--allow-handshake-from",
+            "192.0.2.0/24",
+            "--allow-handshake-from",
+            "2001:db8::/32",
+        ]))?;
+        assert_eq!(opt.allow_handshake_from.len(), 2);
+        let acl = HandshakeAcl::new(opt.allow_handshake_from);
+        assert!(acl.allows("192.0.2.1".parse()?));
+        assert!(acl.allows("2001:db8::1".parse()?));
+        assert!(!acl.allows("198.51.100.1".parse()?));
+        for invalid in [
+            "",
+            "load-balancer.example",
+            "192.0.2.0/33",
+            "2001:db8::/129",
+        ] {
+            assert!(
+                Opt::try_parse_from(base.into_iter().chain(["--allow-handshake-from", invalid,]))
+                    .is_err(),
+                "accepted invalid network {invalid:?}"
+            );
         }
         Ok(())
     }

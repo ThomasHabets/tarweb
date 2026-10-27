@@ -200,3 +200,35 @@ with and without QUIC-LB, and verifies that requests succeed after stopping the
 router. Its Quinn client does not automatically act on preferred addresses, so
 the test reads the advertised transport parameter and models the address change
 in its UDP adapter.
+
+
+### Restricting new HTTP/3 connections to load balancers
+
+Use the repeatable `--allow-handshake-from CIDR` flag to allow new QUIC
+connections only from your load balancers' source networks:
+
+```sh
+tarweb-h3 --listen '0.0.0.0:8443' --tls-cert cert.pem --tls-key key.pem \
+    --allow-handshake-from '127.0.0.1/32' \
+    --allow-handshake-from '192.0.2.0/24' \
+    --preferred-address-v4 '203.0.113.10:8443' site.tar
+```
+
+Use the source IP addresses as seen by tarweb-h3. A router on the same host may
+connect from loopback; a remote router may connect from a private or NAT address.
+IPv4 and IPv6 CIDRs can be mixed, and a source matching any entry is allowed.
+Use `/32` for individual IPv4 addresses and `/128` for individual IPv6 addresses.
+IPv4-mapped IPv6 sources and mapped prefixes of `/96` or longer are treated
+as IPv4. With no entries, all
+sources are allowed, preserving the default behavior.
+
+When at least one prefix is configured, unmatched new connection attempts are
+silently discarded before accepting the QUIC connection or starting its TLS
+handshake. This also applies to fresh resumed connections: clients must start
+those through an allowed load balancer again.
+
+Packets for existing connections are processed normally, including when their
+source address changes. Thus a client can complete its handshake through
+sni-router-h3, migrate directly to tarweb-h3's preferred address, and continue
+using that connection even though its own address cannot create new connections.
+The ACL works with both ordinary worker CIDs and QUIC-LB CIDs.

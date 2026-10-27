@@ -21,6 +21,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 core_affinity = "0.8"
 httpdate = "1"
+ipnet = "2"
 
 # Need at least 0.7.5 for setsockopt support.
 # Cannot use feature "bindgen" because it requires too modern headers for debian

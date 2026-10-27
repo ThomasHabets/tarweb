@@ -285,7 +285,32 @@ fn free_addr(ipv6: bool) -> Result<SocketAddr> {
     Ok(UdpSocket::bind(bind)?.local_addr()?)
 }
 
-fn run(router: &Path, quic_lb: bool, preferred: Option<bool>) -> Result<()> {
+fn assert_direct_handshake_blocked(
+    backend: SocketAddr,
+    cert: rustls::pki_types::CertificateDer<'static>,
+    cid_len: usize,
+) -> Result<()> {
+    let mut client = Client::new(backend, cert, cid_len)?;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        client.step()?;
+        ensure!(
+            client.connected == 0,
+            "untrusted client established a direct connection"
+        );
+    }
+    ensure!(
+        client.conn.stats().udp_tx.datagrams > 0,
+        "client sent no Initial datagrams"
+    );
+    ensure!(
+        client.conn.stats().udp_rx.datagrams == 0,
+        "denied handshake received a response"
+    );
+    Ok(())
+}
+
+fn run(router: &Path, quic_lb: bool, preferred: Option<bool>, handshake_acl: bool) -> Result<()> {
     let dir = tempfile::tempdir()?;
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let cert_path = dir.path().join("cert.pem");
@@ -305,11 +330,30 @@ fn run(router: &Path, quic_lb: bool, preferred: Option<bool>) -> Result<()> {
     archive.finish()?;
     let backend = free_addr(preferred.unwrap_or(false))?;
     let frontend = free_addr(preferred.unwrap_or(false))?;
+    // Use opposite address families for router and direct paths under the ACL.
+    // This exercises real IPv4/IPv6 sources without extra interface addresses.
+    let router_backend = if handshake_acl {
+        SocketAddr::new(
+            if backend.is_ipv4() {
+                Ipv6Addr::LOCALHOST.into()
+            } else {
+                Ipv4Addr::LOCALHOST.into()
+            },
+            backend.port(),
+        )
+    } else {
+        backend
+    };
+    let listen = if handshake_acl {
+        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), backend.port())
+    } else {
+        backend
+    };
     let mut backend_command = Command::new(env!("CARGO_BIN_EXE_tarweb-h3"));
     backend_command
         .args([
             "--listen",
-            &backend.to_string(),
+            &listen.to_string(),
             "--threads",
             "2",
             "--verbose",
@@ -335,11 +379,25 @@ fn run(router: &Path, quic_lb: bool, preferred: Option<bool>) -> Result<()> {
             })
             .arg(backend.to_string());
     }
+    if handshake_acl {
+        // Put the trusted prefix second to exercise repeated ACL flags.
+        let trusted = if router_backend.is_ipv4() {
+            "127.0.0.1/32"
+        } else {
+            "::1/128"
+        };
+        backend_command.args([
+            "--allow-handshake-from",
+            "192.0.2.0/24",
+            "--allow-handshake-from",
+            trusted,
+        ]);
+    }
     let backend_server = Server::start(&mut backend_command)?;
     let config = dir.path().join("h3.conf");
     let lb_config = if quic_lb {
         format!(
-            "quic_lb: < key_file: \"{}\" servers: < server_id: 123 addr: \"{backend}\" > >",
+            "quic_lb: < key_file: \"{}\" servers: < server_id: 123 addr: \"{router_backend}\" > >",
             lb_key.display()
         )
     } else {
@@ -349,7 +407,7 @@ fn run(router: &Path, quic_lb: bool, preferred: Option<bool>) -> Result<()> {
         &config,
         format!(
             "{lb_config}\n\
-         rules: < regex: \"localhost\" backend: < proxy: < addr: \"{backend}\" > > >\n\
+         rules: < regex: \"localhost\" backend: < proxy: < addr: \"{router_backend}\" > > >\n\
          default: < backend: < null: <> > >\n"
         ),
     )?;
@@ -365,6 +423,11 @@ fn run(router: &Path, quic_lb: bool, preferred: Option<bool>) -> Result<()> {
         let new_cids = if preferred.is_some() { 1 } else { 2 };
         client
             .until(|c| c.connected == 1 && c.conn.stats().frame_rx.new_connection_id >= new_cids)?;
+        if handshake_acl {
+            // The routed handshake succeeded, so the backend is ready and the
+            // same client must now be unable to create a fresh direct session.
+            assert_direct_handshake_blocked(backend, cert.cert.der().clone(), cid_len)?;
+        }
         let advertised = client.preferred_address()?;
         if preferred.is_none() {
             ensure!(advertised.is_none(), "preferred address must be opt-in");
@@ -402,6 +465,9 @@ fn run(router: &Path, quic_lb: bool, preferred: Option<bool>) -> Result<()> {
             router_server.child.wait()?;
             // Successful requests after router shutdown prove traffic is direct.
             client.fetch(content)?;
+            if handshake_acl {
+                assert_direct_handshake_blocked(backend, cert.cert.der().clone(), cid_len)?;
+            }
             client.fetch(content)?;
             ensure!(
                 client.connected == 1,
@@ -449,8 +515,8 @@ fn run(router: &Path, quic_lb: bool, preferred: Option<bool>) -> Result<()> {
 fn legacy_rotation_and_quic_lb_migration() -> Result<()> {
     let router = std::env::var_os("SNI_ROUTER_H3_BIN")
         .context("set SNI_ROUTER_H3_BIN to the built router binary")?;
-    run(Path::new(&router), false, None)?;
-    run(Path::new(&router), true, None)
+    run(Path::new(&router), false, None, false)?;
+    run(Path::new(&router), true, None, false)
 }
 
 #[test]
@@ -460,7 +526,20 @@ fn preferred_address_bypasses_router() -> Result<()> {
         .context("set SNI_ROUTER_H3_BIN to the built router binary")?;
     for quic_lb in [false, true] {
         for ipv6 in [false, true] {
-            run(Path::new(&router), quic_lb, Some(ipv6))?;
+            run(Path::new(&router), quic_lb, Some(ipv6), false)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a built sni-router-h3; set SNI_ROUTER_H3_BIN"]
+fn handshake_acl_allows_router_and_established_direct_paths() -> Result<()> {
+    let router = std::env::var_os("SNI_ROUTER_H3_BIN")
+        .context("set SNI_ROUTER_H3_BIN to the built router binary")?;
+    for quic_lb in [false, true] {
+        for ipv6 in [false, true] {
+            run(Path::new(&router), quic_lb, Some(ipv6), true)?;
         }
     }
     Ok(())
